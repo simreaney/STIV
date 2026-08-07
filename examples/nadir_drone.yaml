@@ -1,0 +1,74 @@
+# -------------------------------------------------------------------------- #
+# STIV survey: nadir (straight-down) drone hover over a small river
+#
+# The usual UAV gauging geometry.  With the camera pointing straight down a
+# single ground sample distance describes the whole frame, so no ground control
+# points are needed -- just the flight altitude and the lens.
+#
+#   stiv run examples/nadir_drone.yaml
+# -------------------------------------------------------------------------- #
+
+video:
+  path: ../footage/hover_60m.mp4
+  start_s: 4.0              # skip the first seconds while the aircraft settles
+  duration_s: 30.0          # the paper used 30 s; 20-40 s is plenty
+  frame_step: 1             # raise this if median tan(phi) comes out above ~4
+
+rectify:
+  method: scale
+  # Either give the ground sample distance directly...
+  # m_per_px: 0.0213
+  # ...or let it be derived from the flight geometry:
+  altitude_m: 60.0          # height above the WATER SURFACE, not above take-off
+  hfov_deg: 84.0            # DJI wide lenses are typically 82-84 degrees
+  # sensor_width_mm: 6.3    # alternative to hfov_deg
+  # focal_length_mm: 4.5
+
+section:
+  # Two ends of the cross-section, in image pixels. `stiv pick` writes these
+  # for you by letting you click them on a frame.
+  start_px: [310, 880]      # left bank looking downstream
+  end_px:   [1640, 830]     # right bank
+  n_stations: 40
+  edge_trim: 0.02           # skip the outer 2% at each bank
+  name: dee_upstream_gauge
+
+flow:
+  direction: auto           # perpendicular to the section, in world space
+  downstream_px: [980, 1300]   # any point downstream; fixes the sign
+
+stabilise:
+  enabled: true             # essential for a hovering aircraft
+  model: similarity
+  # Strongly recommended: outline the water so the tracker only follows static
+  # ground. Without it, features picked up on the moving surface bias the
+  # estimated camera motion.
+  water_mask_px:
+    - [[290, 700], [1700, 660], [1720, 1010], [270, 1040]]
+
+stiv:
+  search_line_length_m: 4.0
+  window_px: 31             # the 31 x 31 local area A of the paper
+  window_overlap: 0.5
+  gradient_order: 4         # Eq. (12); use 6 for the wider stencil of Eq. (13)
+  smooth_sigma: 0.0         # try 1.0-2.0 if the surface texture is smooth
+  velocity_range_ms: [-0.5, 3.0]   # brackets the expected velocity
+  estimator: eq14
+
+quality:
+  min_valid_fraction: 0.15
+  min_mean_coherency: 0.10
+  max_relative_uncertainty: 0.5
+  interpolate_flagged: true
+
+discharge:
+  enabled: true
+  bathymetry_csv: bathymetry_example.csv
+  alpha: 0.85               # surface -> depth-averaged velocity index
+  bank_coefficient: 0.7
+
+output:
+  out_dir: ../results/dee_upstream
+  save_sti_images: true
+  save_diagnostics: true
+  dpi: 150

@@ -1,0 +1,13 @@
+numpy>=1.24
+scipy>=1.10
+opencv-python>=4.7
+matplotlib>=3.7
+pandas>=2.0
+PyYAML>=6.0
+tqdm>=4.65
+
+[gui]
+PyQt5>=5.15
+
+[test]
+pytest>=7.0

@@ -1,0 +1,79 @@
+# -------------------------------------------------------------------------- #
+# STIV test run: DJI_0659.MP4 (DJI Mavic Air 2S, nadir hover, ~30 m AGL)
+#
+# Coordinates below were picked by inspecting an averaged frame of the clip
+# (banks are static, so averaging frames cancels the water texture and makes
+# the bank edges easy to trace). Flow direction and an approximate surface
+# velocity (~0.6-0.7 m/s) were confirmed independently with dense optical
+# flow on the water band vs. the (essentially static) banks.
+#
+#   stiv run examples/dji_0659_test.yaml
+# -------------------------------------------------------------------------- #
+
+video:
+  path: DJI_0659.MP4
+  start_s: 0.0
+  duration_s: null          # clip is only 10.8 s total (323 frames @ 29.97 fps) -- use all of it
+  frame_step: 1
+
+rectify:
+  method: scale
+  altitude_m: 30.0
+  # Air 2S is a 1" sensor, 22 mm (35 mm-equivalent), f/2.8. That gives a
+  # horizontal FOV of ~79 deg for the 16:9 video crop (the commonly quoted
+  # 88 deg is the *diagonal* FOV of the 3:2 photo mode). Treat this as an
+  # approximation -- confirm with a ground control measurement if the
+  # absolute velocity numbers matter.
+  hfov_deg: 79.0
+
+section:
+  # A straight, clean reach with no boulders in the way, picked at x=600 px
+  # in the full-resolution (5472x3078) frame. Water runs top(y~1040) to
+  # bottom(y~2830) here, channel width ~ 18 m.
+  start_px: [600, 1040]      # top bank (upstream-left side of the channel)
+  end_px:   [600, 2830]      # bottom bank
+  n_stations: 30
+  edge_trim: 0.02
+  name: dji_0659_test
+
+flow:
+  direction: auto            # perpendicular to the section, in world space
+  downstream_px: [200, 1900] # flow runs right-to-left (-x) in this shot
+  auto_flip: true
+
+stabilise:
+  enabled: true               # hover still shows a few px of drift/yaw
+  model: similarity
+  # The water/rapids boundary is irregular and hard to trust everywhere in
+  # this frame (a mid-channel rapid intrudes unevenly), so rather than
+  # outline the water precisely, mark three regions that were verified by
+  # eye to be dry, static, high-texture gravel -- this is the safer way to
+  # keep the tracker off the moving water.
+  static_mask_px:
+    - [[0, 0], [5472, 0], [5472, 880], [0, 880]]          # top gravel bar, full width
+    - [[0, 2900], [1300, 2900], [1300, 3078], [0, 3078]]  # bottom-left gravel
+    - [[3800, 2600], [5472, 2600], [5472, 3078], [3800, 3078]]  # bottom-right gravel
+
+stiv:
+  search_line_length_m: 4.0
+  window_px: 31
+  window_overlap: 0.5
+  gradient_order: 4
+  smooth_sigma: 0.0
+  velocity_range_ms: [-0.5, 4.0]   # brackets the ~0.6-0.7 m/s median with room for faster rapids
+  estimator: eq14
+
+quality:
+  min_valid_fraction: 0.15
+  min_mean_coherency: 0.10
+  max_relative_uncertainty: 0.5
+  interpolate_flagged: true
+
+discharge:
+  enabled: false   # no bathymetry survey for this reach
+
+output:
+  out_dir: ../results/dji_0659_test
+  save_sti_images: true
+  save_diagnostics: true
+  dpi: 150

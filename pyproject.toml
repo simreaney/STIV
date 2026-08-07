@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stiv"
+version = "1.0.0"
+description = "Space-Time Image Velocimetry for river surface flow from drone video"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["hydrology", "river", "velocimetry", "STIV", "discharge", "UAV", "drone"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Hydrology",
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-python>=4.7",
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+    "PyYAML>=6.0",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+gui = ["PyQt5>=5.15"]          # only needed for the interactive `stiv pick`
+notebook = [                   # the interactive survey wizard in notebooks/
+    "ipywidgets>=8",
+    "ipympl>=0.9",
+    "ipyfilechooser>=0.6",
+]
+
+[project.scripts]
+stiv = "stiv.cli:main"
+
+[tool.setuptools]
+packages = ["stiv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

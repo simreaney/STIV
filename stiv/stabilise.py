@@ -1,0 +1,327 @@
+"""Compensation for drone motion between frames.
+
+A hovering multirotor still drifts, yaws and rocks by a few pixels over a
+30-second clip.  STIV cannot tell that apparent motion from water motion: a
+steady 1 px/frame drift along the search line adds ``Sx * fps`` m/s to every
+station, which at a typical 2 cm/px and 30 fps is 0.6 m/s of pure error.  So
+for UAV footage this step matters as much as the orientation analysis itself.
+
+The approach is the standard one: track distinctive features on *static* ground
+with pyramidal Lucas-Kanade optical flow, fit a per-frame transform back to a
+reference frame, and use it to follow the same patch of ground through the
+clip.  Two details are worth flagging:
+
+* Every frame is matched against the **reference** frame, using the previous
+  frame's tracks only as an initial guess.  Chaining frame-to-frame transforms
+  instead would accumulate drift, and drift is exactly the error mode that
+  masquerades as flow.
+* Nothing is ever warped.  The estimated transform is applied to the *search
+  line sample points*, which is a handful of coordinates per frame rather than
+  a few million pixels.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+import cv2
+import numpy as np
+
+from .config import StabiliseConfig
+
+log = logging.getLogger(__name__)
+
+_LK_PARAMS = dict(
+    winSize=(21, 21),
+    maxLevel=3,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+)
+_MIN_INLIERS = 6
+
+
+@dataclass
+class StabilisationReport:
+    """Per-frame diagnostics, summarised in the run report."""
+
+    n_frames: int = 0
+    n_failed: int = 0
+    n_features: int = 0
+    #: Per-frame RMS reprojection error of the fitted transform, pixels.
+    rmse_px: list[float] = field(default_factory=list)
+    #: Per-frame displacement of the section centre, pixels.
+    shift_px: list[float] = field(default_factory=list)
+    inlier_fraction: list[float] = field(default_factory=list)
+    enabled: bool = True
+
+    def summary(self) -> str:
+        if not self.enabled:
+            return "stabilisation: disabled"
+        if not self.rmse_px:
+            return "stabilisation: no frames processed"
+        return (
+            f"stabilisation: {self.n_features} features, "
+            f"median residual {np.median(self.rmse_px):.2f} px, "
+            f"max frame shift {np.max(self.shift_px):.1f} px, "
+            f"{self.n_failed}/{self.n_frames} frames fell back to the previous transform"
+        )
+
+    def warnings(self) -> list[str]:
+        out = []
+        if not self.enabled:
+            return out
+        if self.n_features < 30:
+            out.append(
+                f"only {self.n_features} trackable features were found on static "
+                f"ground; give stabilise.static_mask_px, or disable stabilisation "
+                f"if the camera is fixed"
+            )
+        if self.n_frames and self.n_failed > 0.1 * self.n_frames:
+            out.append(
+                f"{self.n_failed} of {self.n_frames} frames could not be "
+                f"stabilised reliably; results may contain camera motion"
+            )
+        if self.inlier_fraction and np.median(self.inlier_fraction) < 0.5:
+            out.append(
+                "fewer than half the tracked features agree with the fitted "
+                "camera motion; features are probably being picked up on the "
+                "water surface -- supply stabilise.water_mask_px"
+            )
+        if self.shift_px and np.max(self.shift_px) > 100:
+            out.append(
+                f"camera moved up to {np.max(self.shift_px):.0f} px during the "
+                f"clip; check that the search lines stay over water throughout"
+            )
+        return out
+
+
+# --------------------------------------------------------------------------- #
+def build_mask(
+    cfg: StabiliseConfig,
+    image_shape: tuple[int, int],
+    exclude_px: Optional[np.ndarray] = None,
+    exclude_dilate_px: int = 60,
+) -> np.ndarray:
+    """Build the uint8 mask of regions in which to look for static features.
+
+    Priority: an explicit ``static_mask_px`` wins; otherwise the whole frame is
+    used minus ``water_mask_px`` and minus a corridor around the search lines
+    (``exclude_px``), which is water by construction.
+    """
+    h, w = image_shape[:2]
+
+    if cfg.static_mask_px:
+        mask = np.zeros((h, w), np.uint8)
+        for poly in cfg.static_mask_px:
+            cv2.fillPoly(mask, [np.asarray(poly, np.int32).reshape(-1, 1, 2)], 255)
+    else:
+        mask = np.full((h, w), 255, np.uint8)
+
+    if cfg.water_mask_px:
+        for poly in cfg.water_mask_px:
+            cv2.fillPoly(mask, [np.asarray(poly, np.int32).reshape(-1, 1, 2)], 0)
+
+    if not cfg.static_mask_px and exclude_px is not None and len(exclude_px) >= 3:
+        hull = cv2.convexHull(np.asarray(exclude_px, np.float32).reshape(-1, 1, 2))
+        blocker = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(blocker, hull.astype(np.int32), 255)
+        k = 2 * int(exclude_dilate_px) + 1
+        blocker = cv2.dilate(blocker, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        mask[blocker > 0] = 0
+
+    return mask
+
+
+def _fit_transform(src: np.ndarray, dst: np.ndarray, model: str):
+    """Fit ``src -> dst`` robustly; returns (3x3 matrix, inlier mask) or (None, None)."""
+    if len(src) < _MIN_INLIERS:
+        return None, None
+    s = src.reshape(-1, 1, 2).astype(np.float32)
+    d = dst.reshape(-1, 1, 2).astype(np.float32)
+
+    if model == "homography":
+        M, inl = cv2.findHomography(s, d, cv2.RANSAC, 3.0, maxIters=2000, confidence=0.995)
+        if M is None:
+            return None, None
+        return M, (inl.ravel().astype(bool) if inl is not None else None)
+
+    if model == "affine":
+        A, inl = cv2.estimateAffine2D(s, d, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+    else:  # similarity: rotation + uniform scale + translation
+        A, inl = cv2.estimateAffinePartial2D(s, d, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+    if A is None:
+        return None, None
+    M = np.vstack([A, [0.0, 0.0, 1.0]])
+    return M, (inl.ravel().astype(bool) if inl is not None else None)
+
+
+def transform_points(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Apply a 3x3 image transform to ``(n, 2)`` points."""
+    p = np.asarray(pts, dtype=np.float64)
+    ones = np.ones((len(p), 1))
+    q = (M @ np.hstack([p, ones]).T).T
+    w = q[:, 2:3]
+    w = np.where(np.abs(w) < 1e-12, 1e-12, w)
+    return q[:, :2] / w
+
+
+class Stabiliser:
+    """Tracks static ground and reports, per frame, where the reference went.
+
+    Usage is streaming: construct with the reference frame, then call
+    :meth:`update` once per subsequent frame.  :meth:`current_transform` returns
+    the 3x3 matrix mapping *reference* image coordinates to *current* frame
+    coordinates.
+    """
+
+    def __init__(
+        self,
+        cfg: StabiliseConfig,
+        reference_grey: np.ndarray,
+        mask: Optional[np.ndarray] = None,
+    ):
+        self.cfg = cfg
+        self.report = StabilisationReport(enabled=cfg.enabled)
+        self.M = np.eye(3)
+
+        self.ref = _as_u8(reference_grey)
+        self.prev = self.ref
+        self.mask = mask
+
+        if not cfg.enabled:
+            self.ref_pts = np.empty((0, 2), np.float32)
+            self.cur_pts = self.ref_pts
+            self.alive = np.zeros(0, bool)
+            return
+
+        pts = cv2.goodFeaturesToTrack(
+            self.ref,
+            maxCorners=cfg.max_features,
+            qualityLevel=cfg.quality_level,
+            minDistance=cfg.min_distance_px,
+            mask=mask,
+            blockSize=7,
+        )
+        self.ref_pts = (
+            pts.reshape(-1, 2).astype(np.float32) if pts is not None else np.empty((0, 2), np.float32)
+        )
+        self.cur_pts = self.ref_pts.copy()
+        self.alive = np.ones(len(self.ref_pts), bool)
+        self.report.n_features = len(self.ref_pts)
+
+        if len(self.ref_pts) < _MIN_INLIERS:
+            log.warning(
+                "only %d static features found; stabilisation will be disabled",
+                len(self.ref_pts),
+            )
+            self.cfg = StabiliseConfig(**{**cfg.__dict__, "enabled": False})
+            self.report.enabled = False
+
+    # ------------------------------------------------------------------ #
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cfg.enabled)
+
+    def current_transform(self) -> np.ndarray:
+        return self.M
+
+    def update(self, frame_grey: np.ndarray, probe_px: Optional[np.ndarray] = None) -> np.ndarray:
+        """Register one frame against the reference; returns the new transform."""
+        if not self.enabled:
+            return self.M
+
+        cur = _as_u8(frame_grey)
+        self.report.n_frames += 1
+
+        # Predict where the reference features should be, then refine with LK
+        # against the *reference* image so nothing accumulates frame to frame.
+        guess = transform_points(self.M, self.ref_pts).astype(np.float32)
+        guess = np.where(self.alive[:, None], self.cur_pts, guess).astype(np.float32)
+
+        nxt, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.ref, cur,
+            self.ref_pts.reshape(-1, 1, 2),
+            guess.reshape(-1, 1, 2).copy(),
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+            **_LK_PARAMS,
+        )
+        nxt = nxt.reshape(-1, 2)
+        ok = status.ravel().astype(bool)
+
+        # Forward-backward consistency: track back and keep only the features
+        # that land where they started.
+        if ok.any():
+            back, status_b, _ = cv2.calcOpticalFlowPyrLK(
+                cur, self.ref,
+                nxt.reshape(-1, 1, 2).astype(np.float32),
+                self.ref_pts.reshape(-1, 1, 2).copy(),
+                flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+                **_LK_PARAMS,
+            )
+            fb_err = np.linalg.norm(back.reshape(-1, 2) - self.ref_pts, axis=1)
+            ok &= status_b.ravel().astype(bool) & (fb_err < 1.5)
+
+        M, inliers = (None, None)
+        if ok.sum() >= _MIN_INLIERS:
+            M, inliers = _fit_transform(self.ref_pts[ok], nxt[ok], self.cfg.model)
+
+        if M is None:
+            self.report.n_failed += 1
+            self.report.rmse_px.append(float("nan"))
+            self.report.inlier_fraction.append(0.0)
+            self.report.shift_px.append(self._probe_shift(probe_px))
+            # Keep the last good transform and re-seed from its prediction.
+            self.cur_pts = transform_points(self.M, self.ref_pts).astype(np.float32)
+            self.alive = np.zeros(len(self.ref_pts), bool)
+            self.prev = cur
+            return self.M
+
+        pred = transform_points(M, self.ref_pts[ok])
+        resid = np.linalg.norm(pred - nxt[ok], axis=1)
+        if inliers is not None and inliers.any():
+            rmse = float(np.sqrt(np.mean(resid[inliers] ** 2)))
+            inlier_frac = float(inliers.mean())
+        else:
+            rmse = float(np.sqrt(np.mean(resid**2)))
+            inlier_frac = 1.0
+
+        if rmse > self.cfg.max_reprojection_px:
+            # A bad fit is worse than no update: hold the previous transform.
+            self.report.n_failed += 1
+            M = self.M
+
+        self.M = M
+        self.report.rmse_px.append(rmse)
+        self.report.inlier_fraction.append(inlier_frac)
+        self.report.shift_px.append(self._probe_shift(probe_px))
+
+        # Keep good tracks; re-inject lost ones at the model-predicted position
+        # so they can recover without breaking the reference correspondence.
+        alive = np.zeros(len(self.ref_pts), bool)
+        alive[np.flatnonzero(ok)] = True
+        if inliers is not None:
+            alive[np.flatnonzero(ok)[~inliers]] = False
+
+        self.cur_pts = transform_points(self.M, self.ref_pts).astype(np.float32)
+        self.cur_pts[alive] = nxt[alive]
+        self.alive = alive
+        self.prev = cur
+        return self.M
+
+    # ------------------------------------------------------------------ #
+    def _probe_shift(self, probe_px: Optional[np.ndarray]) -> float:
+        if probe_px is None or len(probe_px) == 0:
+            return 0.0
+        moved = transform_points(self.M, probe_px)
+        return float(np.max(np.linalg.norm(moved - np.asarray(probe_px, float), axis=1)))
+
+
+def _as_u8(img: np.ndarray) -> np.ndarray:
+    if img.dtype == np.uint8:
+        return img
+    a = np.asarray(img, dtype=np.float32)
+    lo, hi = float(a.min()), float(a.max())
+    if hi - lo < 1e-9:
+        return np.zeros(a.shape, np.uint8)
+    return ((a - lo) * (255.0 / (hi - lo))).astype(np.uint8)

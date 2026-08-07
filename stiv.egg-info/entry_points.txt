@@ -1,0 +1,2 @@
+[console_scripts]
+stiv = stiv.cli:main

@@ -1,0 +1,82 @@
+# -------------------------------------------------------------------------- #
+# STIV survey: oblique view from a drone standing off the bank, or from a
+# bridge / tower camera.
+#
+# This is the geometry of the original paper (Figs. 1 and 13).  With the camera
+# looking across the river rather than down at it, scale varies across the
+# frame, so the mapping needs ground control points: >= 4 features whose image
+# and real-world positions are both known, all lying on (or very near) the
+# water-surface plane.
+#
+# Good GCPs: surveyed markers, bridge piers at the waterline, boulders whose
+# positions you have taken with RTK GNSS.  Spread them across the whole
+# measurement area -- clustering them all in one corner makes the homography
+# extrapolate badly.
+# -------------------------------------------------------------------------- #
+
+video:
+  path: ../footage/oblique_bank.mp4
+  start_s: 0.0
+  duration_s: 30.0
+  frame_step: 2             # oblique views have coarse far-field pixels
+
+rectify:
+  method: gcp
+  # Image coordinates, pixels.
+  gcp_px:
+    - [ 412,  902]
+    - [1520,  874]
+    - [1310,  520]
+    - [ 640,  530]
+    - [ 968,  690]          # a 5th point lets RANSAC reject a mis-click and
+                            # gives a meaningful RMSE in the run report
+  # Matching real-world coordinates, metres, on the water plane. Any local grid
+  # will do -- easting/northing, or a tape measure along the bank.
+  gcp_world:
+    - [  0.0,   0.0]
+    - [ 42.0,   0.0]
+    - [ 42.0,  28.0]
+    - [  0.0,  28.0]
+    - [ 21.0,  12.5]
+
+section:
+  start_px: [455, 815]
+  end_px:   [1465, 795]
+  n_stations: 50
+  edge_trim: 0.03
+  name: uono_flood_section
+
+flow:
+  # In an oblique view the flow is rarely horizontal on screen. Two points
+  # along a visible streamline are the most reliable way to set the direction.
+  direction: points
+  from_px: [900, 700]
+  to_px:   [520, 760]
+
+stabilise:
+  enabled: true
+  model: homography         # appropriate when the static scene is roughly planar
+  static_mask_px:
+    # Track only the far bank and the structures on it.
+    - [[300, 380], [1700, 360], [1700, 520], [300, 540]]
+
+stiv:
+  # In an oblique view the far side of the section has much coarser ground
+  # resolution, so give the search lines enough length to hold several features.
+  search_line_length_m: 8.0
+  n_samples: 200            # the paper used 200-pixel search lines
+  window_px: 31
+  gradient_order: 6
+  smooth_sigma: 1.0         # helps on the low-contrast far field
+  velocity_range_ms: [-0.5, 5.0]
+
+quality:
+  min_mean_coherency: 0.15
+  median_filter_stations: 3   # oblique far-field stations are noisier
+
+discharge:
+  enabled: false            # enable once you have a surveyed bed profile
+
+output:
+  out_dir: ../results/uono_flood
+  dpi: 150

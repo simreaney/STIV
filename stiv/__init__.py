@@ -1,0 +1,73 @@
+"""Space-Time Image Velocimetry (STIV) for river surface flow from drone video.
+
+An implementation of
+
+    Fujita, I., Watanabe, H. & Tsubaki, R. (2007), "Development of a
+    non-intrusive and efficient flow monitoring technique: The space-time image
+    velocimetry (STIV)", Intl. J. River Basin Management 5(2), 105-114.
+
+Quick start::
+
+    from stiv import Config, run
+
+    result = run(Config.from_yaml("survey.yaml"))
+    print(result.summary())
+    result.to_frame().to_csv("velocity.csv", index=False)
+
+or from the command line::
+
+    stiv pick flight.mp4 -o survey.yaml     # click the cross-section
+    stiv run survey.yaml                    # analyse and write outputs
+"""
+
+from .analysis import StationResult, StivResult, run
+from .config import Config, ConfigError
+from .discharge import DischargeResult, compute_discharge
+from .geometry import (
+    HomographyRectifier,
+    Rectifier,
+    ScaleRectifier,
+    SearchLine,
+    SectionGeometry,
+    build_section,
+)
+from .orientation import (
+    AngleEstimate,
+    OrientationField,
+    angle_range_from_velocity,
+    mean_orientation_angle,
+    structure_tensor_field,
+    velocity_from_angle,
+)
+from .sti import SpaceTimeImage, preprocess
+from .video import FrameSource, VideoInfo, probe
+
+__version__ = "1.0.0"
+
+__all__ = [
+    "Config",
+    "ConfigError",
+    "run",
+    "StivResult",
+    "StationResult",
+    "DischargeResult",
+    "compute_discharge",
+    "build_section",
+    "SectionGeometry",
+    "SearchLine",
+    "Rectifier",
+    "ScaleRectifier",
+    "HomographyRectifier",
+    "structure_tensor_field",
+    "mean_orientation_angle",
+    "velocity_from_angle",
+    "angle_range_from_velocity",
+    "OrientationField",
+    "AngleEstimate",
+    "SpaceTimeImage",
+    "preprocess",
+    "FrameSource",
+    "VideoInfo",
+    "probe",
+    "__version__",
+]
