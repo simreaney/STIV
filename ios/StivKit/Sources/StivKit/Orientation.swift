@@ -317,17 +317,23 @@ public func meanOrientationAngle(
     }
     let validFraction = Double(nInRange) / Double(max(1, phi.count))
 
-    let width = (phiMax - phiMin) / Double(binCount)
+    // Bin edges and centres are built the way numpy does -- `linspace` edges,
+    // then midpoints -- rather than by the algebraically equivalent
+    // `phiMin + width * (b + 0.5)`.  The two differ in the last bit, and the
+    // golden fixture compares histograms bin for bin, so "algebraically
+    // equivalent" is not good enough.
+    let span = phiMax - phiMin
+    var edges = [Double](repeating: 0, count: binCount + 1)
+    for b in 0...binCount { edges[b] = phiMin + span * Double(b) / Double(binCount) }
+    edges[binCount] = phiMax          // linspace pins the endpoint exactly
     var centres = [Double](repeating: 0, count: binCount)
-    for b in 0..<binCount { centres[b] = phiMin + width * (Double(b) + 0.5) }
+    for b in 0..<binCount { centres[b] = 0.5 * (edges[b] + edges[b + 1]) }
 
     var hist = [Double](repeating: 0, count: binCount)
     for level in coherencyLevels {
         for i in phi.indices where inRange[i] && coh[i] >= level {
-            // numpy.histogram's bin rule: half-open bins, last bin closed.
-            var b = Int((phi[i] - phiMin) / width)
-            if b == binCount { b = binCount - 1 }
-            if b >= 0 && b < binCount { hist[b] += 1 }
+            hist[binIndex(phi[i], phiMin: phiMin, span: span,
+                          binCount: binCount, edges: edges)] += 1
         }
     }
 
@@ -368,6 +374,32 @@ public func meanOrientationAngle(
         phiMin: phiMin,
         phiMax: phiMax
     )
+}
+
+/// numpy's uniform-bin index, including its correction step.
+///
+/// `numpy.histogram` scales the value across the whole range in one operation
+/// and then checks the result against the neighbouring edges, because the scaled
+/// value can land one bin out through rounding.  Bins are half-open except the
+/// last, which is closed.  Reproduced here because the golden fixture compares
+/// bin counts exactly, and a value sitting on an edge is common rather than
+/// exotic: a saturated `phi` pinned at the search-range boundary lands there
+/// every time.
+///
+/// The caller must have established that `value` is inside `[phiMin, phiMax]`.
+func binIndex(
+    _ value: Double,
+    phiMin: Double,
+    span: Double,
+    binCount: Int,
+    edges: [Double]
+) -> Int {
+    var index = Int((value - phiMin) / span * Double(binCount))
+    if index == binCount { index -= 1 }          // the closed right edge
+    index = min(max(index, 0), binCount - 1)
+    if index > 0, value < edges[index] { index -= 1 }
+    if index < binCount - 1, value >= edges[index + 1] { index += 1 }
+    return index
 }
 
 /// Sub-bin location of the histogram maximum by parabolic interpolation.
