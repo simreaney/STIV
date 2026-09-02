@@ -43,6 +43,8 @@ struct SectionScreen: View {
                             if let world = projector.world(at: location) {
                                 model.handleTap(world: world)
                                 model.rebuildLayout()
+                            } else {
+                                model.tapMissed()
                             }
                         }
                 }
@@ -63,6 +65,12 @@ struct SectionScreen: View {
                 Text(model.pickTarget.prompt)
                     .font(.subheadline)
                     .fixedSize(horizontal: false, vertical: true)
+
+                if let hint = model.tapHint {
+                    Label(hint, systemImage: "hand.tap")
+                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 if let width = model.sectionWidthM {
                     HStack(spacing: 18) {

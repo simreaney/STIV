@@ -195,11 +195,21 @@ public struct WaterPlaneProjection: PlaneRectifier, Sendable {
         let origin = pose.position
         let height = origin.y - plane.y
 
-        // The ray must actually descend toward the plane.  A pixel above the
-        // horizon has `direction.y >= 0` and intersects nothing: returning nil
-        // is what lets the UI say "that tap is above the waterline" instead of
-        // silently inventing a point at infinity.
-        guard abs(direction.y) > 1e-9 else { return nil }
+        // Two conditions, stated rather than implied.
+        //
+        // The camera must be above the water.  With a correctly fitted plane it
+        // always is, but a failed fit -- a sweep that caught the bank above the
+        // phone, or a typed height with the wrong sign -- puts the plane over the
+        // camera, and then the algebra below happily intersects *upward* rays and
+        // returns a mirrored world that looks entirely plausible.  That is the
+        // failure mode this whole file is written to avoid, so it is refused.
+        guard height > 0 else { return nil }
+
+        // And the ray must descend toward the plane.  A pixel above the horizon
+        // intersects nothing; returning nil is what lets the UI say "that tap is
+        // above the waterline" instead of inventing a point at infinity.
+        guard direction.y < -1e-9 else { return nil }
+
         let t = -height / direction.y
         guard t > 0, t.isFinite else { return nil }
 
