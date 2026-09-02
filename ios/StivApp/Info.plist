@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>STIV</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+
+	<!-- Required: ARKit prompts for camera access on the first session.run, and
+	     the app crashes on that call if this key is absent. -->
+	<key>NSCameraUsageDescription</key>
+	<string>STIV measures the surface velocity of a river from the motion of its
+	surface pattern. The camera provides the video the measurement is made from,
+	and the LiDAR scanner fixes the water level so distances come out in metres.</string>
+
+	<!-- ARKit world tracking is not optional here: it supplies both the metric
+	     scale and the camera-motion compensation. There is deliberately no
+	     LiDAR requirement, because none exists -- UIRequiredDeviceCapabilities
+	     has no value for a depth sensor, so LiDAR can only be checked at
+	     runtime, and the app degrades to a manually entered water level. -->
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arkit</string>
+	</array>
+
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string></string>
+	</dict>
+
+	<!-- A cross-section is wide, so landscape is the natural way to hold the
+	     phone; portrait stays available because a steep bank sometimes is not.
+	     Upside-down is excluded: the overlay reads the interface orientation
+	     from the window scene, and there is no reason to support a case nobody
+	     uses. -->
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+	</dict>
+
+	<!-- Holding still for thirty seconds must not be interrupted by the screen
+	     dimming and the session losing tracking. -->
+	<key>UIRequiresFullScreen</key>
+	<true/>
+	<key>UIStatusBarStyle</key>
+	<string>UIStatusBarStyleLightContent</string>
+	<key>UIUserInterfaceStyle</key>
+	<string>Dark</string>
+</dict>
+</plist>

@@ -1,0 +1,46 @@
+# XcodeGen fallback.
+#
+# `ios/StivApp.xcodeproj` is checked in and should just open in Xcode 16 or
+# later. It was hand-authored, though, so if it refuses to open or the
+# synchronized folder does not pick up the sources, regenerate an equivalent
+# project from this file instead:
+#
+#     brew install xcodegen
+#     cd ios && xcodegen generate --spec project.yml --project .
+#
+# Note that XcodeGen writes explicit per-file entries rather than a
+# synchronized folder, so a project generated from here needs regenerating
+# whenever a source file is added.
+
+name: StivApp
+options:
+  bundleIdPrefix: org.stiv
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  StivKit:
+    path: StivKit
+
+targets:
+  STIV:
+    type: application
+    platform: iOS
+    sources:
+      - path: StivApp
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: StivKit
+        product: StivKit
+    info:
+      path: StivApp/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.stiv.app
+        PRODUCT_NAME: STIV
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: StivApp/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"

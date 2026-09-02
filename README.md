@@ -231,6 +231,29 @@ worth calibrating against an ADCP transect if the site matters.
 
 ---
 
+## On an iPhone
+
+There is a native app in [`ios/`](ios/README.md) that runs the same method from
+the built-in camera, with the **LiDAR scanner supplying the scale** -- no
+altitude, no ground control points, no tape measure.
+
+The trick is that scale only needs one number. ARKit's world frame is
+gravity-aligned, so still water is the plane `y = y0`; LiDAR reaches about five
+metres, which is enough to range the *waterline* -- at water level by definition
+-- and gravity carries that scale out to a far bank no depth sensor could reach.
+Camera motion is handled by anchoring the search-line samples as world points
+and reprojecting them through each frame's 6-DoF pose, which replaces
+[`stiv/stabilise.py`](stiv/stabilise.py) entirely.
+
+Far-field scale is extrapolated, so its error budget is derived, reported per
+station and flagged; the dominant term goes as range / camera height, which is
+why the app tells you to stand higher. Measurements export as `velocity.csv`
+plus a `survey.yaml` that `stiv run` can re-analyse, since the phone's ray-plane
+mapping *is* the homography `HomographyRectifier` fits.
+
+Needs Xcode 16 and an iPhone 12 Pro or later; other iPhones fall back to a typed
+camera height. Discharge is desktop-only for now.
+
 ## Library use
 
 ```python

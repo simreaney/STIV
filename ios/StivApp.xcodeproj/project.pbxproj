@@ -1,0 +1,288 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+/* objectVersion 77 is what Xcode 16 writes, and it is required for the
+ * synchronized ("buildable") folder below.  It is not backward compatible:
+ * Xcode 15 and earlier cannot open this project. */
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		571400000000000000000012 /* StivKit in Frameworks */ = {isa = PBXBuildFile; productRef = 571400000000000000000011 /* StivKit */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		571400000000000000000005 /* STIV.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = STIV.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		571400000000000000000013 /* Exceptions for "StivApp" folder in "STIV" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+/* Info.plist is consumed through INFOPLIST_FILE, so it must not also be copied
+ * in as a bundle resource -- that produces "Multiple commands produce". */
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 571400000000000000000002 /* STIV */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+/* A synchronized folder: Xcode compiles whatever is inside it, by extension,
+ * with no per-file entries in this project.  Adding a source file therefore
+ * needs no project edit at all. */
+		571400000000000000000003 /* StivApp */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				571400000000000000000013 /* Exceptions for "StivApp" folder in "STIV" target */,
+			);
+			path = StivApp;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		571400000000000000000008 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				571400000000000000000012 /* StivKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		571400000000000000000004 = {
+			isa = PBXGroup;
+			children = (
+				571400000000000000000003 /* StivApp */,
+				571400000000000000000006 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		571400000000000000000006 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				571400000000000000000005 /* STIV.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		571400000000000000000002 /* STIV */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 57140000000000000000000D /* Build configuration list for PBXNativeTarget "STIV" */;
+			buildPhases = (
+				571400000000000000000007 /* Sources */,
+				571400000000000000000008 /* Frameworks */,
+				571400000000000000000009 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				571400000000000000000003 /* StivApp */,
+			);
+			name = STIV;
+			packageProductDependencies = (
+				571400000000000000000011 /* StivKit */,
+			);
+			productName = STIV;
+			productReference = 571400000000000000000005 /* STIV.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		571400000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				preferredProjectObjectVersion = 77;
+				TargetAttributes = {
+					571400000000000000000002 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = 57140000000000000000000A /* Build configuration list for PBXProject "StivApp" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 571400000000000000000004;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				571400000000000000000010 /* XCLocalSwiftPackageReference "StivKit" */,
+			);
+			productRefGroup = 571400000000000000000006 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				571400000000000000000002 /* STIV */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		571400000000000000000009 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+/* Empty on purpose: the synchronized folder supplies the sources. */
+		571400000000000000000007 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		57140000000000000000000B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		57140000000000000000000C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_NO_COMMON_BLOCKS = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		57140000000000000000000E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = StivApp/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "org.stiv.app";
+				PRODUCT_NAME = STIV;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		57140000000000000000000F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = StivApp/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "org.stiv.app";
+				PRODUCT_NAME = STIV;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		57140000000000000000000A /* Build configuration list for PBXProject "StivApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				57140000000000000000000B /* Debug */,
+				57140000000000000000000C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		57140000000000000000000D /* Build configuration list for PBXNativeTarget "STIV" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				57140000000000000000000E /* Debug */,
+				57140000000000000000000F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+/* The numerics live in a local package so they can be tested with `swift test`
+ * on a Mac, without a simulator and without ARKit. */
+		571400000000000000000010 /* XCLocalSwiftPackageReference "StivKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = StivKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		571400000000000000000011 /* StivKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = StivKit;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 571400000000000000000001 /* Project object */;
+}
