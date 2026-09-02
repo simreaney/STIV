@@ -2,12 +2,26 @@
 //  What a measurement is: everything the analysis needs, and nothing about how
 //  it was captured.
 //
-//  This mirrors `stiv/config.py` field for field, with the drone-specific parts
-//  dropped (`rectify`, `stabilise`, `output`) and the picked geometry expressed
-//  in ARKit world metres rather than image pixels, because on a phone the world
-//  frame is available from the start and pixels are not stable across frames.
+//  This follows `stiv/config.py` closely: the same sections, the same names and
+//  the same defaults wherever the two describe the same quantity, so a parameter
+//  tuned on the desktop means what it says here.  Where a value could be carried
+//  between the two, it uses the Python's spelling rather than whichever reads
+//  better in Swift -- `flow.direction` is `angle`, not `bearing`.
 //
-//  Defaults are copied from the Python and should stay in step with it.
+//  It is not a field-for-field mirror, and the divergences are not arbitrary:
+//
+//  * `rectify`, `stabilise` and `output` are gone.  ARKit supplies the
+//    rectification and the camera pose, so there is nothing left to configure.
+//  * Picked geometry is in ARKit world metres, not image pixels: on a phone the
+//    world frame exists from the first frame and pixel coordinates are not
+//    stable across frames.  So `section.start` is a `PlanePoint` where the
+//    Python has `section.start_px` -- genuinely different quantities, sharing
+//    no spelling on purpose.
+//  * `capture` replaces `video`: there is no file, and `St` comes from measured
+//    frame timestamps rather than a container's declared frame rate.
+//
+//  `Export.surveyYAML` is what speaks the Python's schema exactly, converting
+//  the world geometry back into pixels and ground control points.
 
 import Foundation
 
@@ -82,13 +96,18 @@ public struct FlowSettings: Codable, Sendable, Equatable {
         /// Perpendicular to the cross-section, in world space.
         case auto
         /// A fixed bearing, degrees counter-clockwise from world +X.
-        case bearing
+        ///
+        /// Spelled `angle` because that is what `stiv/config.py` calls it, and
+        /// a value that can cross between the two should not change its name on
+        /// the way.
+        case angle
         /// Parallel to `from` -> `to`, which point downstream.
         case points
     }
 
     public var direction: Direction = .auto
-    public var bearingDegrees: Double?
+    /// `flow.angle_deg` in the Python.
+    public var angleDegrees: Double?
     public var from: PlanePoint?
     public var to: PlanePoint?
     /// A point downstream of the section; disambiguates the sign of the

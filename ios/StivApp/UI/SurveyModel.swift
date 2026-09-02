@@ -77,6 +77,8 @@ final class SurveyModel: ObservableObject {
     @Published var downstream: PlanePoint?
     @Published var waterPolygon: [PlanePoint] = []
     @Published var pickTarget: PickTarget = .sectionStart
+    /// Why the last tap did nothing, when it did nothing.
+    @Published var tapHint: String?
 
     @Published private(set) var plane: WaterPlane?
     @Published private(set) var layout: SectionLayout?
@@ -98,6 +100,10 @@ final class SurveyModel: ObservableObject {
     /// retuning `frame_step` means another pass over the video.
     private var recording: CompletedRecording?
     private var bridge: DesktopBridge?
+    /// Guards `stopRecordingAndAnalyse` against its two concurrent callers.
+    private var isFinishing = false
+    /// Increments per analysis so an overtaken run cannot publish a stale result.
+    private var analysisGeneration = 0
 
     // MARK: - navigation
 
@@ -145,7 +151,21 @@ final class SurveyModel: ObservableObject {
 
     // MARK: - picking
 
+    /// A tap whose ray never met the water plane.
+    ///
+    /// With a sound plane fit this only happens above the horizon.  If it
+    /// happens *everywhere*, the plane is wrong -- fitted above the camera, or
+    /// with a typed height of the wrong sign -- and the fix is to measure the
+    /// water level again, not to keep tapping.
+    func tapMissed() {
+        tapHint = plane == nil
+            ? "Measure the water level first."
+            : "That tap did not meet the water surface -- it is above the horizon. "
+            + "If no tap works, the water level is wrong: measure it again."
+    }
+
     func handleTap(world: PlanePoint) {
+        tapHint = nil
         switch pickTarget {
         case .sectionStart:
             sectionStart = world
@@ -244,13 +264,32 @@ final class SurveyModel: ObservableObject {
         let polygon = waterPolygon.compactMap { projection.worldToImage($0) }
         bridge = makeBridge(projection: projection, layout: layout)
 
+        // A new run invalidates the previous one, both so the finish guard will
+        // fire again and so the results screen cannot show the old profile
+        // alongside a recording in progress.
+        recording = nil
+        result = nil
+        analysisError = nil
+
         capture.startRecording(plan: plan,
                                waterPolygon: polygon.count >= 3 ? polygon : nil)
     }
 
+    /// Stop recording and analyse, at most once per recording.
+    ///
+    /// Two things race to call this: the Stop button, and the `.onChange` that
+    /// fires when the recording reaches its requested duration.  Both are
+    /// legitimate -- whichever happens first should end the run -- so the method
+    /// has to be idempotent rather than exclusive.  Without the guard the second
+    /// caller reaches `finishRecording` after the first has already taken the
+    /// recorder, gets nil back, and reports "Nothing was recorded" over a
+    /// perfectly good measurement.
     func stopRecordingAndAnalyse() {
+        guard !isFinishing, recording == nil else { return }
+        isFinishing = true
         capture.finishRecording { [weak self] completed in
             guard let self else { return }
+            self.isFinishing = false
             guard let completed else {
                 self.analysisError = "Nothing was recorded."
                 return
@@ -262,8 +301,17 @@ final class SurveyModel: ObservableObject {
     }
 
     /// Run (or re-run) the analysis over the recording already in hand.
+    ///
+    /// The frame-step control can start a second analysis while the first is
+    /// still running, and a shorter step is *faster* to analyse -- fewer rows --
+    /// so the results can genuinely arrive out of order.  Each run therefore
+    /// carries a generation, and only the newest is allowed to publish; an
+    /// overtaken run is discarded rather than left to overwrite the answer the
+    /// user is looking at.
     func analyse() {
         guard let recording else { return }
+        analysisGeneration += 1
+        let generation = analysisGeneration
         isAnalysing = true
         analysisError = nil
         var survey = self.survey
@@ -280,6 +328,7 @@ final class SurveyModel: ObservableObject {
             let result = StivKit.analyse(survey: survey, layout: layout,
                                          stis: stis, motion: motion)
             DispatchQueue.main.async {
+                guard generation == self.analysisGeneration else { return }
                 self.result = result
                 self.isAnalysing = false
             }

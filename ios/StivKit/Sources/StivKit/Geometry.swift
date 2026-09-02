@@ -162,8 +162,8 @@ public func resolveFlowDirection(
 ) throws -> PlaneVector {
     var d: PlaneVector
     switch flow.direction {
-    case .bearing:
-        let a = (flow.bearingDegrees ?? 0) * .pi / 180
+    case .angle:
+        let a = (flow.angleDegrees ?? 0) * .pi / 180
         d = PlaneVector(x: cos(a), z: sin(a))
     case .points:
         guard let from = flow.from, let to = flow.to else {

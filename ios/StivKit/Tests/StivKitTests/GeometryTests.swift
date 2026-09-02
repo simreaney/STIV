@@ -61,6 +61,32 @@ final class PlaneProjectionTests: XCTestCase {
         XCTAssertNil(p.imageToWorld(PixelPoint(u: p.intrinsics.cx, v: 0)))
     }
 
+    /// A water plane fitted *above* the camera is a failed fit, not a geometry.
+    ///
+    /// The algebra will happily intersect upward-pointing rays against it and
+    /// return a mirrored world that looks entirely plausible -- the exact class
+    /// of silent wrongness this projection is written to avoid -- so it is
+    /// refused instead.
+    func testAPlaneAboveTheCameraIsRefused() {
+        let inverted = WaterPlaneProjection(
+            intrinsics: PinholeIntrinsics(horizontalFovDegrees: 60, width: 1920, height: 1440),
+            pose: .looking(fromHeight: 2.0, downDegrees: 20),
+            // 3 m up when the camera is at 2 m: the sweep caught the bank above
+            // the phone, or a typed height had the wrong sign.
+            plane: WaterPlane(y: 3.0))
+        XCTAssertNil(inverted.imageToWorld(PixelPoint(u: 960, v: 1200)))
+        XCTAssertNil(inverted.imageToWorld(PixelPoint(u: 960, v: 200)))
+    }
+
+    /// A ray that does not descend intersects nothing, whatever the algebra says.
+    func testOnlyDescendingRaysIntersect() throws {
+        let p = makeProjection(heightM: 2.0, downDegrees: 20)
+        // Well below the principal point: descending, so it must land.
+        XCTAssertNotNil(p.imageToWorld(PixelPoint(u: p.intrinsics.cx, v: 1300)))
+        // Far above it: ascending, so it must not.
+        XCTAssertNil(p.imageToWorld(PixelPoint(u: p.intrinsics.cx, v: 0)))
+    }
+
     func testGroundSampleDistanceGrowsWithRange() throws {
         let p = makeProjection()
         let near = try XCTUnwrap(p.localScale(at: PixelPoint(u: p.intrinsics.cx, v: 1400)))

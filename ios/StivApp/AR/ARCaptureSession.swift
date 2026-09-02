@@ -262,7 +262,11 @@ final class ARCaptureSession: NSObject, ObservableObject {
                 return
             }
             let report = self.residualChecker.report
+            // Both, together: the plan carries one world point per STI column
+            // per station, and a plan without a recorder is a state nothing
+            // else here knows how to interpret.
             self.recorder = nil
+            self.plan = nil
             DispatchQueue.main.async {
                 completion(CompletedRecording(recorder: recorder, plan: plan, motion: report))
             }

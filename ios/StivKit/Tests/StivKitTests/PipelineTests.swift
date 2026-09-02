@@ -256,6 +256,43 @@ final class RecorderTests: XCTestCase {
     }
 }
 
+final class SurveyCodingTests: XCTestCase {
+    /// `flow.direction` is one of the few values that can be carried between
+    /// this and `stiv/config.py`, so its spelling is part of the contract.
+    func testFlowDirectionUsesThePythonSpelling() throws {
+        var survey = Survey()
+        survey.flow.direction = .angle
+        survey.flow.angleDegrees = 42
+        let json = try JSONEncoder().encode(survey)
+        let text = try XCTUnwrap(String(data: json, encoding: .utf8))
+        XCTAssertTrue(text.contains("\"angle\""), text)
+        XCTAssertFalse(text.contains("bearing"), text)
+
+        let round = try JSONDecoder().decode(Survey.self, from: json)
+        XCTAssertEqual(round.flow.direction, .angle)
+        XCTAssertEqual(round.flow.angleDegrees, 42)
+    }
+
+    /// The hand-written coders for the two settings structs with ranges must
+    /// round-trip, since a typo in one would silently reset a parameter.
+    func testSettingsWithRangesRoundTrip() throws {
+        var survey = Survey()
+        survey.sti.velocityRangeMs = -0.25 ... 5.5
+        survey.sti.windowPx = 41
+        survey.sti.estimator = .peak
+        survey.quality.tanPhiRange = 0.1 ... 6.0
+        survey.quality.maxRelativeScaleUncertainty = 0.22
+
+        let round = try JSONDecoder().decode(
+            Survey.self, from: try JSONEncoder().encode(survey))
+        XCTAssertEqual(round.sti.velocityRangeMs, -0.25 ... 5.5)
+        XCTAssertEqual(round.sti.windowPx, 41)
+        XCTAssertEqual(round.sti.estimator, .peak)
+        XCTAssertEqual(round.quality.tanPhiRange, 0.1 ... 6.0)
+        XCTAssertEqual(round.quality.maxRelativeScaleUncertainty, 0.22)
+    }
+}
+
 final class UncertaintyTests: XCTestCase {
     func testHeightErrorScalesInverselyWithCameraHeight() {
         var settings = ScaleSettings()
