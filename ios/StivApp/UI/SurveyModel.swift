@@ -267,6 +267,8 @@ final class SurveyModel: ObservableObject {
         // A new run invalidates the previous one, both so the finish guard will
         // fire again and so the results screen cannot show the old profile
         // alongside a recording in progress.
+        analysisGeneration += 1
+        isAnalysing = false
         recording = nil
         result = nil
         analysisError = nil
