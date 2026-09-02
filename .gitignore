@@ -6,3 +6,4 @@ examples/DJI_0659.MP4
 /tests/__pycache__
 /papers
 .DS_Store
+/ios/StivKit/.build

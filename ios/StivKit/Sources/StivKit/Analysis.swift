@@ -557,9 +557,30 @@ func directionCheck(
     motion: MotionReport,
     warnings: inout [String]
 ) {
-    let raw = stations.map(\.velocityRawMs).filter(\.isFinite).sorted()
-    guard !raw.isEmpty else { return }
-    let median = raw[raw.count / 2]
+    // `velocityRawMs` came from the first pass, which searched only the
+    // configured (and nearly always asymmetric) range.  When the lines face
+    // upstream the true angle is not just near that range's boundary but can
+    // sit entirely outside it, so *no* window's angle falls inside so narrow
+    // a range and every station's first pass comes back NaN -- exactly the
+    // case this check exists to catch, and exactly the case in which reading
+    // the sign off `velocityRawMs` finds nothing.  Probe the full angle range
+    // instead: it has no assumed direction to be wrong about.
+    let limit = 0.5 * Double.pi - 1e-3
+    let probe = stations.indices.compactMap { i -> Double? in
+        guard i < fields.count, let field = fields[i], i < stis.count else { return nil }
+        guard let estimate = try? meanOrientationAngle(
+            field: field, phiMin: -limit, phiMax: limit,
+            coherencyLevels: survey.sti.coherencyLevels,
+            binCount: survey.sti.angleBins,
+            minCoherency: survey.sti.minCoherency,
+            estimator: survey.sti.estimator), estimate.phi.isFinite
+        else { return nil }
+        return velocity(fromAngle: estimate.phi,
+                        sxMetresPerColumn: stis[i].sxMetresPerColumn,
+                        stSecondsPerRow: stis[i].stSecondsPerRow)
+    }.sorted()
+    guard !probe.isEmpty else { return }
+    let median = probe[probe.count / 2]
     guard median < 0 else { return }
 
     let message = "the median velocity along the search lines is \(decimals(median, 3)) m/s, "
