@@ -9,7 +9,7 @@ for UAV footage this step matters as much as the orientation analysis itself.
 The approach is the standard one: track distinctive features on *static* ground
 with pyramidal Lucas-Kanade optical flow, fit a per-frame transform back to a
 reference frame, and use it to follow the same patch of ground through the
-clip.  Two details are worth flagging:
+clip.  Three details are worth flagging:
 
 * Every frame is matched against the **reference** frame, using the previous
   frame's tracks only as an initial guess.  Chaining frame-to-frame transforms
@@ -18,6 +18,11 @@ clip.  Two details are worth flagging:
 * Nothing is ever warped.  The estimated transform is applied to the *search
   line sample points*, which is a handful of coordinates per frame rather than
   a few million pixels.
+* Features die as the aircraft drifts, so the set is topped back up from the
+  current frame (``stabilise.redetect_fraction``) and the new corners carried
+  back into reference coordinates.  Without it the surviving set thins until
+  the fit fails and the last good transform is held for the rest of the clip --
+  which reads as uncompensated camera motion, i.e. as flow.
 """
 
 from __future__ import annotations

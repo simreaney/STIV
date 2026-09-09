@@ -108,17 +108,22 @@ stiv demo
 
 renders a synthetic river with a known parabolic velocity profile — including
 simulated drone drift, sway and yaw — analyses it, and reports the error against
-ground truth. Expect **≈3% relative RMSE**:
+ground truth. Expect **≈0.6% relative RMSE**:
 
 ```
 stations       19/21 clean, 2 failed and interpolated
-surface U      mean 0.788  median 0.903  max 1.205 m/s
-stabilisation: 1200 features, median residual 0.26 px, max frame shift 59.2 px
+surface U      mean 0.783  median 0.902  max 1.209 m/s
+stabilisation: 1200 features, median residual 0.24 px, max frame shift 59.2 px,
+               0/299 frames fell back to the previous transform, 18 feature top-up(s)
 
-  RMSE           : 0.0099 m/s
-  bias           : +0.0053 m/s
-  relative RMSE  : 2.9 %
+  RMSE           : 0.0033 m/s
+  bias           : +0.0015 m/s
+  relative RMSE  : 0.6 %
 ```
+
+The relative RMSE is taken over the stations moving faster than 0.15 m/s, since
+a relative error is meaningless where the truth approaches zero; the run prints
+how many stations that was.
 
 ---
 
@@ -185,6 +190,16 @@ STI column per row, and the paper only validated `tan φ` from 0.1 to 7. Since
 `tan φ = U·St/Sx`, the knob is `video.frame_step` — the run warns you and names a
 better value when the median drifts out of range.
 
+**Leave `stiv.smooth_sigma` on.** It defaults to 1.5 px, and it is doing more
+than tidying up noise: a feature advancing `tan φ` columns per STI row *aliases*
+once `tan φ` approaches a third of the finest wavelength in the surface texture,
+and aliasing biases the velocity **low** by tens of percent while the coherency
+stays high enough that nothing flags it. On fine texture (finest wavelength ≈ 6
+STI columns) the error at `tan φ` = 2.5 is −23% unsmoothed and −1.6% at
+`smooth_sigma: 1.5`; where the pattern is already well sampled the smoothing
+costs nothing measurable. This is also section 2.3 of the paper, which reports
+the same for its "Case C" smooth patterns.
+
 **Bracket the velocity, but not too tightly.** `stiv.velocity_range_ms` sets the
 `φ_min`/`φ_max` of Eq. (14) and is the mechanism the paper uses to throw away
 vectors corrupted by obstacles. Too wide admits noise; too narrow biases the
@@ -204,10 +219,11 @@ and lose resolution with range.
 | `tan_phi_high` / `tan_phi_low` | outside the validated range; adjust `frame_step` |
 | `out_of_frame` | the search line left the image, often after camera drift |
 | `interpolated` | this station failed and was filled from its neighbours |
+| `median_filtered` | `quality.median_filter_stations` moved this station's velocity |
 
-Advisory flags (`tan_phi_*`) never trigger interpolation: a genuinely slow patch
-near the bank is measuring correctly, and pulling it toward its faster neighbours
-would add error rather than remove it.
+Advisory flags (`tan_phi_*`, `median_filtered`) never trigger interpolation: a
+genuinely slow patch near the bank is measuring correctly, and pulling it toward
+its faster neighbours would add error rather than remove it.
 
 ---
 
