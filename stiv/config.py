@@ -207,10 +207,19 @@ class StiConfig:
     #: Normalise each STI to zero mean / unit variance.
     normalise: bool = True
     #: Contrast-limited adaptive histogram equalisation on the STI.
+    #: Desktop only -- the iOS port has no CLAHE, so a survey.yaml exported
+    #: from the phone never sets it, and setting it here makes a desktop run
+    #: diverge from what the phone would have reported.
     clahe: bool = False
     #: Gaussian smoothing sigma (pixels) applied to the STI.  Section 2.3 of
-    #: the paper shows this materially improves accuracy on smooth patterns.
-    smooth_sigma: float = 0.0
+    #: the paper shows this materially improves accuracy on smooth patterns,
+    #: and it is also what keeps the gradient below the Nyquist limit of the
+    #: surface texture: a feature moving `tan phi` columns per row aliases once
+    #: `tan phi` approaches a third of the finest texture wavelength, which
+    #: biases the velocity *low* by tens of percent with no drop in coherency
+    #: to warn you.  1.5 px suppresses that while costing nothing when the
+    #: pattern is already well sampled; 0.0 disables smoothing entirely.
+    smooth_sigma: float = 1.5
 
     # --- structure tensor -------------------------------------------------- #
     #: Order of the central-difference gradient operator: 4 for Eq. (12),
@@ -426,6 +435,17 @@ class Config:
             raise ConfigError("discharge.enabled needs bathymetry_csv or depths_m")
         if d.enabled and not 0.0 < d.alpha <= 1.5:
             raise ConfigError("discharge.alpha should be a velocity index in (0, 1.5]")
+        if d.enabled and not 0.0 < d.bank_coefficient <= 1.0:
+            raise ConfigError(
+                "discharge.bank_coefficient is the fraction of the near-bank "
+                "velocity retained at the waterline, so it must be in (0, 1]"
+            )
+        if st.smooth_sigma < 0.0:
+            raise ConfigError("stiv.smooth_sigma must be >= 0")
+        if not 0.0 <= st.min_coherency <= 1.0:
+            raise ConfigError("stiv.min_coherency must be in [0, 1]")
+        if any(not 0.0 <= c <= 1.0 for c in st.coherency_levels):
+            raise ConfigError("stiv.coherency_levels must all be in [0, 1]")
 
     def to_dict(self) -> dict[str, Any]:
         return _asdict(self)

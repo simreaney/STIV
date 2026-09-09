@@ -249,6 +249,9 @@ final class RecorderTests: XCTestCase {
         for r in 0..<120 { m[r, 60] += 50.0 }
         var settings = StiSettings()
         settings.removeStaticBackground = true
+        // Isolate the subtraction: the default Gaussian smoothing runs *after*
+        // it and would blend the neighbouring columns back into this one.
+        settings.smoothSigma = 0
         let cleaned = preprocess(m, settings: settings)
         var columnMean = 0.0
         for r in 0..<120 { columnMean += cleaned[r, 60] }

@@ -146,7 +146,7 @@ public struct StiSettings: Codable, Sendable, Equatable {
     public var normalise: Bool = true
     /// Gaussian smoothing sigma (pixels) applied to the STI.  Section 2.3 shows
     /// this materially improves accuracy on smooth patterns.
-    public var smoothSigma: Double = 0.0
+    public var smoothSigma: Double = 1.5
 
     // --- structure tensor ----------------------------------------------- //
 

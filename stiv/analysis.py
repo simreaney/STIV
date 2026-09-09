@@ -53,7 +53,9 @@ FAILURE_FLAGS = frozenset(
 #: Flags meaning "the number is real but near the edge of the method's range".
 #: A genuinely slow station by the bank is the common case, and interpolating
 #: it away from its neighbours would be worse than reporting it.
-ADVISORY_FLAGS = frozenset({"tan_phi_low", "tan_phi_high", "interpolated"})
+ADVISORY_FLAGS = frozenset(
+    {"tan_phi_low", "tan_phi_high", "interpolated", "median_filtered"}
+)
 
 
 @dataclass
@@ -202,12 +204,16 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
             f"shorten stiv.search_line_length_m or move the section"
         )
 
+    _rectification_warnings(geom, warnings)
+
     stis, stab_report, reference_bgr = _collect_stis(cfg, source, geom, progress)
 
     stations, fields, estimates = _analyse_stis(cfg, stis, geom)
 
-    _quality_control(cfg, stations, warnings)
+    # Direction first: it can replace every station's estimate, and quality
+    # control must judge the estimates that are actually going to be reported.
     _direction_check(cfg, stations, stis, fields, estimates, warnings)
+    _quality_control(cfg, stations, warnings)
     _range_advice(cfg, stations, source, warnings)
     warnings.extend(stab_report.warnings())
 
@@ -237,6 +243,33 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
         warnings=warnings,
         elapsed_s=time.perf_counter() - t_start,
     )
+
+
+def _rectification_warnings(geom: SectionGeometry, warnings: list[str]) -> None:
+    """Flag a ground-control fit that will not support the velocities it scales.
+
+    Velocity is linear in ``Sx``, so an error in the image-to-world map passes
+    straight into every station with no attenuation and nothing downstream can
+    detect it.  The residuals are the only evidence available.
+    """
+    rect = geom.rectifier
+    if not isinstance(rect, geometry.HomographyRectifier):
+        return
+
+    tolerance_m = rect.inlier_threshold_m
+    if rect.rmse_m > tolerance_m:
+        warnings.append(
+            f"the ground control points fit to {rect.rmse_m:.3f} m RMSE, worse "
+            f"than the {tolerance_m:.3f} m expected of {geometry._RANSAC_PX:.0f}-pixel "
+            f"clicking accuracy; every velocity scales linearly with this error. "
+            f"Re-check the survey coordinates and the clicked pixels."
+        )
+    if rect.n_inliers < rect.n_gcp:
+        warnings.append(
+            f"{rect.n_gcp - rect.n_inliers} of {rect.n_gcp} ground control "
+            f"point(s) were rejected as outliers by the homography fit; check "
+            f"them for a transcription error or a mismatched point order"
+        )
 
 
 def _collect_stis(
@@ -455,6 +488,12 @@ def _quality_control(cfg: Config, stations: list[StationResult], warnings: list[
 
 
 def _median_filter(stations: list[StationResult], k: int) -> None:
+    """Median-filter the velocity profile across stations.
+
+    Any station the filter actually moves is flagged.  The reported velocity is
+    then no longer the one that station measured, and a silently substituted
+    number that still reports ``ok`` is worse than no filter at all.
+    """
     v = np.array([s.velocity_ms for s in stations], dtype=float)
     half = k // 2
     out = v.copy()
@@ -464,8 +503,11 @@ def _median_filter(stations: list[StationResult], k: int) -> None:
         window = window[np.isfinite(window)]
         if window.size:
             out[i] = float(np.median(window))
-    for s, val in zip(stations, out):
-        s.velocity_ms = float(val)
+    for s, before, after in zip(stations, v, out):
+        s.velocity_ms = float(after)
+        unchanged = before == after or (np.isnan(before) and np.isnan(after))
+        if not unchanged and "median_filtered" not in s.flags:
+            s.flags.append("median_filtered")
 
 
 def _interpolate_flagged(stations: list[StationResult]) -> None:
@@ -511,13 +553,39 @@ def _direction_check(
     cheap: reversing the search line mirrors the STI in space, which negates
     phi and leaves the structure tensor untouched, so the existing orientation
     fields can be reused and only the histogram of Eq. (14) is recomputed.
+
+    The sign cannot be read off the first pass.  ``velocity_raw_ms`` came from
+    the configured -- and nearly always asymmetric -- range, so when the lines
+    face upstream the true angle does not merely sit near that range's boundary
+    but can fall entirely outside it.  Then *no* window lands in range, every
+    station comes back NaN, and the one clue to the direction is gone precisely
+    when it is needed.  So the direction is probed over the full angle range
+    instead, which has no assumed direction to be wrong about.
     """
-    v = np.array([s.velocity_raw_ms for s in stations], dtype=float)
-    ok = np.isfinite(v)
-    if not ok.any():
+    limit = 0.5 * math.pi - 1e-3
+    probe: list[float] = []
+    for s, field_ in zip(stis, fields):
+        if field_ is None:
+            continue
+        est = orientation.mean_orientation_angle(
+            field_,
+            -limit,
+            limit,
+            coherency_levels=cfg.stiv.coherency_levels,
+            n_bins=cfg.stiv.n_angle_bins,
+            min_coherency=cfg.stiv.min_coherency,
+            estimator=cfg.stiv.estimator,
+        )
+        if np.isfinite(est.phi):
+            probe.append(
+                orientation.velocity_from_angle(est.phi, s.sx_m_per_px, s.st_s_per_px)
+            )
+    if not probe:
         return
 
-    med = float(np.median(v[ok]))
+    # Upper median for an even count, matching StivKit's `directionCheck` so
+    # the two implementations decide identically on the same input.
+    med = float(sorted(probe)[len(probe) // 2])
     if med >= 0:
         return
 
@@ -530,21 +598,18 @@ def _direction_check(
         return
 
     v_lo, v_hi = cfg.stiv.velocity_range_ms
+    structural = {"sti_too_small", "out_of_frame"}
     for st, s, field_ in zip(stations, stis, fields):
         if field_ is None:
             continue
         # Mirror the search range about zero and re-run Eq. (14).
         est = _estimate_angle(cfg, s, field_, -v_hi, -v_lo)
+        # Every flag but the structural ones came from the now-discarded first
+        # pass.  Drop them so that quality control -- which runs after this,
+        # once -- judges only the estimate that will actually be reported.
+        st.flags = [f for f in st.flags if f in structural]
         _apply_estimate(cfg, st, s, est, negate=True)
         estimates[st.index] = est
-
-    # Every flag except the structural ones was derived from the discarded
-    # first pass, so clear them before re-running quality control -- otherwise
-    # the advisory flags would be appended a second time.
-    structural = {"sti_too_small", "out_of_frame"}
-    for st in stations:
-        st.flags = [f for f in st.flags if f in structural]
-    _quality_control(cfg, stations, [])
 
     warnings.append(
         msg + "; the search range was mirrored and the stations re-analysed "

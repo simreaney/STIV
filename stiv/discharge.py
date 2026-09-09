@@ -203,12 +203,19 @@ def compute_discharge(
 
     ud = cfg.alpha * us                                  # velocity-index conversion
 
+    # The bank coefficient is a *velocity* reduction -- the near-bank vertical
+    # stands in for water that slows to zero at the waterline.  Applying it to
+    # the panel width instead gives an identical discharge, since Q is linear
+    # in both, but then understates the reported cross-sectional area and so
+    # overstates Q/A.  Area is a number people check against an ADCP, so it is
+    # kept honest here.
+    if len(ud) > 1:
+        ud = ud.copy()
+        ud[0] *= cfg.bank_coefficient
+        ud[-1] *= cfg.bank_coefficient
+
     # --- integration ----------------------------------------------------- #
     width = mid_section_widths(b, left, right)
-    if len(width) > 1:
-        width = width.copy()
-        width[0] *= cfg.bank_coefficient
-        width[-1] *= cfg.bank_coefficient
 
     area = width * depth
     q = area * ud

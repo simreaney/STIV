@@ -41,13 +41,14 @@ public enum StationFlag: String, Sendable, CaseIterable {
     case tanPhiHigh
     case scaleUncertain
     case interpolated
+    case medianFiltered
 
     public var isFailure: Bool {
         switch self {
         case .noOrientation, .stiTooSmall, .lowValidFraction,
              .lowCoherency, .highUncertainty, .outOfFrame:
             return true
-        case .tanPhiLow, .tanPhiHigh, .scaleUncertain, .interpolated:
+        case .tanPhiLow, .tanPhiHigh, .scaleUncertain, .interpolated, .medianFiltered:
             return false
         }
     }
@@ -65,6 +66,7 @@ public enum StationFlag: String, Sendable, CaseIterable {
         case .tanPhiLow:         return "features barely move between frames -- lower the frame step"
         case .scaleUncertain:    return "scale here is extrapolated far from the water-plane fit"
         case .interpolated:      return "this station failed and was filled from its neighbours"
+        case .medianFiltered:    return "the profile median filter moved this station's velocity"
         }
     }
 }
@@ -489,6 +491,12 @@ func qualityControl(survey: Survey, stations: inout [StationResult], warnings: i
     }
 }
 
+/// Median-filter the velocity profile across stations.
+///
+/// Any station the filter actually moves is flagged.  The reported velocity is
+/// then no longer the one that station measured, and a silently substituted
+/// number that still reports `ok` is worse than no filter at all.  Matches
+/// `stiv.analysis._median_filter`.
 func medianFilter(_ stations: inout [StationResult], window k: Int) {
     let v = stations.map(\.velocityMs)
     let half = k / 2
@@ -496,7 +504,14 @@ func medianFilter(_ stations: inout [StationResult], window k: Int) {
         let lo = max(0, i - half)
         let hi = min(v.count, i + half + 1)
         let w = v[lo..<hi].filter(\.isFinite).sorted()
-        if !w.isEmpty { stations[i].velocityMs = w[w.count / 2] }
+        guard !w.isEmpty else { continue }
+        let filtered = w[w.count / 2]
+        let before = v[i]
+        stations[i].velocityMs = filtered
+        let unchanged = before == filtered || (before.isNaN && filtered.isNaN)
+        if !unchanged, !stations[i].flags.contains(.medianFiltered) {
+            stations[i].flags.append(.medianFiltered)
+        }
     }
 }
 

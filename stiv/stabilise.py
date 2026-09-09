@@ -39,6 +39,18 @@ _LK_PARAMS = dict(
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
 )
 _MIN_INLIERS = 6
+#: Frames a reference feature may fail to track before it is retired and its
+#: slot given to a fresh corner.  Short enough to keep the set healthy, long
+#: enough that a feature briefly lost to blur or a passing bird recovers.
+_MAX_DEAD_FRAMES = 5
+#: Minimum frames between top-ups.  Corner detection is not cheap, and the
+#: features injected by one attempt need a frame or two to prove themselves, so
+#: re-running it every frame pays full price for nothing.
+_REDETECT_INTERVAL = 15
+#: Consecutive top-ups that find nothing before the attempt is abandoned.  Once
+#: the aircraft has drifted off the reference frame there is no more static
+#: ground to find, and retrying for the rest of the clip is pure cost.
+_REDETECT_GIVE_UP = 2
 
 
 @dataclass
@@ -48,6 +60,8 @@ class StabilisationReport:
     n_frames: int = 0
     n_failed: int = 0
     n_features: int = 0
+    #: Times the tracked set was topped back up after features died.
+    n_redetections: int = 0
     #: Per-frame RMS reprojection error of the fitted transform, pixels.
     rmse_px: list[float] = field(default_factory=list)
     #: Per-frame displacement of the section centre, pixels.
@@ -60,11 +74,15 @@ class StabilisationReport:
             return "stabilisation: disabled"
         if not self.rmse_px:
             return "stabilisation: no frames processed"
+        redetected = (
+            f", {self.n_redetections} feature top-up(s)" if self.n_redetections else ""
+        )
         return (
             f"stabilisation: {self.n_features} features, "
-            f"median residual {np.median(self.rmse_px):.2f} px, "
+            f"median residual {np.nanmedian(self.rmse_px):.2f} px, "
             f"max frame shift {np.max(self.shift_px):.1f} px, "
-            f"{self.n_failed}/{self.n_frames} frames fell back to the previous transform"
+            f"{self.n_failed}/{self.n_frames} frames fell back to the previous "
+            f"transform{redetected}"
         )
 
     def warnings(self) -> list[str]:
@@ -185,7 +203,8 @@ class Stabiliser:
         self.report = StabilisationReport(enabled=cfg.enabled)
         self.M = np.eye(3)
 
-        self.ref = _as_u8(reference_grey)
+        self._u8 = _u8_scaling(reference_grey)
+        self.ref = _to_u8(reference_grey, self._u8)
         self.prev = self.ref
         self.mask = mask
 
@@ -208,6 +227,12 @@ class Stabiliser:
         )
         self.cur_pts = self.ref_pts.copy()
         self.alive = np.ones(len(self.ref_pts), bool)
+        #: Consecutive frames each reference feature has failed to track for.
+        self.dead_streak = np.zeros(len(self.ref_pts), np.int32)
+        #: How many features the set is topped back up to when it is depleted.
+        self._n_target = len(self.ref_pts)
+        self._redetect_wait = 0
+        self._redetect_barren = 0
         self.report.n_features = len(self.ref_pts)
 
         if len(self.ref_pts) < _MIN_INLIERS:
@@ -231,7 +256,7 @@ class Stabiliser:
         if not self.enabled:
             return self.M
 
-        cur = _as_u8(frame_grey)
+        cur = _to_u8(frame_grey, self._u8)
         self.report.n_frames += 1
 
         # Predict where the reference features should be, then refine with LK
@@ -274,6 +299,7 @@ class Stabiliser:
             # Keep the last good transform and re-seed from its prediction.
             self.cur_pts = transform_points(self.M, self.ref_pts).astype(np.float32)
             self.alive = np.zeros(len(self.ref_pts), bool)
+            self.dead_streak = self.dead_streak + 1
             self.prev = cur
             return self.M
 
@@ -306,8 +332,108 @@ class Stabiliser:
         self.cur_pts = transform_points(self.M, self.ref_pts).astype(np.float32)
         self.cur_pts[alive] = nxt[alive]
         self.alive = alive
+        self.dead_streak = np.where(alive, 0, self.dead_streak + 1)
         self.prev = cur
+
+        # Features die as the aircraft drifts: bank texture leaves the frame,
+        # motion blur washes a corner out.  Without a top-up the surviving set
+        # thins until the fit fails and the last good transform is held for the
+        # rest of the clip -- which reads as uncompensated camera motion, i.e.
+        # as flow.
+        self._redetect_wait = max(0, self._redetect_wait - 1)
+        if (
+            self.cfg.redetect_fraction > 0.0
+            and self._n_target > 0
+            and self._redetect_wait == 0
+            and self._redetect_barren < _REDETECT_GIVE_UP
+            and int(alive.sum()) < self.cfg.redetect_fraction * self._n_target
+        ):
+            self._redetect(cur)
+            self._redetect_wait = _REDETECT_INTERVAL
+
         return self.M
+
+    # ------------------------------------------------------------------ #
+    def _redetect(self, cur: np.ndarray) -> None:
+        """Retire long-dead tracks and top the set back up from ``cur``.
+
+        Corners are detected in the *current* frame -- the reference frame's
+        own corners are the ones that just died -- and then carried back into
+        reference coordinates through the inverse of the current transform, so
+        the reference correspondence that keeps this drift-free is preserved.
+        The static-ground mask is warped forward for the same reason.
+
+        A feature whose back-projection falls outside the reference frame is
+        dropped: there is no reference appearance to match it against.  That is
+        a real limit of registering everything to one reference, and it is the
+        price of not accumulating drift.
+        """
+        keep = self.dead_streak < _MAX_DEAD_FRAMES
+        if not keep.all():
+            self.ref_pts = self.ref_pts[keep]
+            self.cur_pts = self.cur_pts[keep]
+            self.alive = self.alive[keep]
+            self.dead_streak = self.dead_streak[keep]
+
+        room = int(self.cfg.max_features) - len(self.ref_pts)
+        if room <= 0:
+            self._redetect_barren += 1
+            return
+        try:
+            m_inv = np.linalg.inv(self.M)
+        except np.linalg.LinAlgError:
+            self._redetect_barren += 1
+            return
+
+        mask = self.mask
+        if mask is not None:
+            h, w = cur.shape[:2]
+            mask = cv2.warpPerspective(
+                mask, self.M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0
+            )
+
+        found = cv2.goodFeaturesToTrack(
+            cur,
+            maxCorners=room,
+            qualityLevel=self.cfg.quality_level,
+            minDistance=self.cfg.min_distance_px,
+            mask=mask,
+            blockSize=7,
+        )
+        if found is None:
+            self._redetect_barren += 1
+            return
+        cur_new = found.reshape(-1, 2).astype(np.float32)
+
+        # Discard anything that duplicates a track already held.
+        if len(self.cur_pts):
+            gap = np.linalg.norm(
+                cur_new[:, None, :] - self.cur_pts[None, :, :], axis=2
+            ).min(axis=1)
+            cur_new = cur_new[gap > self.cfg.min_distance_px]
+        if not len(cur_new):
+            self._redetect_barren += 1
+            return
+
+        ref_new = transform_points(m_inv, cur_new).astype(np.float32)
+        h, w = self.ref.shape[:2]
+        inside = (
+            (ref_new[:, 0] >= 0) & (ref_new[:, 0] <= w - 1)
+            & (ref_new[:, 1] >= 0) & (ref_new[:, 1] <= h - 1)
+        )
+        ref_new, cur_new = ref_new[inside], cur_new[inside]
+        if not len(ref_new):
+            self._redetect_barren += 1
+            return
+
+        self.ref_pts = np.vstack([self.ref_pts, ref_new]).astype(np.float32)
+        self.cur_pts = np.vstack([self.cur_pts, cur_new]).astype(np.float32)
+        self.alive = np.concatenate([self.alive, np.ones(len(ref_new), bool)])
+        self.dead_streak = np.concatenate(
+            [self.dead_streak, np.zeros(len(ref_new), np.int32)]
+        )
+        self._redetect_barren = 0
+        self.report.n_redetections += 1
 
     # ------------------------------------------------------------------ #
     def _probe_shift(self, probe_px: Optional[np.ndarray]) -> float:
@@ -317,11 +443,34 @@ class Stabiliser:
         return float(np.max(np.linalg.norm(moved - np.asarray(probe_px, float), axis=1)))
 
 
-def _as_u8(img: np.ndarray) -> np.ndarray:
-    if img.dtype == np.uint8:
-        return img
-    a = np.asarray(img, dtype=np.float32)
+def _u8_scaling(reference: np.ndarray) -> Optional[tuple[float, float]]:
+    """Fix the float-to-byte mapping once, from the reference frame.
+
+    Returns ``None`` when the input is already ``uint8`` and needs no mapping.
+
+    Lucas-Kanade assumes brightness constancy: the same patch of ground must
+    carry the same grey value in the reference frame and in the current one.
+    Rescaling each frame by its *own* min and max breaks that assumption --
+    one specular highlight drifting into view compresses the real texture into
+    a fraction of the byte range, and the tracker loses every feature at once
+    while the fitted transform quietly falls back to the previous frame's.  So
+    the mapping is derived once, here, and applied unchanged to every frame.
+    """
+    if reference.dtype == np.uint8:
+        return None
+    a = np.asarray(reference, dtype=np.float32)
     lo, hi = float(a.min()), float(a.max())
     if hi - lo < 1e-9:
-        return np.zeros(a.shape, np.uint8)
-    return ((a - lo) * (255.0 / (hi - lo))).astype(np.uint8)
+        return (lo, lo + 1.0)
+    return (lo, hi)
+
+
+def _to_u8(img: np.ndarray, scaling: Optional[tuple[float, float]]) -> np.ndarray:
+    """Apply the fixed mapping from :func:`_u8_scaling`, clipping outliers."""
+    if img.dtype == np.uint8:
+        return img
+    if scaling is None:
+        return np.clip(np.asarray(img, dtype=np.float32), 0.0, 255.0).astype(np.uint8)
+    lo, hi = scaling
+    a = np.asarray(img, dtype=np.float32)
+    return np.clip((a - lo) * (255.0 / (hi - lo)), 0.0, 255.0).astype(np.uint8)

@@ -54,8 +54,12 @@ class TestPreprocess:
 
     def test_normalisation_gives_unit_variance(self):
         rng = np.random.default_rng(2)
+        # smooth_sigma is pinned off: the default Gaussian smoothing runs
+        # *after* normalisation and would take the variance of white noise back
+        # down well below one.  This isolates the normalisation step.
         out = preprocess(rng.standard_normal((60, 60)) * 17.0 + 3.0,
-                         StiConfig(remove_static_background=False, normalise=True))
+                         StiConfig(remove_static_background=False, normalise=True,
+                                   smooth_sigma=0.0))
         assert out.std() == pytest.approx(1.0, rel=1e-6)
 
     def test_nans_are_filled(self):
@@ -171,3 +175,31 @@ class TestDischarge:
                               alpha=1.0, bank_coefficient=1.0)
         r = compute_discharge(cfg, [5.0], [1.0], 10.0)
         assert r.depths_m[0] == pytest.approx(2.0)
+
+
+class TestBankCoefficient:
+    def test_it_does_not_shrink_the_reported_area(self):
+        """It is a *velocity* coefficient, so the area must stay geometric.
+
+        Applied to the panel width instead it yields an identical discharge --
+        Q is linear in both -- while understating the cross-sectional area and
+        so overstating Q/A.  Area is a number people check against an ADCP.
+        """
+        b = np.linspace(0, 20, 11)
+        cfg = DischargeConfig(enabled=True, depths_m=[2.0] * 11,
+                              alpha=0.85, bank_coefficient=0.7)
+        r = compute_discharge(cfg, b, [1.0] * 11, 20.0)
+
+        assert r.area_m2 == pytest.approx(20.0 * 2.0)
+        assert r.panel_width_m.sum() == pytest.approx(r.wetted_width_m)
+
+    def test_it_still_reduces_the_discharge(self):
+        b = np.linspace(0, 20, 11)
+        kw = dict(enabled=True, depths_m=[2.0] * 11, alpha=1.0)
+        full = compute_discharge(DischargeConfig(bank_coefficient=1.0, **kw),
+                                 b, [1.0] * 11, 20.0)
+        reduced = compute_discharge(DischargeConfig(bank_coefficient=0.7, **kw),
+                                    b, [1.0] * 11, 20.0)
+        assert reduced.discharge_m3s < full.discharge_m3s
+        # Only the two edge panels change, and only through their velocity.
+        assert reduced.area_m2 == pytest.approx(full.area_m2)

@@ -58,8 +58,24 @@ final class GoldenFixtureTests: XCTestCase {
             let hist: [Double]
             let bin_centres: [Double]
         }
+        struct Preprocess: Decodable {
+            struct Settings: Decodable {
+                let remove_static_background: Bool
+                let normalise: Bool
+                let clahe: Bool
+                let smooth_sigma: Double
+            }
+            struct Cell: Decodable { let r: Int; let c: Int; let value: Double }
+            let settings: Settings
+            let mean: Double
+            let std: Double
+            let min: Double
+            let max: Double
+            let probes: [Cell]
+        }
         let sti: Sti
         let parameters: Parameters
+        let preprocess: Preprocess
         let field: Field
         let estimate: Estimate
     }
@@ -107,6 +123,44 @@ final class GoldenFixtureTests: XCTestCase {
             windowType: type,
             overlap: golden.parameters.overlap,
             gradientOrder: order)
+    }
+
+    /// `preprocess` runs *before* the structure tensor, so a divergence here
+    /// moves every angle that follows.  Nothing pinned it until this test,
+    /// which is why the port's missing CLAHE branch went unnoticed.
+    ///
+    /// At 1e-9 this catches normalising after smoothing instead of before, a
+    /// boundary rule of "reflect" where scipy's "nearest" was meant, a
+    /// different Gaussian truncation radius, and a wrong sigma.  It does not
+    /// catch the order of the two mean subtractions, because double centring
+    /// commutes: either order gives X - colmean - rowmean + grandmean.
+    func testPreprocessMatchesThePython() throws {
+        let (golden, sti) = try skipUnlessPresent()
+        let want = golden.preprocess
+
+        XCTAssertFalse(want.settings.clahe,
+                       "the Swift port has no CLAHE; the fixture must not enable it")
+
+        var settings = StiSettings()
+        settings.removeStaticBackground = want.settings.remove_static_background
+        settings.normalise = want.settings.normalise
+        settings.smoothSigma = want.settings.smooth_sigma
+
+        let got = StivKit.preprocess(sti, settings: settings)
+        XCTAssertEqual(got.rows, sti.rows)
+        XCTAssertEqual(got.cols, sti.cols)
+
+        let (mean, std) = meanAndStd(got.data)
+        XCTAssertEqual(mean, want.mean, accuracy: 1e-9)
+        XCTAssertEqual(std, want.std, accuracy: 1e-9)
+        XCTAssertEqual(got.data.min() ?? .nan, want.min, accuracy: 1e-9)
+        XCTAssertEqual(got.data.max() ?? .nan, want.max, accuracy: 1e-9)
+
+        // Corners and edges, where a boundary rule differs.
+        for cell in want.probes {
+            XCTAssertEqual(got[cell.r, cell.c], cell.value, accuracy: 1e-9,
+                           "cell (\(cell.r), \(cell.c))")
+        }
     }
 
     func testWindowGridMatchesThePython() throws {

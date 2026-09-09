@@ -62,9 +62,32 @@ public enum GradientOrder: Int, CaseIterable, Codable, Sendable {
 public enum WindowType: String, Codable, Sendable {
     /// Reproduces the paper's rectangular integration area `A`.
     case box
-    /// Smoothly tapered over the same nominal support; better-conditioned tensor.
+    /// Smoothly tapered; a better-conditioned tensor, but note that its
+    /// support is *wider* than the box's -- see `supportRadius(windowPx:)`.
     case gaussian
+
+    /// Sigma of the `.gaussian` window for a nominal window size.
+    func sigma(windowPx: Int) -> Double { Double(windowPx) / 4.0 }
+
+    /// Support radius in pixels: the margin the analysis must trim per edge.
+    ///
+    /// The box window reaches `windowPx / 2`.  The Gaussian one reaches
+    /// `truncate * sigma`, which at `sigma = windowPx / 4` is a full
+    /// `windowPx` -- twice as far.  Trimming only the box margin left the
+    /// outermost Gaussian windows integrating clamped-edge gradients, which
+    /// biases the angle in a band two windows deep at each end of the STI.
+    /// Matches `stiv.orientation._window_radius`.
+    func supportRadius(windowPx: Int) -> Int {
+        switch self {
+        case .box:      return windowPx / 2
+        case .gaussian: return Int(gaussianTruncate * sigma(windowPx: windowPx) + 0.5)
+        }
+    }
 }
+
+/// `scipy.ndimage.gaussian_filter`'s default kernel cut-off, in sigmas, which
+/// `Matrix.gaussianMean` reproduces.
+let gaussianTruncate = 4.0
 
 // MARK: - results
 
@@ -198,8 +221,7 @@ public func structureTensorField(
 ) throws -> OrientationField {
     let nt = sti.rows
     let nx = sti.cols
-    let half = windowPx / 2
-    let margin = half + gradientOrder.pad
+    let margin = windowType.supportRadius(windowPx: windowPx) + gradientOrder.pad
     guard nt > 2 * margin + 1, nx > 2 * margin + 1 else {
         throw OrientationError.stiTooSmall(
             rows: nt, cols: nx, windowPx: windowPx, order: gradientOrder.rawValue)
@@ -212,7 +234,8 @@ public func structureTensorField(
     let window: (Matrix) -> Matrix = { m in
         switch windowType {
         case .box:      return m.boxMean(size: windowPx)
-        case .gaussian: return m.gaussianMean(sigma: Double(windowPx) / 4.0)
+        case .gaussian: return m.gaussianMean(sigma: windowType.sigma(windowPx: windowPx),
+                                             truncate: gaussianTruncate)
         }
     }
 

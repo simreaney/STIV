@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from stiv import Config, run
+from stiv.analysis import ADVISORY_FLAGS
 from stiv.synthetic import SyntheticRiver, make_config, render
 
 
@@ -93,6 +94,28 @@ class TestFixedCamera:
         assert stats["rmse"] < 0.05
         both = np.isfinite(forward.velocities) & np.isfinite(reversed_.velocities)
         assert np.allclose(forward.velocities[both], reversed_.velocities[both], atol=0.05)
+
+    def test_reversed_flow_is_corrected_when_no_window_is_in_range(self, clean_clip):
+        """The first pass can come back entirely NaN, and must still recover.
+
+        The test above leans on noise scattering *some* windows into the
+        configured range, which leaves a negative median to read the direction
+        from.  Narrow the range and nothing lands inside it at all: every
+        station's first pass is NaN, so there is no sign to read and the
+        correction never fires -- which reported a wholly failed
+        cross-section rather than a reversed one.  The direction is therefore
+        probed over the full angle range, which has no assumed direction to be
+        wrong about.
+        """
+        river, video, d = clean_clip
+        res = analyse(river, video, d / "rev_narrow",
+                      flow={"reverse": True},
+                      stiv={"velocity_range_ms": (0.3, 1.5)})
+
+        assert any("opposite to the assumed downstream" in w for w in res.warnings)
+        assert np.nanmedian(res.velocities) > 0
+        measured = sum(1 for st in res.stations if not st.failed)
+        assert measured > 0.5 * len(res.stations)
 
     def test_frame_step_does_not_change_the_answer(self, clean_clip):
         """tan(phi) doubles with frame_step, but Sx/St halves, so U is invariant.
@@ -181,6 +204,22 @@ class TestOutputsAndQuality:
         assert q.panel_width_m[0] == pytest.approx(q.panel_width_m[1] / 2)
         assert q.panel_width_m[-1] == pytest.approx(q.panel_width_m[-2] / 2)
         assert q.panel_width_m.sum() == pytest.approx(river.channel_width_m)
+
+    def test_median_filter_flags_the_stations_it_moves(self, clean_clip):
+        """A substituted velocity that still reports ``ok`` is worse than none.
+
+        The filter is advisory, so it must not make a station eligible for
+        interpolation either.
+        """
+        river, video, d = clean_clip
+        res = analyse(river, video, d / "medfilt",
+                      quality={"median_filter_stations": 3})
+
+        moved = [st for st in res.stations if "median_filtered" in st.flags]
+        assert moved, "the filter changed nothing, so this proves nothing"
+        assert all(not st.ok for st in moved)
+        assert all("median_filtered" in ADVISORY_FLAGS for _ in moved)
+        assert not any(st.failed and st.flags == ["median_filtered"] for st in moved)
 
     def test_figures_are_written(self, clean_clip, tmp_path):
         from stiv import plotting

@@ -81,6 +81,37 @@ class ScaleRectifier(Rectifier):
         return f"uniform scale, {self.m_per_px * 100:.3f} cm/pixel (nadir view assumed)"
 
 
+#: Clicking accuracy a ground control point is expected to be good to, pixels.
+_RANSAC_PX = 3.0
+
+
+def _provisional_scale(gcp_px: ArrayLike, gcp_world: ArrayLike) -> float:
+    """Rough metres-per-pixel from the control points, before any fit.
+
+    Only used to express a pixel tolerance in the world units that
+    :func:`cv2.findHomography` measures its residuals in.  The median over all
+    point pairs is robust to a single bad point, which is the whole reason the
+    tolerance is wanted.
+    """
+    p = np.atleast_2d(np.asarray(gcp_px, dtype=float))
+    w = np.atleast_2d(np.asarray(gcp_world, dtype=float))
+    ratios = []
+    for i in range(len(p)):
+        for j in range(i + 1, len(p)):
+            d_px = float(np.linalg.norm(p[i] - p[j]))
+            if d_px > 1e-9:
+                ratios.append(float(np.linalg.norm(w[i] - w[j])) / d_px)
+    if not ratios:
+        raise ConfigError("the ground control points are coincident in the image")
+    scale = float(np.median(ratios))
+    if not scale > 0:
+        raise ConfigError(
+            "the ground control points are coincident in world coordinates; "
+            "check that gcp_world is not all the same point"
+        )
+    return scale
+
+
 class HomographyRectifier(Rectifier):
     """Plane-to-plane projective mapping fitted to ground control points.
 
@@ -96,8 +127,16 @@ class HomographyRectifier(Rectifier):
         if len(src) < 4:
             raise ConfigError("a homography needs at least 4 ground control points")
 
+        # cv2.findHomography measures its RANSAC reprojection error in the
+        # *destination* space -- which here is world metres, not pixels.  A bare
+        # threshold of 3.0 therefore admits a three-metre blunder as an inlier,
+        # i.e. disables the robust fit entirely at any realistic ground sample
+        # distance.  Convert the intended three-pixel tolerance using a scale
+        # taken from the control points themselves, by median over point pairs
+        # so that one mis-surveyed point cannot inflate it.
         method = cv2.RANSAC if len(src) >= 5 else 0
-        H, mask = cv2.findHomography(src, dst, method, 3.0)
+        self.inlier_threshold_m = _RANSAC_PX * _provisional_scale(gcp_px, gcp_world)
+        H, mask = cv2.findHomography(src, dst, method, self.inlier_threshold_m)
         if H is None:
             raise ConfigError(
                 "could not fit a homography to the given ground control points; "

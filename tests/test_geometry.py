@@ -177,3 +177,38 @@ class TestConfigValidation:
         gsd = cfg.rectify.resolve_m_per_px(960)
         expected = 2 * 60.0 * math.tan(math.radians(84.0) / 2) / 960
         assert gsd == pytest.approx(expected)
+
+
+class TestGcpOutlierRejection:
+    """``cv2.findHomography`` measures its RANSAC error in the *destination*
+    space.  The destination here is world metres, so a bare threshold of 3.0
+    means three metres -- 150 px at 2 cm/px -- and the robust fit is off.
+    """
+
+    MPP = 0.02
+    PX = np.array([[100, 100], [900, 100], [900, 700], [100, 700],
+                   [500, 400], [300, 600]], float)
+
+    def world(self):
+        return np.column_stack([self.PX[:, 0] * self.MPP, -self.PX[:, 1] * self.MPP])
+
+    def test_threshold_is_three_pixels_worth_of_metres(self):
+        r = HomographyRectifier(self.PX, self.world(), SHAPE)
+        assert r.inlier_threshold_m == pytest.approx(3.0 * self.MPP, rel=0.05)
+
+    def test_a_blundered_control_point_is_rejected(self):
+        blundered = self.world()
+        blundered[4] += (2.0, 0.0)              # a 2 m (100 px) transcription error
+        r = HomographyRectifier(self.PX, blundered, SHAPE)
+        assert r.n_inliers == len(self.PX) - 1
+
+    def test_ordinary_clicking_error_is_kept(self):
+        jittered = self.world()
+        jittered[4] += (2.0 * self.MPP, 0.0)    # 2 px, i.e. a steady hand
+        r = HomographyRectifier(self.PX, jittered, SHAPE)
+        assert r.n_inliers == len(self.PX)
+
+    def test_coincident_image_points_are_rejected(self):
+        px = np.zeros((4, 2))
+        with pytest.raises(ConfigError, match="coincident"):
+            HomographyRectifier(px, self.world()[:4], SHAPE)

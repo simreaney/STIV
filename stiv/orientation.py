@@ -91,8 +91,8 @@ def central_difference(img: np.ndarray, axis: int, order: int = 4) -> np.ndarray
     """Central-difference derivative along ``axis`` with the given stencil order.
 
     Edges are handled by reflection; the affected margin is masked out later by
-    :func:`structure_tensor_field`, which trims ``order // 2 + window // 2``
-    pixels from every side.
+    :func:`structure_tensor_field`, which trims ``order // 2`` plus the window's
+    own support radius (see :func:`_window_radius`) from every side.
     """
     try:
         k = _STENCILS[order]
@@ -115,14 +115,43 @@ def central_difference(img: np.ndarray, axis: int, order: int = 4) -> np.ndarray
     return out
 
 
+#: ``scipy.ndimage.gaussian_filter``'s default kernel cut-off, in sigmas.
+_GAUSSIAN_TRUNCATE = 4.0
+
+
+def _window_sigma(window_px: int) -> float:
+    """Sigma of the ``"gaussian"`` window for a nominal window size."""
+    return window_px / 4.0
+
+
+def _window_radius(window_px: int, window_type: str) -> int:
+    """Support radius of the Eq. (3) window ``w``, in pixels.
+
+    This is the margin the analysis must trim from every edge.  The box window
+    reaches ``window_px // 2``.  The Gaussian one reaches
+    ``truncate * sigma``, which at ``sigma = window_px / 4`` is a full
+    ``window_px`` -- twice as far.  Trimming only the box margin left the
+    outermost Gaussian windows integrating reflection-padded gradients, which
+    biases the angle in a band two windows deep at each end of the STI.
+    """
+    if window_type == "box":
+        return window_px // 2
+    if window_type == "gaussian":
+        return int(_GAUSSIAN_TRUNCATE * _window_sigma(window_px) + 0.5)
+    raise ValueError(f"window_type must be 'box' or 'gaussian', got {window_type!r}")
+
+
 def _window_filter(a: np.ndarray, window_px: int, window_type: str) -> np.ndarray:
     """Apply the window function ``w`` of Eq. (3) over the local area ``A``."""
     if window_type == "box":
         # The paper's rectangular integration area A (31 x 31 px by default).
         return uniform_filter(a, size=window_px, mode="nearest")
     if window_type == "gaussian":
-        # Same nominal support, smoothly tapered: better-conditioned tensor.
-        return gaussian_filter(a, sigma=window_px / 4.0, mode="nearest")
+        # Smoothly tapered: a better-conditioned tensor, but note the support
+        # is wider than the box's -- see _window_radius.
+        return gaussian_filter(
+            a, sigma=_window_sigma(window_px), truncate=_GAUSSIAN_TRUNCATE, mode="nearest"
+        )
     raise ValueError(f"window_type must be 'box' or 'gaussian', got {window_type!r}")
 
 
@@ -158,8 +187,7 @@ def structure_tensor_field(
         raise ValueError(f"STI must be 2-D (time, space), got shape {sti.shape}")
 
     nt, nx = sti.shape
-    half = window_px // 2
-    margin = half + len(_STENCILS[gradient_order]) // 2
+    margin = _window_radius(window_px, window_type) + len(_STENCILS[gradient_order]) // 2
     if nt <= 2 * margin + 1 or nx <= 2 * margin + 1:
         raise ValueError(
             f"STI of shape {sti.shape} is too small for a {window_px}px window "

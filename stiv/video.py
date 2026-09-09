@@ -112,9 +112,17 @@ class FrameSource:
 
     # ------------------------------------------------------------------ #
     def to_grey(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """Collapse a BGR frame to the scalar brightness field ``g``."""
+        """Collapse a BGR frame to the scalar brightness field ``g``.
+
+        The plain conversion is left as ``uint8``.  Promoting it to float here
+        would cost a full-frame copy on every frame and buy nothing: the STI
+        sampler converts the handful of pixels it actually reads, and the
+        stabiliser wants bytes anyway.  Custom ``channel_weights`` can leave the
+        0-255 range (a colour-difference channel goes negative), so those stay
+        float and the stabiliser scales them once, against the reference frame.
+        """
         if self.channel_weights is None:
-            return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         return (frame_bgr.astype(np.float32) * self.channel_weights[None, None, :]).sum(axis=2)
 
     def frames(self, colour: bool = False) -> Iterator[np.ndarray]:

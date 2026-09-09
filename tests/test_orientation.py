@@ -171,3 +171,24 @@ class TestEq16:
     def test_angle_range_stays_inside_the_tangent_singularity(self):
         lo, hi = angle_range_from_velocity(-1e9, 1e9, 0.02, 1 / 30)
         assert -math.pi / 2 < lo < hi < math.pi / 2
+
+
+def test_gaussian_window_trims_its_own_wider_support():
+    """The Gaussian window reaches 4 sigma = ``window_px``, not ``window_px // 2``.
+
+    Trimming only the box margin left the outermost Gaussian windows
+    integrating reflection-padded gradients, biasing the angle in a band two
+    windows deep at each end of every STI.
+    """
+    rng = np.random.default_rng(0)
+    base = rng.standard_normal((200, 200))
+    perturbed = base.copy()
+    perturbed[:5, :] += 500.0                      # only the first five rows differ
+
+    for window_type, first_row in (("box", 17), ("gaussian", 33)):
+        a = structure_tensor_field(base, window_px=31, window_type=window_type)
+        b = structure_tensor_field(perturbed, window_px=31, window_type=window_type)
+        assert a.centres_t[0] == first_row
+        moved = a.centres_t[np.any(np.abs(a.phi - b.phi) > 1e-9, axis=1)]
+        # Only the first window row, which legitimately overlaps rows 2-4.
+        assert list(moved) == [first_row]
