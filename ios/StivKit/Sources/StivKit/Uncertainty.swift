@@ -75,6 +75,22 @@ public struct ScaleSettings: Codable, Sendable, Equatable {
     public var degradedVioScaleSigma: Double = 0.05
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case planeHeightSigmaM, gravityTiltSigmaDegrees, vioScaleSigma, degradedVioScaleSigma
+    }
+
+    // Missing keys take their defaults, so a survey saved before a field
+    // existed still loads; synthesized decoding would reject the whole file.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var d = ScaleSettings()
+        d.planeHeightSigmaM = try c.decodeIfPresent(Double.self, forKey: .planeHeightSigmaM) ?? d.planeHeightSigmaM
+        d.gravityTiltSigmaDegrees = try c.decodeIfPresent(Double.self, forKey: .gravityTiltSigmaDegrees) ?? d.gravityTiltSigmaDegrees
+        d.vioScaleSigma = try c.decodeIfPresent(Double.self, forKey: .vioScaleSigma) ?? d.vioScaleSigma
+        d.degradedVioScaleSigma = try c.decodeIfPresent(Double.self, forKey: .degradedVioScaleSigma) ?? d.degradedVioScaleSigma
+        self = d
+    }
 }
 
 /// Relative (fractional) 1-sigma uncertainty of `Sx` at one station.
@@ -103,13 +119,27 @@ public func relativeScaleUncertainty(
 
 /// The advice that goes with a large uncertainty, phrased so it is actionable
 /// on the bank rather than in a lab.
+///
+/// A non-finite `worstRelative` is the model saying it knows nothing -- the
+/// camera at, or below, the fitted water plane -- and that deserves a warning
+/// of its own rather than the silence an `isFinite` guard used to give it.
 public func scaleAdvice(
     worstRelative: Double,
     atRangeM: Double,
     cameraHeightM: Double,
     threshold: Double
 ) -> String? {
-    guard worstRelative > threshold, worstRelative.isFinite else { return nil }
+    guard worstRelative.isFinite else {
+        if !(cameraHeightM > 0.05) {
+            return "the camera is only \(decimals(cameraHeightM, 2)) m above the fitted water "
+                 + "plane -- at or below the surface, which the scale-uncertainty model cannot "
+                 + "describe. Check the water-plane fit. Velocities are still reported, but their "
+                 + "scale uncertainty is unknown."
+        }
+        return "the scale uncertainty could not be computed (check the scale settings); "
+             + "velocities are still reported, but their scale uncertainty is unknown."
+    }
+    guard worstRelative > threshold else { return nil }
     let suggestedHeight = cameraHeightM * worstRelative / threshold
     return "scale at the far side of the section is uncertain to \(percent(worstRelative)) "
          + "(range \(decimals(atRangeM, 1)) m from a camera \(decimals(cameraHeightM, 2)) m "

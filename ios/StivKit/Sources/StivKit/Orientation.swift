@@ -89,16 +89,32 @@ public enum WindowType: String, Codable, Sendable {
 /// `Matrix.gaussianMean` reproduces.
 let gaussianTruncate = 4.0
 
+/// Smallest STI extent, in rows or in columns, that fits one analysis window:
+/// `stiv.orientation.min_sti_size`.
+///
+/// `structureTensorField` refuses anything smaller.  Exposed so a recording
+/// that is too short, or a search line with too few samples, can be refused
+/// before the analysis rather than discovered station by station afterwards --
+/// where it used to read as a texture or velocity-range problem.
+public func minStiSize(
+    windowPx: Int,
+    windowType: WindowType = .box,
+    gradientOrder: GradientOrder = .four
+) -> Int {
+    2 * (windowType.supportRadius(windowPx: windowPx) + gradientOrder.pad) + 2
+}
+
 // MARK: - results
 
 /// Per-window orientation angles and coherencies over one STI.
-public struct OrientationField {
+public struct OrientationField: Sendable {
     /// Radians at window centres, measured from the time axis toward the space
     /// axis, positive for downstream motion along the search line.
     public let phi: Matrix
     /// In `[0, 1]`; Eq. (11).
     public let coherency: Matrix
-    /// Trace of `J`: gradient power. Used to spot dead (textureless) windows.
+    /// Trace of `J`: the window's gradient power.  Eq. (14) uses it to drop
+    /// windows with no texture at all -- see `flatWindows(_:)`.
     public let energy: Matrix
     /// STI row index of each window centre.
     public let centresT: [Int]
@@ -109,13 +125,16 @@ public struct OrientationField {
 }
 
 /// Result of the Eq. (14) weighted average over one STI.
-public struct AngleEstimate {
+public struct AngleEstimate: Sendable {
     /// Radians; `nan` if nothing usable.
     public let phi: Double
     public let tanPhi: Double
-    /// Coherency-weighted spread of in-range angles, radians.
+    /// Standard deviation of the summed Eq. (14) histogram, radians: the
+    /// *spread* of the individual window angles about the mean, not the
+    /// standard error of the mean itself.
     public let phiStd: Double
-    /// Fraction of windows falling inside `[phiMin, phiMax]`.
+    /// Fraction of *all* windows that carry texture and fall inside
+    /// `[phiMin, phiMax]`.  Featureless windows count against it.
     public let validFraction: Double
     /// Mean coherency of the in-range windows.
     public let meanCoherency: Double
@@ -157,6 +176,10 @@ public enum OrientationError: Error, CustomStringConvertible {
     case stiTooSmall(rows: Int, cols: Int, windowPx: Int, order: Int)
     case noWindowsFit(windowPx: Int)
     case badAngleRange(min: Double, max: Double)
+    /// A parameter no analysis can run with -- a window of no pixels, a NaN
+    /// overlap, an empty histogram.  Thrown rather than trapped: these reach
+    /// the analysis from user-editable settings.
+    case invalidParameter(String)
 
     public var description: String {
         switch self {
@@ -167,7 +190,9 @@ public enum OrientationError: Error, CustomStringConvertible {
         case let .noWindowsFit(windowPx):
             return "no valid local windows fit inside the STI; reduce windowPx (\(windowPx))"
         case let .badAngleRange(min, max):
-            return "need phiMin < phiMax, got \(min) and \(max)"
+            return "need finite phiMin < phiMax, got \(min) and \(max)"
+        case let .invalidParameter(message):
+            return message
         }
     }
 }
@@ -180,23 +205,53 @@ public enum OrientationError: Error, CustomStringConvertible {
 /// `structureTensorField`, which trims `order/2 + window/2` pixels from every
 /// side.
 public func centralDifference(_ img: Matrix, axis: Axis, order: GradientOrder = .four) -> Matrix {
-    let k = order.stencil
+    // Only the non-zero taps, in stencil order: the accumulation below must
+    // add the same products in the same order as numpy's loop over the
+    // stencil, or the last bit -- and the golden fixture -- moves.
+    let taps = order.stencil.enumerated().filter { $0.element != 0.0 }
+    let coefficients = taps.map(\.element)
+    let offsets = taps.map { $0.offset - order.pad }
     let pad = order.pad
-    let n = axis == .space ? img.cols : img.rows
-    let outer = axis == .space ? img.rows : img.cols
+    let rows = img.rows
+    let cols = img.cols
 
-    var out = Matrix(rows: img.rows, cols: img.cols)
-    for o in 0..<outer {
-        for i in 0..<n {
-            var acc = 0.0
-            for (j, c) in k.enumerated() where c != 0.0 {
-                let src = Matrix.reflectIndex(i + j - pad, n)
-                acc += c * img.at(outer: o, inner: src, axis: axis)
+    var out = [Double](repeating: 0, count: img.count)
+    img.data.withUnsafeBufferPointer { src in
+        out.withUnsafeMutableBufferPointer { dst in
+            switch axis {
+            case .space:
+                for r in 0..<rows {
+                    let base = r * cols
+                    for c in 0..<cols {
+                        var acc = 0.0
+                        if c >= pad && c + pad < cols {
+                            for t in coefficients.indices {
+                                acc += coefficients[t] * src[base + c + offsets[t]]
+                            }
+                        } else {
+                            for t in coefficients.indices {
+                                acc += coefficients[t]
+                                    * src[base + Matrix.reflectIndex(c + offsets[t], cols)]
+                            }
+                        }
+                        dst[base + c] = acc
+                    }
+                }
+            case .time:
+                // A whole row of outputs per tap, so memory is read along rows
+                // while each output still sums its taps in stencil order.
+                for r in 0..<rows {
+                    let o = r * cols
+                    for t in coefficients.indices {
+                        let s = Matrix.reflectIndex(r + offsets[t], rows) * cols
+                        let ct = coefficients[t]
+                        for c in 0..<cols { dst[o + c] += ct * src[s + c] }
+                    }
+                }
             }
-            out.set(outer: o, inner: i, axis: axis, value: acc)
         }
     }
-    return out
+    return Matrix(rows: rows, cols: cols, data: out)
 }
 
 /// Compute the orientation angle and coherency over a grid of local windows.
@@ -209,9 +264,13 @@ public func centralDifference(_ img: Matrix, axis: Axis, order: GradientOrder = 
 ///   - overlap: Fractional overlap between neighbouring windows; 0.5 reproduces
 ///     the 50% overlap used in the paper.
 ///
-/// The tensor components are evaluated everywhere by filtering `gx*gx`,
-/// `gx*gt` and `gt*gt`, then sampled on the window grid.  That is algebraically
-/// identical to stepping a window across the image, but far faster.
+/// The tensor components are evaluated by filtering `gx*gx`, `gx*gt` and
+/// `gt*gt` and sampling the result on the window grid.  That is algebraically
+/// identical to stepping a window across the image, but far faster.  The box
+/// filter is a running sum, O(1) per pixel, so it is simply run everywhere; the
+/// Gaussian is evaluated only where the grid reads it (see
+/// `Matrix.gaussianMean(sigma:truncate:rowIndices:colIndices:)`), with
+/// bit-for-bit the same result.
 public func structureTensorField(
     sti: Matrix,
     windowPx: Int = 31,
@@ -219,6 +278,13 @@ public func structureTensorField(
     overlap: Double = 0.5,
     gradientOrder: GradientOrder = .four
 ) throws -> OrientationField {
+    guard windowPx >= 1 else {
+        throw OrientationError.invalidParameter("windowPx must be >= 1, got \(windowPx)")
+    }
+    guard overlap.isFinite else {
+        throw OrientationError.invalidParameter("window overlap must be a finite number, got \(overlap)")
+    }
+
     let nt = sti.rows
     let nx = sti.cols
     let margin = windowType.supportRadius(windowPx: windowPx) + gradientOrder.pad
@@ -227,15 +293,32 @@ public func structureTensorField(
             rows: nt, cols: nx, windowPx: windowPx, order: gradientOrder.rawValue)
     }
 
+    let step = windowStep(windowPx: windowPx, overlap: overlap)
+    let rowsIdx = Array(stride(from: margin, to: nt - margin, by: step))
+    let colsIdx = Array(stride(from: margin, to: nx - margin, by: step))
+    guard !rowsIdx.isEmpty, !colsIdx.isEmpty else {
+        throw OrientationError.noWindowsFit(windowPx: windowPx)
+    }
+
     // x is the space axis (columns); t is the time axis (rows).
     let gx = centralDifference(sti, axis: .space, order: gradientOrder)
     let gt = centralDifference(sti, axis: .time, order: gradientOrder)
 
+    // Each component comes back already sampled on the window grid, so
+    // `J[i, j]` below is the window at `(rowsIdx[i], colsIdx[j])`.
     let window: (Matrix) -> Matrix = { m in
         switch windowType {
-        case .box:      return m.boxMean(size: windowPx)
-        case .gaussian: return m.gaussianMean(sigma: windowType.sigma(windowPx: windowPx),
-                                             truncate: gaussianTruncate)
+        case .box:
+            let full = m.boxMean(size: windowPx)
+            var sampled = Matrix(rows: rowsIdx.count, cols: colsIdx.count)
+            for (i, r) in rowsIdx.enumerated() {
+                for (j, c) in colsIdx.enumerated() { sampled[i, j] = full[r, c] }
+            }
+            return sampled
+        case .gaussian:
+            return m.gaussianMean(sigma: windowType.sigma(windowPx: windowPx),
+                                  truncate: gaussianTruncate,
+                                  rowIndices: rowsIdx, colIndices: colsIdx)
         }
     }
 
@@ -243,22 +326,15 @@ public func structureTensorField(
     let Jxt = window(gx.multiplied(by: gt))   // Eq. (8)
     let Jtt = window(gt.multiplied(by: gt))   // Eq. (9)
 
-    let step = max(1, Int((Double(windowPx) * (1.0 - overlap)).rounded()))
-    let rowsIdx = Array(stride(from: margin, to: nt - margin, by: step))
-    let colsIdx = Array(stride(from: margin, to: nx - margin, by: step))
-    guard !rowsIdx.isEmpty, !colsIdx.isEmpty else {
-        throw OrientationError.noWindowsFit(windowPx: windowPx)
-    }
-
     var phi = Matrix(rows: rowsIdx.count, cols: colsIdx.count)
     var coh = Matrix(rows: rowsIdx.count, cols: colsIdx.count)
     var energy = Matrix(rows: rowsIdx.count, cols: colsIdx.count)
 
-    for (i, r) in rowsIdx.enumerated() {
-        for (j, c) in colsIdx.enumerated() {
-            let jxx = Jxx[r, c]
-            let jxt = Jxt[r, c]
-            let jtt = Jtt[r, c]
+    for i in rowsIdx.indices {
+        for j in colsIdx.indices {
+            let jxx = Jxx[i, j]
+            let jxt = Jxt[i, j]
+            let jtt = Jtt[i, j]
 
             // Streak inclination, measured from the time axis toward the space
             // axis.
@@ -298,7 +374,53 @@ public func structureTensorField(
     )
 }
 
+/// Spacing of the window grid, in pixels: `int(round(windowPx * (1 - overlap)))`
+/// as `stiv.orientation.structure_tensor_field` computes it.
+///
+/// Python's `round` takes halves to the nearest *even* integer, and Swift's
+/// default `rounded()` takes them away from zero.  At the paper's 50% overlap
+/// every window size of the form 4k + 1 -- 21, 29, ... -- lands exactly on a
+/// half, so the default rounding gave a different grid from the desktop's for
+/// a quarter of the sizes the settings screen offers.
+func windowStep(windowPx: Int, overlap: Double) -> Int {
+    let raw = (Double(windowPx) * (1.0 - overlap)).rounded(.toNearestOrEven)
+    // Any step past the image is the same single window; the cap only keeps a
+    // wildly negative overlap from overflowing `Int(_:)`.
+    return raw < 1 ? 1 : Int(min(raw, 1e15))
+}
+
 // MARK: - Eq. (14): coherency-weighted mean orientation angle
+
+/// A window whose gradient energy (the trace of `J`) is at or below this
+/// fraction of the STI's mean window energy is treated as featureless:
+/// `stiv.orientation.FLAT_WINDOW_REL_ENERGY`.
+///
+/// Such a window has no orientation at all, but Eq. (6) still returns
+/// `phi = 0` for it -- and the lowest coherency level of Eq. (14), `C >= 0`,
+/// admits it -- so without this it casts a vote for *zero velocity*.  Patches
+/// that are numerically flat (a saturated glint, samples that left the frame
+/// and were filled with their column mean, a uniform bank) sit many orders of
+/// magnitude below real texture, so the exact value is not critical.
+public let flatWindowRelativeEnergy = 1e-6
+
+/// The windows of a field that carry no texture, in `field.phi.data` order;
+/// `stiv.orientation.flat_windows`.
+///
+/// The threshold is relative to the mean energy over *this* STI's windows, so
+/// it does not care whether the STI was normalised.  An STI with no gradient
+/// anywhere has a mean of zero, and then every window is flat.  (numpy sums
+/// the mean pairwise and this sums it in order; the two can differ in the last
+/// bit, which could only matter to a window within an ulp of the threshold --
+/// and flat windows sit orders of magnitude below it, usually at exactly 0.)
+public func flatWindows(_ field: OrientationField) -> [Bool] {
+    let energy = field.energy.data
+    var total = 0.0
+    var count = 0
+    for e in energy where e.isFinite { total += e; count += 1 }
+    let reference = count > 0 ? total / Double(count) : 0.0
+    let threshold = flatWindowRelativeEnergy * reference
+    return energy.map { !$0.isFinite || $0 <= threshold }
+}
 
 /// Average the per-window angles into one angle for the STI.
 ///
@@ -313,6 +435,10 @@ public func structureTensorField(
 /// `phiMin`/`phiMax` come from the user's velocity search range, and are the
 /// mechanism the paper uses to discard vectors corrupted by obstacles in the
 /// field of view (Fig. 12).
+///
+/// Featureless windows (`flatWindows(_:)`) are left out of the histogram and
+/// the mean coherency, and count as invalid in `validFraction`: their phi of
+/// exactly zero is an artefact of Eq. (6), not a measurement of still water.
 public func meanOrientationAngle(
     field: OrientationField,
     phiMin: Double,
@@ -322,18 +448,26 @@ public func meanOrientationAngle(
     minCoherency: Double = 0.0,
     estimator: AngleEstimator = .eq14
 ) throws -> AngleEstimate {
-    guard phiMin < phiMax else {
+    // Infinite bounds give NaN bin edges, and a NaN bin index traps in
+    // `Int(_:)`; numpy refuses both with a ValueError, which the pipeline
+    // turns into a flag.  So does this.
+    guard phiMin.isFinite, phiMax.isFinite, phiMin < phiMax else {
         throw OrientationError.badAngleRange(min: phiMin, max: phiMax)
+    }
+    guard binCount >= 1 else {
+        throw OrientationError.invalidParameter("the angle histogram needs at least one bin, got \(binCount)")
     }
 
     let phi = field.phi.data
     let coh = field.coherency.data
+    let flat = flatWindows(field)
 
     var inRange = [Bool](repeating: false, count: phi.count)
     var nInRange = 0
     for i in phi.indices {
         let p = phi[i], c = coh[i]
-        if p.isFinite && c.isFinite && p >= phiMin && p <= phiMax && c >= minCoherency {
+        if p.isFinite && c.isFinite && !flat[i]
+            && p >= phiMin && p <= phiMax && c >= minCoherency {
             inRange[i] = true
             nInRange += 1
         }

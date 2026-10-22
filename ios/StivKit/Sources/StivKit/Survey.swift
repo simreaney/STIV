@@ -58,6 +58,20 @@ public struct CaptureSettings: Codable, Sendable, Equatable {
     public var stSecondsPerRow: Double { Double(frameStep) / framesPerSecond }
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case durationSeconds, frameStep, framesPerSecond, rollingShutterRowSeconds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var d = CaptureSettings()
+        d.durationSeconds = try c.decodeIfPresent(Double.self, forKey: .durationSeconds) ?? d.durationSeconds
+        d.frameStep = try c.decodeIfPresent(Int.self, forKey: .frameStep) ?? d.frameStep
+        d.framesPerSecond = try c.decodeIfPresent(Double.self, forKey: .framesPerSecond) ?? d.framesPerSecond
+        d.rollingShutterRowSeconds = try c.decodeIfPresent(Double.self, forKey: .rollingShutterRowSeconds) ?? d.rollingShutterRowSeconds
+        self = d
+    }
 }
 
 // MARK: - geometry
@@ -77,6 +91,21 @@ public struct SectionSettings: Codable, Sendable, Equatable {
     public var name: String = "section"
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case start, end, stationCount, edgeTrim, name
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var d = SectionSettings()
+        d.start = try c.decodeIfPresent(PlanePoint.self, forKey: .start) ?? d.start
+        d.end = try c.decodeIfPresent(PlanePoint.self, forKey: .end) ?? d.end
+        d.stationCount = try c.decodeIfPresent(Int.self, forKey: .stationCount) ?? d.stationCount
+        d.edgeTrim = try c.decodeIfPresent(Double.self, forKey: .edgeTrim) ?? d.edgeTrim
+        d.name = try c.decodeIfPresent(String.self, forKey: .name) ?? d.name
+        self = d
+    }
 }
 
 /// A point on the horizontal water plane: ARKit world X and Z, in metres.
@@ -95,7 +124,9 @@ public struct FlowSettings: Codable, Sendable, Equatable {
     public enum Direction: String, Codable, Sendable {
         /// Perpendicular to the cross-section, in world space.
         case auto
-        /// A fixed bearing, degrees counter-clockwise from world +X.
+        /// A fixed bearing in degrees, measured from world +X towards world +Z
+        /// -- clockwise seen from above, and the same number `stiv/config.py`
+        /// calls counter-clockwise; see `SectionLayout.flowBearingDegrees`.
         ///
         /// Spelled `angle` because that is what `stiv/config.py` calls it, and
         /// a value that can cross between the two should not change its name on
@@ -120,6 +151,23 @@ public struct FlowSettings: Codable, Sendable, Equatable {
     public var autoFlip: Bool = true
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case direction, angleDegrees, from, to, downstream, reverse, autoFlip
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var d = FlowSettings()
+        d.direction = try c.decodeIfPresent(Direction.self, forKey: .direction) ?? d.direction
+        d.angleDegrees = try c.decodeIfPresent(Double.self, forKey: .angleDegrees)
+        d.from = try c.decodeIfPresent(PlanePoint.self, forKey: .from)
+        d.to = try c.decodeIfPresent(PlanePoint.self, forKey: .to)
+        d.downstream = try c.decodeIfPresent(PlanePoint.self, forKey: .downstream)
+        d.reverse = try c.decodeIfPresent(Bool.self, forKey: .reverse) ?? d.reverse
+        d.autoFlip = try c.decodeIfPresent(Bool.self, forKey: .autoFlip) ?? d.autoFlip
+        self = d
+    }
 }
 
 // MARK: - the analysis itself
@@ -295,38 +343,101 @@ public struct Survey: Codable, Sendable, Equatable {
 
     public init() {}
 
-    /// Sanity checks that would otherwise surface as a confusing failure deep
-    /// in the analysis.  Mirrors `Config.validate`.
+    private enum CodingKeys: String, CodingKey {
+        case capture, section, flow, sti, quality, scale
+    }
+
+    // Every section, and every key within one, is optional and takes its
+    // default when absent -- what `Config.from_dict` does for a YAML file.
+    // Synthesized decoding ignores property defaults, so one missing key used
+    // to fail the whole survey: a saved survey from an older build would not
+    // load at all.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var d = Survey()
+        d.capture = try c.decodeIfPresent(CaptureSettings.self, forKey: .capture) ?? d.capture
+        d.section = try c.decodeIfPresent(SectionSettings.self, forKey: .section) ?? d.section
+        d.flow = try c.decodeIfPresent(FlowSettings.self, forKey: .flow) ?? d.flow
+        d.sti = try c.decodeIfPresent(StiSettings.self, forKey: .sti) ?? d.sti
+        d.quality = try c.decodeIfPresent(QualitySettings.self, forKey: .quality) ?? d.quality
+        d.scale = try c.decodeIfPresent(ScaleSettings.self, forKey: .scale) ?? d.scale
+        self = d
+    }
+
+    /// Sanity checks that would otherwise surface as a confusing failure --
+    /// or a crash -- deep in the analysis.  Mirrors `Config.validate` rule for
+    /// rule wherever the two describe the same setting, plus `angleBins`,
+    /// which the Python leaves to numpy to reject and Swift must check itself.
+    /// Non-finite numbers are refused throughout: a NaN passes most range
+    /// tests by comparing false.
     public func validated() throws -> Survey {
-        if section.stationCount < 1 {
-            throw SurveyError.invalid("section.stationCount must be >= 1, got \(section.stationCount)")
+        func fail(_ message: String) -> SurveyError { .invalid(message) }
+
+        // capture  (Python: video)
+        if capture.frameStep < 1 {
+            throw fail("capture.frameStep must be >= 1, got \(capture.frameStep)")
+        }
+        if !(capture.framesPerSecond.isFinite && capture.framesPerSecond > 0) {
+            throw fail("capture.framesPerSecond must be a positive number, got \(capture.framesPerSecond)")
+        }
+
+        // section
+        if section.stationCount < 2 {
+            throw fail("section.stationCount must be >= 2, got \(section.stationCount)")
         }
         if !(0..<0.5).contains(section.edgeTrim) {
-            throw SurveyError.invalid("section.edgeTrim must be in [0, 0.5), got \(section.edgeTrim)")
+            throw fail("section.edgeTrim must be in [0, 0.5), got \(section.edgeTrim)")
         }
-        if sti.windowPx < 5 || sti.windowPx % 2 == 0 {
-            throw SurveyError.invalid("sti.windowPx must be odd and >= 5, got \(sti.windowPx)")
+
+        // flow
+        switch flow.direction {
+        case .angle:
+            guard let angle = flow.angleDegrees else {
+                // Without this, `resolveFlowDirection` silently used 0 degrees.
+                throw fail("flow.direction 'angle' needs flow.angleDegrees")
+            }
+            if !angle.isFinite {
+                throw fail("flow.angleDegrees must be a finite number, got \(angle)")
+            }
+        case .points:
+            if flow.from == nil || flow.to == nil {
+                throw fail("flow.direction 'points' needs flow.from and flow.to")
+            }
+        case .auto:
+            break
         }
-        if !(0..<1).contains(sti.windowOverlap) {
-            throw SurveyError.invalid("sti.windowOverlap must be in [0, 1), got \(sti.windowOverlap)")
-        }
-        if sti.searchLineLengthM <= 0 {
-            throw SurveyError.invalid("sti.searchLineLengthM must be positive")
+
+        // sti  (Python: stiv)
+        if !(sti.searchLineLengthM.isFinite && sti.searchLineLengthM > 0) {
+            throw fail("sti.searchLineLengthM must be > 0, got \(sti.searchLineLengthM)")
         }
         if let n = sti.sampleCount, n < 16 {
-            throw SurveyError.invalid("sti.sampleCount must be >= 16, got \(n)")
+            throw fail("sti.sampleCount must be >= 16, got \(n)")
         }
-        if capture.frameStep < 1 {
-            throw SurveyError.invalid("capture.frameStep must be >= 1, got \(capture.frameStep)")
+        if sti.windowPx < 5 || sti.windowPx % 2 == 0 {
+            throw fail("sti.windowPx must be an odd integer >= 5, got \(sti.windowPx)")
         }
-        if capture.framesPerSecond <= 0 {
-            throw SurveyError.invalid("capture.framesPerSecond must be positive")
+        if !(0..<1).contains(sti.windowOverlap) {
+            throw fail("sti.windowOverlap must be in [0, 1), got \(sti.windowOverlap)")
         }
-        if sti.velocityRangeMs.lowerBound >= sti.velocityRangeMs.upperBound {
-            throw SurveyError.invalid("sti.velocityRangeMs must be increasing")
+        let v = sti.velocityRangeMs
+        if !(v.lowerBound.isFinite && v.upperBound.isFinite) || v.lowerBound >= v.upperBound {
+            throw fail("sti.velocityRangeMs must be [min, max] with finite min < max, got \(v)")
         }
         if sti.coherencyLevels.isEmpty {
-            throw SurveyError.invalid("sti.coherencyLevels must not be empty")
+            throw fail("sti.coherencyLevels must not be empty")
+        }
+        if !sti.coherencyLevels.allSatisfy({ (0.0...1.0).contains($0) }) {
+            throw fail("sti.coherencyLevels must all be in [0, 1], got \(sti.coherencyLevels)")
+        }
+        if !(sti.smoothSigma.isFinite && sti.smoothSigma >= 0) {
+            throw fail("sti.smoothSigma must be >= 0, got \(sti.smoothSigma)")
+        }
+        if !(0.0...1.0).contains(sti.minCoherency) {
+            throw fail("sti.minCoherency must be in [0, 1], got \(sti.minCoherency)")
+        }
+        if sti.angleBins < 1 {
+            throw fail("sti.angleBins must be >= 1, got \(sti.angleBins)")
         }
         return self
     }

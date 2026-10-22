@@ -86,7 +86,8 @@ func syntheticSTI(
 
     if noise > 0 {
         let (_, std) = standardDeviation(m.data)
-        for i in m.data.indices { m.data[i] += noise * std * rng.next() }
+        // Through the subscript: `Matrix.data` is read-only outside StivKit.
+        for r in 0..<rows { for c in 0..<cols { m[r, c] += noise * std * rng.next() } }
     }
     return m
 }

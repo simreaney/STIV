@@ -30,7 +30,10 @@ public struct PixelPoint: Sendable, Equatable {
 
 /// Bidirectional mapping between captured-image pixels and world metres on the
 /// water plane.
-public protocol PlaneRectifier {
+///
+/// `Sendable` because a rectifier describes one fixed camera pose and plane:
+/// it is a value to be handed to the analysis queue, not shared mutable state.
+public protocol PlaneRectifier: Sendable {
     /// Where a pixel's ray meets the water plane, or `nil` if it misses (the
     /// ray points at the sky, or above the horizon).
     func imageToWorld(_ px: PixelPoint) -> PlanePoint?
@@ -116,7 +119,7 @@ public func - (a: PlanePoint, b: PlanePoint) -> PlaneVector {
 // MARK: - search lines
 
 /// One streamwise search line: the seed of a single space-time image.
-public struct SearchLine {
+public struct SearchLine: Sendable {
     /// Station number along the cross-section, 0 at `section.start`.
     public let index: Int
     /// Distance along the cross-section from its start, metres.
@@ -132,18 +135,29 @@ public struct SearchLine {
     public let lengthM: Double
     /// Horizontal distance from the camera to `centre` at setup, metres.
     public let rangeM: Double
+    /// Where `centre` lands in the reference frame, or `nil` if it is behind
+    /// the camera.  The desktop's `centre_px`, exported as `u_px`, `v_px`.
+    public internal(set) var centrePx: PixelPoint? = nil
 
     public var sampleCount: Int { samples.count }
 }
 
 /// Everything about where the measurement happens.
-public struct SectionLayout {
+public struct SectionLayout: Sendable {
     public let start: PlanePoint
     public let end: PlanePoint
     public let widthM: Double
     public let flowDirection: PlaneVector
     public let searchLines: [SearchLine]
-    /// Bearing of the flow, degrees counter-clockwise from world +X.
+    /// Bearing of the flow, `atan2(z, x)` in degrees: measured from world +X
+    /// towards world +Z.
+    ///
+    /// Viewed from above that is *clockwise*: ARKit's world frame is
+    /// right-handed with +Y up, so with +X to the right +Z points towards the
+    /// bottom of a map.  It is nonetheless the very number `stiv/config.py`
+    /// calls counter-clockwise, because the export hands the desktop the
+    /// plane's `(x, z)` as its `(X, Y)`, and in that frame the rotation from
+    /// +X to +Y is the conventional positive one.
     public let flowBearingDegrees: Double
     /// Camera height above the water plane at setup, metres.
     public let cameraHeightM: Double
@@ -163,7 +177,12 @@ public func resolveFlowDirection(
     var d: PlaneVector
     switch flow.direction {
     case .angle:
-        let a = (flow.angleDegrees ?? 0) * .pi / 180
+        // No silent default: an `angle` survey without its angle used to run
+        // along world +X, which is a direction nobody chose.
+        guard let degrees = flow.angleDegrees, degrees.isFinite else {
+            throw SurveyError.invalid("flow.direction == .angle needs a finite angleDegrees")
+        }
+        let a = degrees * .pi / 180
         d = PlaneVector(x: cos(a), z: sin(a))
     case .points:
         guard let from = flow.from, let to = flow.to else {
@@ -182,6 +201,67 @@ public func resolveFlowDirection(
     return flow.reverse ? -d : d
 }
 
+/// Points along a search line at which the local image scale is evaluated
+/// when choosing its sample count: `stiv.geometry._SCALE_PROBES`.
+let scaleProbes = 33
+/// Relative difference between the largest and the mean image scale along a
+/// line below which the scale is taken to be uniform (a nadir view):
+/// `stiv.geometry._UNIFORM_SCALE_RTOL`.
+let uniformScaleTolerance = 1e-6
+
+/// Largest image distance, pixels per metre, anywhere along a world segment:
+/// `stiv.geometry._max_px_per_m`, by central differences of `worldToImage`
+/// at `scaleProbes` points with a step of a thousandth of the length.
+/// Probes the rectifier cannot project (behind the camera) are skipped; `nil`
+/// if none can be.
+func maxPixelsPerMetre(rectifier: PlaneRectifier, from a: PlanePoint, to b: PlanePoint) -> Double? {
+    let length = distance(a, b)
+    guard length > 0, length.isFinite else { return nil }
+    let u = PlaneVector(x: (b.x - a.x) / length, z: (b.z - a.z) / length)
+    let h = 1e-3 * length
+    var best: Double?
+    for k in 0..<scaleProbes {
+        // `np.linspace(0, length, 33)`: `k * step`, with the last pinned.
+        let s = k == scaleProbes - 1 ? length : Double(k) * (length / Double(scaleProbes - 1))
+        let centre = PlanePoint(x: a.x + s * u.x, z: a.z + s * u.z)
+        guard let forward = rectifier.worldToImage(centre + u * h),
+              let back = rectifier.worldToImage(centre + u * -h) else { continue }
+        let du = forward.u - back.u
+        let dv = forward.v - back.v
+        let span = (du * du + dv * dv).squareRoot()
+        guard span.isFinite else { continue }
+        best = max(best ?? 0, span)
+    }
+    return best.map { $0 / (2.0 * h) }
+}
+
+/// Samples for a search line from `a` to `b` when none are configured:
+/// `stiv.geometry.default_n_samples`.
+///
+/// One STI column per image pixel is the natural resolution limit -- *where
+/// the image is finest along the line*.  In an oblique view, which on a phone
+/// held on a bank is every view, the near end of a line covers more pixels
+/// per metre than the far end, so counting pixels end to end (the mean
+/// spacing) left the near field undersampled and aliased its finest texture.
+/// The count follows the largest local pixels-per-metre instead, rounded half
+/// to even as Python's `round`, and clamped to 16...4096.  When the scale is
+/// uniform to within `uniformScaleTolerance` -- a camera looking straight down
+/// -- the original end-to-end count is kept, so rounding error in the
+/// derivative cannot flip a count that sits on a half.
+///
+/// `nil` when the endpoints do not project, for the caller to fall back on.
+func defaultSampleCount(rectifier: PlaneRectifier, from a: PlanePoint, to b: PlanePoint) -> Int? {
+    guard let pa = rectifier.worldToImage(a), let pb = rectifier.worldToImage(b) else { return nil }
+    let spanMean = ((pa.u - pb.u) * (pa.u - pb.u) + (pa.v - pb.v) * (pa.v - pb.v)).squareRoot()
+    guard spanMean.isFinite else { return nil }
+    var span = spanMean
+    if let perMetre = maxPixelsPerMetre(rectifier: rectifier, from: a, to: b) {
+        let spanMax = distance(a, b) * perMetre
+        if spanMax.isFinite && spanMax > spanMean * (1.0 + uniformScaleTolerance) { span = spanMax }
+    }
+    return Int(min(max(span.rounded(.toNearestOrEven) + 1, 16), 4096))
+}
+
 /// Lay out the cross-section and its search lines.
 ///
 /// Stations are spaced evenly in *world* space and samples along each line are
@@ -195,9 +275,15 @@ public func buildSection(
     inFrameMargin: Int = 2
 ) throws -> SectionLayout {
     let section = survey.section
+    guard section.stationCount >= 1 else {
+        throw SurveyError.invalid("section.stationCount must be >= 1, got \(section.stationCount)")
+    }
     let start = section.start
     let end = section.end
     let widthM = distance(start, end)
+    guard widthM.isFinite else {
+        throw SurveyError.invalid("section.start and section.end must be finite world points")
+    }
     guard widthM > 0 else {
         throw SurveyError.invalid("section.start and section.end are the same world point")
     }
@@ -223,18 +309,11 @@ public func buildSection(
         let a = stationCentre + flowDirection * (-half)
         let b = stationCentre + flowDirection * half
 
-        // One STI column per image pixel is the natural resolution limit: finer
-        // sampling would only interpolate, coarser would discard resolution the
-        // sensor already gave us.
         var count: Int
         if let fixed = survey.sti.sampleCount {
             count = fixed
-        } else if let pa = rectifier.worldToImage(a), let pb = rectifier.worldToImage(b) {
-            let du = pa.u - pb.u
-            let dv = pa.v - pb.v
-            count = min(max(Int((du * du + dv * dv).squareRoot().rounded()) + 1, 16), 4096)
         } else {
-            count = 128
+            count = defaultSampleCount(rectifier: rectifier, from: a, to: b) ?? 128
         }
         if count < 16 {
             throw SurveyError.invalid("sti.sampleCount must be >= 16, got \(count)")
@@ -267,7 +346,8 @@ public func buildSection(
             samples: samples,
             sxMetresPerColumn: lengthM / Double(count - 1),
             lengthM: lengthM,
-            rangeM: rectifier.horizontalRange(to: stationCentre)
+            rangeM: rectifier.horizontalRange(to: stationCentre),
+            centrePx: rectifier.worldToImage(stationCentre)
         ))
     }
 

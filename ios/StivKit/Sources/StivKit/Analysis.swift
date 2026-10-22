@@ -43,6 +43,25 @@ public enum StationFlag: String, Sendable, CaseIterable {
     case interpolated
     case medianFiltered
 
+    /// The spelling `stiv/analysis.py` uses -- `FAILURE_FLAGS` and
+    /// `ADVISORY_FLAGS` -- for files a desktop tool may read back.
+    /// `scale_uncertain` is the phone's own and has no desktop counterpart.
+    public var pythonName: String {
+        switch self {
+        case .noOrientation:    return "no_orientation"
+        case .stiTooSmall:      return "sti_too_small"
+        case .lowValidFraction: return "low_valid_fraction"
+        case .lowCoherency:     return "low_coherency"
+        case .highUncertainty:  return "high_uncertainty"
+        case .outOfFrame:       return "out_of_frame"
+        case .tanPhiLow:        return "tan_phi_low"
+        case .tanPhiHigh:       return "tan_phi_high"
+        case .scaleUncertain:   return "scale_uncertain"
+        case .interpolated:     return "interpolated"
+        case .medianFiltered:   return "median_filtered"
+        }
+    }
+
     public var isFailure: Bool {
         switch self {
         case .noOrientation, .stiTooSmall, .lowValidFraction,
@@ -80,6 +99,9 @@ public struct StationResult: Sendable {
     public let world: PlanePoint
     /// Horizontal distance from the camera, metres.
     public let rangeM: Double
+    /// The station centre in the reference frame, if it was in front of the
+    /// camera: the desktop's `u_px`, `v_px`.
+    public let pixel: PixelPoint?
 
     public var phiRad: Double = .nan
     public var tanPhi: Double = .nan
@@ -92,12 +114,28 @@ public struct StationResult: Sendable {
     public var phiStdRad: Double = .nan
     /// 1-sigma velocity spread, m/s: the angle histogram propagated through
     /// Eq. (16), combined with the scale uncertainty of this station's range.
+    /// This is the figure to report and to draw error bars with.
     public var velocityStdMs: Double = .nan
+    /// The angle-histogram part of `velocityStdMs` alone, m/s -- what
+    /// `stiv/analysis.py` calls `velocity_std_ms`.
+    ///
+    /// Quality control tests this one, not the total.  The `.highUncertainty`
+    /// failure means "the angle histogram is flat", which the scale term
+    /// cannot speak to; letting it in would fail -- and interpolate away --
+    /// clean far-bank stations purely for being far away, when the scale
+    /// advice promises they are still reported.
+    public var velocityStdAngleMs: Double = .nan
     /// The scale component on its own, as a fraction.
     public var relativeScaleSigma: Double = .nan
     public var sxMetresPerColumn: Double = .nan
     public var stSecondsPerRow: Double = .nan
     public var flags: [StationFlag] = []
+
+    /// Flag the station, once: a flag already present is not added again.
+    /// `StationResult.add_flag`; every flag the pipeline sets goes through it.
+    public mutating func addFlag(_ flag: StationFlag) {
+        if !flags.contains(flag) { flags.append(flag) }
+    }
 
     /// True when the station produced nothing usable.
     public var failed: Bool {
@@ -112,6 +150,7 @@ public struct StationResult: Sendable {
         self.stationM = line.stationM
         self.world = line.centre
         self.rangeM = line.rangeM
+        self.pixel = line.centrePx
         self.sxMetresPerColumn = line.sxMetresPerColumn
     }
 }
@@ -150,8 +189,8 @@ public struct MotionReport: Sendable {
     public func summary() -> String {
         guard enabled else { return "motion: ARKit pose only, residual check disabled" }
         guard !residualPx.isEmpty else { return "motion: no frames processed" }
-        let finite = residualPx.filter(\.isFinite).sorted()
-        let median = finite.isEmpty ? Double.nan : finite[finite.count / 2]
+        // `np.nanmedian(rmse_px)`, as `StabilisationReport.summary`.
+        let median = numpyMedian(residualPx.filter { !$0.isNaN })
         let maxShift = shiftPx.filter(\.isFinite).max() ?? 0
         return "motion: \(patchCount) static patches, "
              + "median pose residual \(decimals(median, 2)) px, "
@@ -175,8 +214,8 @@ public struct MotionReport: Sendable {
                 velocities rely on the ARKit pose alone
                 """)
         }
-        let medianInlier = inlierFraction.sorted().dropFirst(inlierFraction.count / 2).first
-        if let m = medianInlier, m < 0.5 {
+        // `np.median(inlier_fraction) < 0.5`, as `StabilisationReport.warnings`.
+        if !inlierFraction.isEmpty, numpyMedian(inlierFraction) < 0.5 {
             out.append("""
                 fewer than half the tracked patches agree with the fitted residual motion; \
                 patches are probably landing on the water surface -- outline the water on \
@@ -207,7 +246,9 @@ public struct MotionReport: Sendable {
 public struct StivResult: Sendable {
     public let survey: Survey
     public let stations: [StationResult]
-    public let stis: [SpaceTimeImage]
+    /// The conditioned STIs, in single precision, for display.  Nothing
+    /// numerical reads them back: the analysis has finished with them.
+    public let stiPreviews: [StiPreview]
     public let motion: MotionReport
     public let rowCount: Int
     public let durationSeconds: Double
@@ -219,6 +260,13 @@ public struct StivResult: Sendable {
     public var warnings: [String]
     public var elapsedSeconds: Double = 0
 
+    /// The conditioned STIs as `SpaceTimeImage`s, each widened from its
+    /// `Float` preview when it is read.  Kept so existing callers compile; new
+    /// code should use `stiPreviews` and `displayBytes(_: StiPreview)`, which
+    /// never allocate the `Double` copy.
+    @available(*, deprecated, message: "use stiPreviews and displayBytes(_: StiPreview)")
+    public var stis: ConditionedStis { ConditionedStis(previews: stiPreviews) }
+
     public var velocities: [Double] { stations.map(\.velocityMs) }
     public var stationsM: [Double] { stations.map(\.stationM) }
 
@@ -229,7 +277,8 @@ public struct StivResult: Sendable {
     public func summary() -> String {
         let finite = velocities.filter(\.isFinite).sorted()
         let clean = stations.filter(\.ok).count
-        let failed = stations.filter(\.failed).count
+        let failed = stations.filter(\.failed)
+        let filled = failed.filter { $0.flags.contains(.interpolated) }.count
         var lines = [
             "section        \(survey.section.name): \(decimals(widthM, 2)) m wide, "
                 + "\(stations.count) stations",
@@ -239,12 +288,13 @@ public struct StivResult: Sendable {
                 + "step \(survey.capture.frameStep))",
             "flow direction \(decimals(flowBearingDegrees, 1)) deg in world frame",
             motion.summary(),
-            "stations       \(clean)/\(stations.count) clean, \(failed) failed and interpolated",
+            "stations       \(clean)/\(stations.count) clean, "
+                + "\(failed.count) failed (\(filled) interpolated)",
         ]
         if !finite.isEmpty {
             let mean = finite.reduce(0, +) / Double(finite.count)
             lines.append("surface U      mean \(decimals(mean, 3))  "
-                       + "median \(decimals(finite[finite.count / 2], 3))  "
+                       + "median \(decimals(numpyMedian(finite), 3))  "
                        + "max \(decimals(finite[finite.count - 1], 3)) m/s")
         }
         if !warnings.isEmpty {
@@ -255,9 +305,113 @@ public struct StivResult: Sendable {
     }
 }
 
+/// The conditioned STIs of a result, widened to `SpaceTimeImage` one at a
+/// time as they are read; see `StivResult.stis`.
+public struct ConditionedStis: RandomAccessCollection, Sendable {
+    public typealias Index = Int
+    public typealias Indices = Range<Int>
+    public let previews: [StiPreview]
+
+    public var startIndex: Int { previews.startIndex }
+    public var endIndex: Int { previews.endIndex }
+    public subscript(position: Int) -> SpaceTimeImage { previews[position].spaceTimeImage }
+}
+
+/// `numpy.median`: the middle value, or the mean of the two middle values for
+/// an even count.  NaN when empty or when any element is NaN, as numpy.
+///
+/// The upper median (`sorted[count / 2]`) is a different statistic for an even
+/// count, and every threshold downstream of a median -- the uncertainty scale,
+/// the profile filter, the frame-step advice -- moved with it.
+func numpyMedian(_ xs: [Double]) -> Double {
+    guard !xs.isEmpty, !xs.contains(where: \.isNaN) else { return .nan }
+    let sorted = xs.sorted()
+    let n = sorted.count
+    return n % 2 == 1 ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2
+}
+
 // MARK: - the pipeline
 
+/// Execute a full STIV analysis, refusing inputs it cannot honestly analyse.
+///
+/// Throws `SurveyError.invalid` when the survey fails `Survey.validated()`;
+/// when the STIs do not belong to `layout` -- a different number of them, a
+/// different sample count, or a non-positive scale; or when the recording has
+/// too few rows, or every search line too few samples, for even one analysis
+/// window (`minStiSize`), as `stiv.analysis.run` refuses such a clip before
+/// reading it.  Prefer this to the non-throwing
+/// `analyse(survey:layout:stis:motion:)`.
+public func analyse(
+    validating survey: Survey,
+    layout: SectionLayout,
+    stis: [SpaceTimeImage],
+    motion: MotionReport = MotionReport()
+) throws -> StivResult {
+    try validateAnalysisInputs(survey: survey, layout: layout, stis: stis)
+    return analyse(survey: survey, layout: layout, stis: stis, motion: motion)
+}
+
+func validateAnalysisInputs(survey: Survey, layout: SectionLayout, stis: [SpaceTimeImage]) throws {
+    _ = try survey.validated()
+    let lines = layout.searchLines
+    guard stis.count == lines.count else {
+        throw SurveyError.invalid("got \(stis.count) STIs for \(lines.count) search lines; "
+                                + "the recording does not belong to this layout")
+    }
+    for (line, sti) in zip(lines, stis) {
+        guard sti.cols == line.sampleCount else {
+            throw SurveyError.invalid("station \(line.index): the STI has \(sti.cols) samples per row, "
+                                    + "but its search line has \(line.sampleCount)")
+        }
+        guard sti.sxMetresPerColumn.isFinite, sti.sxMetresPerColumn > 0,
+              sti.stSecondsPerRow.isFinite, sti.stSecondsPerRow > 0 else {
+            throw SurveyError.invalid("station \(line.index): Sx and St must be positive and finite, "
+                                    + "got \(sti.sxMetresPerColumn) m and \(sti.stSecondsPerRow) s")
+        }
+    }
+
+    // Too short to fit one window: every station would fail, and used to be
+    // reported afterwards as a texture or velocity-range problem.
+    let s = survey.sti
+    let need = minStiSize(windowPx: s.windowPx, windowType: s.windowType, gradientOrder: s.gradientOrder)
+    let rows = stis.map(\.rows).min() ?? 0
+    if rows < need {
+        throw SurveyError.invalid("""
+            the recording gives only \(rows) STI rows at frame step \(survey.capture.frameStep), \
+            but a \(s.windowPx) px \(s.windowType.rawValue) window needs at least \(need); record for \
+            longer, use a smaller frame step, or use a smaller window
+            """)
+    }
+    if !lines.isEmpty && lines.allSatisfy({ $0.sampleCount < need }) {
+        throw SurveyError.invalid("""
+            the search lines have only \(lines.map(\.sampleCount).min() ?? 0) samples, but a \
+            \(s.windowPx) px \(s.windowType.rawValue) window needs at least \(need); lengthen the \
+            search lines, raise the sample count, or use a smaller window
+            """)
+    }
+}
+
+/// The warning for search lines too short for one window, when only some
+/// are -- when all are, `analyse(validating:...)` refuses the run outright.
+func narrowLineWarning(survey: Survey, layout: SectionLayout) -> String? {
+    let s = survey.sti
+    let need = minStiSize(windowPx: s.windowPx, windowType: s.windowType, gradientOrder: s.gradientOrder)
+    let narrow = layout.searchLines.filter { $0.sampleCount < need }.map(\.index)
+    guard !narrow.isEmpty, narrow.count < layout.searchLines.count else { return nil }
+    let shown = narrow.prefix(5).map(String.init).joined(separator: ", ")
+    let more = narrow.count > 5 ? "..." : ""
+    return """
+        \(narrow.count) search line(s) have fewer than the \(need) samples a \(s.windowPx) px \
+        window needs (stations \(shown)\(more)) and will fail; lengthen the search lines or use \
+        a smaller window
+        """
+}
+
 /// Execute a full STIV analysis over already-recorded space-time images.
+///
+/// Never traps.  Inputs that `analyse(validating:layout:stis:motion:)` would
+/// refuse are analysed anyway, as far as they can be, and the result carries a
+/// warning saying why its numbers should not be trusted.
 public func analyse(
     survey: Survey,
     layout: SectionLayout,
@@ -266,6 +420,16 @@ public func analyse(
 ) -> StivResult {
     let clock = Date()
     var warnings: [String] = []
+
+    do {
+        try validateAnalysisInputs(survey: survey, layout: layout, stis: stis)
+    } catch {
+        warnings.append("the analysis inputs are invalid (\(error)); "
+                      + "treat every number in this result as meaningless")
+    }
+    if let narrow = narrowLineWarning(survey: survey, layout: layout) {
+        warnings.append(narrow)
+    }
 
     if !layout.stationsOutsideFrame.isEmpty {
         let shown = layout.stationsOutsideFrame.prefix(5).map(String.init).joined(separator: ", ")
@@ -276,64 +440,72 @@ public func analyse(
             """)
     }
 
-    var conditioned = stis
+    // Each STI is conditioned, analysed and then dropped to a single-precision
+    // display copy before the next is touched, so at most one conditioned
+    // `Double` STI is alive at a time.  Nothing after the orientation field
+    // reads the pixels again: the direction check reuses the fields, and needs
+    // only each STI's scales.
+    var previews: [StiPreview] = []
     var stations: [StationResult] = []
     var fields: [OrientationField?] = []
+    previews.reserveCapacity(stis.count)
 
     for (i, line) in layout.searchLines.enumerated() {
         var station = StationResult(line: line)
-        guard i < conditioned.count else {
-            station.flags.append(.noOrientation)
+        guard i < stis.count else {
+            station.addFlag(.noOrientation)
             stations.append(station)
             fields.append(nil)
             continue
         }
-        station.stSecondsPerRow = conditioned[i].stSecondsPerRow
-        conditioned[i].data = preprocess(conditioned[i].data, settings: survey.sti)
+        let sti = stis[i]
+        station.stSecondsPerRow = sti.stSecondsPerRow
+        let conditioned = preprocess(sti.data, settings: survey.sti)
 
         var field: OrientationField?
         var estimate: AngleEstimate?
         do {
             let f = try structureTensorField(
-                sti: conditioned[i].data,
+                sti: conditioned,
                 windowPx: survey.sti.windowPx,
                 windowType: survey.sti.windowType,
                 overlap: survey.sti.windowOverlap,
                 gradientOrder: survey.sti.gradientOrder)
             field = f
-            estimate = try estimateAngle(survey: survey, sti: conditioned[i], field: f,
+            estimate = try estimateAngle(survey: survey, sti: sti, field: f,
                                          vLow: survey.sti.velocityRangeMs.lowerBound,
                                          vHigh: survey.sti.velocityRangeMs.upperBound)
         } catch {
-            station.flags.append(.stiTooSmall)
+            station.addFlag(.stiTooSmall)
         }
+        previews.append(StiPreview(conditioned: conditioned, of: sti))
 
-        apply(estimate, to: &station, sti: conditioned[i], survey: survey,
+        apply(estimate, to: &station, sti: sti, survey: survey,
               cameraHeightM: layout.cameraHeightM,
               trackingDegraded: motion.trackingDegraded)
 
-        if conditioned[i].outOfFrameFraction > 0.02 {
-            station.flags.append(.outOfFrame)
+        if sti.outOfFrameFraction > 0.02 {
+            station.addFlag(.outOfFrame)
         }
 
         stations.append(station)
         fields.append(field)
     }
 
-    directionCheck(survey: survey, stations: &stations, stis: conditioned, fields: fields,
+    directionCheck(survey: survey, stations: &stations, stis: stis, fields: fields,
                    cameraHeightM: layout.cameraHeightM, motion: motion, warnings: &warnings)
     qualityControl(survey: survey, stations: &stations, warnings: &warnings)
     scaleWarning(survey: survey, stations: stations, cameraHeightM: layout.cameraHeightM,
                  warnings: &warnings)
     warnings.append(contentsOf: motion.warnings())
 
-    let rows = conditioned.first?.rows ?? 0
-    let st = conditioned.first?.stSecondsPerRow ?? survey.capture.stSecondsPerRow
+    let rows = stis.first?.rows ?? 0
+    let st = stis.first?.stSecondsPerRow ?? survey.capture.stSecondsPerRow
 
     var result = StivResult(
         survey: survey,
         stations: stations,
-        stis: conditioned,
+        stiPreviews: previews,
         motion: motion,
         rowCount: rows,
         durationSeconds: Double(rows) * st,
@@ -400,12 +572,13 @@ func apply(
         station.velocityMs = .nan
         station.velocityRawMs = .nan
         station.velocityStdMs = .nan
+        station.velocityStdAngleMs = .nan
         station.phiStdRad = .nan
         station.coherency = 0
         station.validFraction = estimate?.validFraction ?? 0
         station.windowCount = 0
         if !station.flags.contains(.stiTooSmall) && !station.flags.contains(.noOrientation) {
-            station.flags.append(.noOrientation)
+            station.addFlag(.noOrientation)
         }
         return
     }
@@ -423,10 +596,16 @@ func apply(
     station.windowCount = estimate.usedCount
 
     // Propagate the angle spread through Eq. (16): dU/dphi = k sec^2(phi).
+    // Exactly `_apply_estimate`'s `velocity_std_ms`, which is all quality
+    // control judges.
     let k = sti.sxMetresPerColumn / sti.stSecondsPerRow
     let angleTerm = abs(k / max(cos(phi) * cos(phi), 1e-6)) * estimate.phiStd
+    station.velocityStdAngleMs = angleTerm
     // Eq. (16) is linear in Sx, so a relative scale error is a relative
-    // velocity error.  The two are independent.
+    // velocity error.  The two are independent.  A scale the model cannot
+    // bound (the camera at the water surface) makes the total infinite, which
+    // is the honest figure to report -- and harmless, since quality control
+    // reads the angle term.
     let scaleTerm = station.relativeScaleSigma.isFinite
         ? abs(station.velocityMs) * station.relativeScaleSigma
         : Double.infinity
@@ -435,27 +614,41 @@ func apply(
 
 // MARK: - quality control
 
+/// Flag doubtful stations, then fill or blank the failed ones.
+///
+/// The order is deliberate, and `_quality_control`'s:
+///
+/// 1. flag every station on its measured values;
+/// 2. median-filter the *usable* stations only (if asked), so no failed value
+///    can leak into a good neighbour;
+/// 3. interpolate the failed stations from the *filtered* usable values, so a
+///    spike the filter removed cannot come back through a filled gap;
+/// 4. blank to NaN whatever failed and is still unfilled (its raw value stays
+///    in `velocityRawMs`), so no failed number reaches the summary or the
+///    export.
 func qualityControl(survey: Survey, stations: inout [StationResult], warnings: inout [String]) {
     let q = survey.quality
 
     // The uncertainty test is relative to the section's own velocity scale, so
     // that a genuinely slow but well-resolved station near the bank is not
     // condemned merely for having a small denominator.
-    let finite = stations.map { abs($0.velocityMs) }.filter(\.isFinite).sorted()
-    let velocityScale = finite.isEmpty ? 0 : 0.25 * finite[finite.count / 2]
+    let finite = stations.map { abs($0.velocityMs) }.filter(\.isFinite)
+    let velocityScale = finite.isEmpty ? 0 : 0.25 * numpyMedian(finite)
 
     for i in stations.indices {
         var s = stations[i]
         if s.validFraction.isFinite && s.validFraction < q.minValidFraction {
-            s.flags.append(.lowValidFraction)
+            s.addFlag(.lowValidFraction)
         }
         if s.coherency.isFinite && s.coherency < q.minMeanCoherency {
-            s.flags.append(.lowCoherency)
+            s.addFlag(.lowCoherency)
         }
-        if s.velocityStdMs.isFinite && s.velocityMs.isFinite {
+        // The angle term only: see `StationResult.velocityStdAngleMs`.  The
+        // scale term has its own, advisory, flag below.
+        if s.velocityStdAngleMs.isFinite && s.velocityMs.isFinite {
             let reference = max(abs(s.velocityMs), velocityScale)
-            if reference > 0 && s.velocityStdMs > q.maxRelativeUncertainty * reference {
-                s.flags.append(.highUncertainty)
+            if reference > 0 && s.velocityStdAngleMs > q.maxRelativeUncertainty * reference {
+                s.addFlag(.highUncertainty)
             }
         }
         if s.tanPhi.isFinite {
@@ -463,13 +656,13 @@ func qualityControl(survey: Survey, stations: inout [StationResult], warnings: i
             if a > q.tanPhiRange.upperBound {
                 // Steep streaks: too little spatial displacement per frame is
                 // resolvable.  Section 2.3 tested only up to tan phi = 7.
-                s.flags.append(.tanPhiHigh)
+                s.addFlag(.tanPhiHigh)
             } else if a < q.tanPhiRange.lowerBound {
-                s.flags.append(.tanPhiLow)
+                s.addFlag(.tanPhiLow)
             }
         }
         if !s.relativeScaleSigma.isFinite || s.relativeScaleSigma > q.maxRelativeScaleUncertainty {
-            s.flags.append(.scaleUncertain)
+            s.addFlag(.scaleUncertain)
         }
         stations[i] = s
     }
@@ -477,11 +670,41 @@ func qualityControl(survey: Survey, stations: inout [StationResult], warnings: i
     if q.medianFilterStations > 1 {
         medianFilter(&stations, window: q.medianFilterStations)
     }
+
     if q.interpolateFlagged {
         interpolateFailed(&stations)
     }
 
-    let bad = stations.filter(\.failed).count
+    let unfilled = stations.indices.filter {
+        stations[$0].failed && !stations[$0].flags.contains(.interpolated)
+    }
+    for i in unfilled { reportVelocity(&stations[i], .nan) }
+    if !unfilled.isEmpty && q.interpolateFlagged {
+        let usable = stations.filter { !$0.failed }.count
+        warnings.append("""
+            \(unfilled.count) failed station(s) could not be interpolated -- only \(usable) \
+            station(s) measured a usable velocity, and interpolation needs two -- so they \
+            report no velocity
+            """)
+    }
+
+    // A recording or a search line too small for the window fails every
+    // station it touches, and is not a texture or velocity-range problem: say
+    // so plainly, and keep those stations out of the count below.
+    let tooSmall = stations.filter { $0.flags.contains(.stiTooSmall) }.count
+    if tooSmall > 0 {
+        let s = survey.sti
+        let need = minStiSize(windowPx: s.windowPx, windowType: s.windowType,
+                              gradientOrder: s.gradientOrder)
+        warnings.append("""
+            \(tooSmall) of \(stations.count) stations produced a space-time image too small for \
+            the \(s.windowPx) px \(s.windowType.rawValue) window, which needs at least \(need) rows \
+            (frames) and \(need) columns (samples); record for longer, use a smaller frame \
+            step, lengthen the search lines, or use a smaller window
+            """)
+    }
+
+    let bad = stations.filter { $0.failed && !$0.flags.contains(.stiTooSmall) }.count
     if Double(bad) > 0.3 * Double(max(1, stations.count)) {
         warnings.append("""
             \(bad) of \(stations.count) stations failed quality control; check that the water \
@@ -491,7 +714,46 @@ func qualityControl(survey: Survey, stations: inout [StationResult], warnings: i
     }
 }
 
-/// Median-filter the velocity profile across stations.
+/// Replace a station's reported velocity with one it did not measure;
+/// `stiv.analysis._report_velocity`.
+///
+/// Everything that describes the reported number is kept consistent with it:
+/// `tanPhi` and `phiRad` are recomputed through Eq. (16), and both spreads are
+/// cleared, since they describe the measurement that was replaced rather than
+/// the value now reported -- an interpolated value's uncertainty is the
+/// interpolation error, which nothing here can estimate.  The raw measurement
+/// stays in `velocityRawMs`; the diagnostics that explain why it was replaced
+/// (coherency, valid fraction, the scale sigma) are left alone.
+func reportVelocity(_ s: inout StationResult, _ velocity: Double) {
+    s.velocityMs = velocity
+    if velocity.isFinite && s.sxMetresPerColumn > 0 {
+        s.tanPhi = velocity * s.stSecondsPerRow / s.sxMetresPerColumn
+        s.phiRad = atan(s.tanPhi)
+    } else {
+        s.tanPhi = .nan
+        s.phiRad = .nan
+    }
+    s.velocityStdMs = .nan
+    s.velocityStdAngleMs = .nan
+    s.phiStdRad = .nan
+}
+
+/// Fewest usable values a median-filter window must hold for the filter to
+/// move its station: `stiv.analysis._MIN_MEDIAN_VALUES`.  The median of two
+/// values is their mean, which a single spike drags as far as it likes; from
+/// three up a lone outlier cannot win.
+let minimumMedianValues = 3
+
+/// Median-filter the velocity profile across the *usable* stations.
+///
+/// Only stations that did not fail take part, either as inputs or as outputs:
+/// a failed station's raw value is exactly what the filter must not spread
+/// into its neighbours.  It runs before interpolation, so the gaps are then
+/// filled from the filtered values.  The window is `k` stations wide by index
+/// and centred; failed stations and the ends of the section leave it holding
+/// fewer values, and a station whose window holds fewer than
+/// `minimumMedianValues` is left as measured rather than replaced by what
+/// would really be the mean of two.  The median is numpy's.
 ///
 /// Any station the filter actually moves is flagged.  The reported velocity is
 /// then no longer the one that station measured, and a silently substituted
@@ -499,18 +761,17 @@ func qualityControl(survey: Survey, stations: inout [StationResult], warnings: i
 /// `stiv.analysis._median_filter`.
 func medianFilter(_ stations: inout [StationResult], window k: Int) {
     let v = stations.map(\.velocityMs)
+    let usable = stations.map { !$0.failed && $0.velocityMs.isFinite }
     let half = k / 2
-    for i in stations.indices {
+    for i in stations.indices where usable[i] {
         let lo = max(0, i - half)
         let hi = min(v.count, i + half + 1)
-        let w = v[lo..<hi].filter(\.isFinite).sorted()
-        guard !w.isEmpty else { continue }
-        let filtered = w[w.count / 2]
-        let before = v[i]
-        stations[i].velocityMs = filtered
-        let unchanged = before == filtered || (before.isNaN && filtered.isNaN)
-        if !unchanged, !stations[i].flags.contains(.medianFiltered) {
-            stations[i].flags.append(.medianFiltered)
+        let window = (lo..<hi).filter { usable[$0] }.map { v[$0] }
+        guard window.count >= minimumMedianValues else { continue }
+        let filtered = numpyMedian(window)
+        if filtered != v[i] {
+            reportVelocity(&stations[i], filtered)
+            stations[i].addFlag(.medianFiltered)
         }
     }
 }
@@ -520,6 +781,12 @@ func medianFilter(_ stations: inout [StationResult], window k: Int) {
 /// Advisory flags are deliberately left alone: a station reading a genuinely
 /// slow patch near the bank is measuring correctly, and pulling it towards its
 /// faster neighbours would introduce error rather than remove it.
+///
+/// The usable values are taken as they stand -- after the median filter, when
+/// there is one.  `numpy.interp`, operation for operation: failed stations
+/// beyond the outermost usable one take that station's value, and between two
+/// usable stations the fill is `slope * (x - x0) + v0`.  Nothing happens with
+/// fewer than two usable stations.
 func interpolateFailed(_ stations: inout [StationResult]) {
     let usable = stations.indices.filter { !stations[$0].failed && stations[$0].velocityMs.isFinite }
     guard usable.count >= 2, stations.contains(where: \.failed) else { return }
@@ -528,28 +795,45 @@ func interpolateFailed(_ stations: inout [StationResult]) {
         let x = stations[i].stationM
         // Nearest usable station on each side; clamp at the ends.
         let before = usable.last { stations[$0].stationM <= x }
-        let after = usable.first { stations[$0].stationM >= x }
+        let after = usable.first { stations[$0].stationM > x }
         let value: Double
         switch (before, after) {
-        case let (b?, a?) where b != a:
-            let xb = stations[b].stationM, xa = stations[a].stationM
-            let w = xa > xb ? (x - xb) / (xa - xb) : 0
-            value = stations[b].velocityMs + w * (stations[a].velocityMs - stations[b].velocityMs)
-        case let (b?, _):
+        case let (b?, a?):
+            let x0 = stations[b].stationM, v0 = stations[b].velocityMs
+            let slope = (stations[a].velocityMs - v0) / (stations[a].stationM - x0)
+            value = x == x0 ? v0 : slope * (x - x0) + v0
+        case let (b?, nil):
             value = stations[b].velocityMs
-        case let (_, a?):
+        case let (nil, a?):
             value = stations[a].velocityMs
-        default:
+        case (nil, nil):
             continue
         }
-        stations[i].velocityMs = value
-        if !stations[i].flags.contains(.interpolated) {
-            stations[i].flags.append(.interpolated)
-        }
+        reportVelocity(&stations[i], value)
+        stations[i].addFlag(.interpolated)
     }
 }
 
 // MARK: - direction and range advice
+
+/// How to point the search lines downstream, given how they were pointed;
+/// `stiv.analysis._reverse_advice`, in the phone's own setting names.
+func reverseAdvice(_ flow: FlowSettings) -> String {
+    var advice = flow.reverse
+        ? "set flow.reverse to false (it is currently true)"
+        : "set flow.reverse to true"
+    switch flow.direction {
+    case .auto:
+        advice += flow.downstream == nil
+            ? ", or tap a point downstream of the section"
+            : ", or check that the downstream point really is downstream of the section"
+    case .points:
+        advice += ", or swap flow.from and flow.to"
+    case .angle:
+        advice += ", or add 180 to flow.angleDegrees"
+    }
+    return advice
+}
 
 /// Detect and, if allowed, correct search lines that point upstream.
 ///
@@ -595,14 +879,17 @@ func directionCheck(
                         stSecondsPerRow: stis[i].stSecondsPerRow)
     }.sorted()
     guard !probe.isEmpty else { return }
+    // The upper median for an even count, which `_direction_check` uses too,
+    // so the two decide identically on the same input.
     let median = probe[probe.count / 2]
     guard median < 0 else { return }
 
     let message = "the median velocity along the search lines is \(decimals(median, 3)) m/s, "
                 + "i.e. the flow runs opposite to the assumed downstream direction"
+    let advice = reverseAdvice(survey.flow)
 
     guard survey.flow.autoFlip else {
-        warnings.append(message + "; set flow.reverse, or tap a downstream point.")
+        warnings.append("\(message); \(advice).")
         return
     }
 
@@ -622,9 +909,9 @@ func directionCheck(
               negate: true)
     }
 
-    warnings.append(message + "; the search range was mirrored and the stations re-analysed. "
-                            + "Tap a downstream point to point the search lines the right way "
-                            + "in the first place.")
+    warnings.append("\(message); the search range was mirrored and the stations re-analysed "
+                  + "(flow.autoFlip). To point the search lines the right way in the first "
+                  + "place, \(advice).")
 }
 
 /// Suggest a `frameStep` that puts `tan phi` in the paper's sweet spot.
@@ -633,22 +920,59 @@ func directionCheck(
 /// feature moves about one STI column per row.  Since `tan phi = U St / Sx` and
 /// `St = frameStep / fps`, the step scales it directly -- and on the phone the
 /// user can act on this without re-recording.
+///
+/// Judged, as `_range_advice` judges it, on every station's *measured* angle,
+/// failed or not -- it is when a run fails wholesale that this advice matters
+/// most -- recovered from `velocityRawMs`, since the reported angle of a filled
+/// station is not a measurement.
+///
+/// The step is returned whenever it differs from the current one, so the
+/// results screen can offer it; the message only outside `0.2 ... 4`, where the
+/// desktop would warn.  At step 1 with steep streaks no smaller step exists,
+/// and the message says what does help instead.
 func rangeAdvice(survey: Survey, stations: [StationResult]) -> (step: Int?, message: String?) {
-    let tans = stations.map { abs($0.tanPhi) }.filter(\.isFinite).sorted()
+    let tans = stations.compactMap { s -> Double? in
+        guard s.velocityRawMs.isFinite, s.sxMetresPerColumn > 0 else { return nil }
+        return abs(s.velocityRawMs * s.stSecondsPerRow / s.sxMetresPerColumn)
+    }
     guard !tans.isEmpty else { return (nil, nil) }
-    let median = tans[tans.count / 2]
+    let median = numpyMedian(tans)
     guard median > 0 else { return (nil, nil) }
 
     let step = survey.capture.frameStep
-    let suggested = max(1, Int((Double(step) / median).rounded()))
+    // `max(1, int(round(step / med)))`, with Python's halves-to-even.  The cap
+    // only keeps a vanishingly small median from overflowing `Int(_:)`; no
+    // recording has a million frames to stride over.
+    let ratio = (Double(step) / median).rounded(.toNearestOrEven)
+    let suggested = ratio.isFinite ? max(1, Int(min(ratio, 1e6))) : 1_000_000
     if median >= 0.2 && median <= 4.0 { return (suggested == step ? nil : suggested, nil) }
-    if suggested == step { return (nil, nil) }
 
     if median > 4.0 {
-        return (suggested,
-                "median tan(phi) is \(decimals(median, 1)), near the top of the range the "
-              + "method was validated over (Fig. 7 of the paper stops at 7). Features move "
-              + "far between frames -- try frame step \(suggested), or a longer search line.")
+        if suggested < step {
+            return (suggested,
+                    "median tan(phi) is \(decimals(median, 1)), near the top of the range the "
+                  + "method was validated over (Fig. 7 of the paper stops at 7). Features move "
+                  + "far between STI rows -- try frame step \(suggested).")
+        }
+        // Already reading every frame, so St cannot shrink any further and
+        // only Sx is left.  A longer search line does not change Sx when the
+        // sample count is automatic -- the samples stay about a pixel apart
+        // and the line merely gains columns -- so that is not offered.
+        let sx = numpyMedian(stations.map(\.sxMetresPerColumn))
+        let columns = (survey.sti.searchLineLengthM / (sx * median)).rounded(.toNearestOrEven)
+        let samples = columns.isFinite ? max(16, Int(min(columns, 1e6)) + 1) : 16
+        let longer = survey.sti.sampleCount == nil
+            ? " A longer search line does not help: with an automatic sample count it only "
+              + "adds columns."
+            : ""
+        return (nil,
+                "median tan(phi) is \(decimals(median, 1)) with the frame step already 1, near "
+              + "the top of the range the method was validated over (Fig. 7 of the paper stops "
+              + "at 7): features move about \(decimals(median, 0)) STI columns per frame. Since "
+              + "tan(phi) = U St / Sx, what helps is a shorter St -- a higher capture frame "
+              + "rate -- or a coarser Sx: film from further away or higher up, or set the "
+              + "sample count to about \(samples) so the samples are spaced wider (only if the "
+              + "surface texture is coarser than that spacing).\(longer)")
     }
     return (suggested,
             "median tan(phi) is \(decimals(median, 2)): features barely move between frames, "

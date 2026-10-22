@@ -50,23 +50,42 @@ public struct DesktopBridge: Sendable {
 
 // MARK: - CSV
 
-/// Per-station table, column-for-column as `StivResult.to_frame`.
+/// The columns of `stiv.analysis.StivResult.to_frame`, in its order.
+let desktopCSVColumns = [
+    "index", "station_m", "x_world_m", "y_world_m", "u_px", "v_px", "phi_deg", "tan_phi",
+    "velocity_ms", "velocity_raw_ms", "velocity_std_ms", "coherency", "valid_fraction",
+    "n_windows", "sx_m_per_px", "st_s_per_px", "flags",
+]
+
+/// Columns only the phone has, appended after the desktop's.
+let phoneCSVColumns = ["z_world_m", "range_m", "scale_sigma_rel", "velocity_std_total_ms"]
+
+/// Per-station table: column-for-column `StivResult.to_frame` first, so a
+/// phone run drops into whatever already reads the desktop's `velocity.csv`,
+/// then the columns only the phone can fill.
+///
+/// The desktop's world plane is the phone's `(x, z)` -- that is how the YAML
+/// exports the control points -- so `y_world_m` holds ARKit's `z`.  The same
+/// value is repeated as `z_world_m` at the end, under the name earlier phone
+/// exports used.  `velocity_std_ms` is the desktop's quantity, the angle
+/// spread alone; the phone's total, with the scale term folded in, is
+/// `velocity_std_total_ms`.  Flags use the desktop's snake_case names.
 public func velocityCSV(_ result: StivResult) -> String {
-    var out = [
-        "index,station_m,x_world_m,z_world_m,range_m,phi_deg,tan_phi,velocity_ms,"
-        + "velocity_raw_ms,velocity_std_ms,scale_sigma_rel,coherency,valid_fraction,"
-        + "n_windows,sx_m_per_px,st_s_per_px,flags"
-    ]
+    var out = [(desktopCSVColumns + phoneCSVColumns).joined(separator: ",")]
     for s in result.stations {
         let phiDeg = s.phiRad.isFinite ? s.phiRad * 180 / .pi : Double.nan
         out.append([
             String(s.index),
             csvNumber(s.stationM), csvNumber(s.world.x), csvNumber(s.world.z),
-            csvNumber(s.rangeM), csvNumber(phiDeg), csvNumber(s.tanPhi),
-            csvNumber(s.velocityMs), csvNumber(s.velocityRawMs), csvNumber(s.velocityStdMs),
-            csvNumber(s.relativeScaleSigma), csvNumber(s.coherency), csvNumber(s.validFraction),
+            csvNumber(s.pixel?.u ?? .nan), csvNumber(s.pixel?.v ?? .nan),
+            csvNumber(phiDeg), csvNumber(s.tanPhi),
+            csvNumber(s.velocityMs), csvNumber(s.velocityRawMs), csvNumber(s.velocityStdAngleMs),
+            csvNumber(s.coherency), csvNumber(s.validFraction),
             String(s.windowCount), csvNumber(s.sxMetresPerColumn), csvNumber(s.stSecondsPerRow),
-            s.flags.map(\.rawValue).joined(separator: ";"),
+            s.flags.map(\.pythonName).joined(separator: ";"),
+            // phone-only
+            csvNumber(s.world.z), csvNumber(s.rangeM), csvNumber(s.relativeScaleSigma),
+            csvNumber(s.velocityStdMs),
         ].joined(separator: ","))
     }
     return out.joined(separator: "\n") + "\n"
@@ -81,53 +100,64 @@ func csvNumber(_ v: Double, precision: Int = 6) -> String {
 
 // MARK: - JSON
 
+/// The run, its stations and the survey as JSON.
+///
+/// Every floating-point value goes through `jsonNumber`.  `JSONSerialization`
+/// raises an Objective-C exception on NaN or infinity, which Swift's `try`
+/// cannot catch: one non-finite width or camera height killed the app at the
+/// moment of export.
 public func summaryJSON(_ result: StivResult, bridge: DesktopBridge? = nil) throws -> Data {
     let finite = result.velocities.filter(\.isFinite).sorted()
     var run: [String: Any] = [
         "generated": ISO8601DateFormatter().string(from: Date()),
         "section_name": result.survey.section.name,
-        "width_m": result.widthM,
+        "width_m": jsonNumber(result.widthM),
         "station_count": result.stations.count,
         "clean_stations": result.stations.filter(\.ok).count,
         "failed_stations": result.stations.filter(\.failed).count,
         "rows": result.rowCount,
-        "duration_s": result.durationSeconds,
-        "st_s_per_row": result.stSecondsPerRow,
+        "duration_s": jsonNumber(result.durationSeconds),
+        "st_s_per_row": jsonNumber(result.stSecondsPerRow),
         "frame_step": result.survey.capture.frameStep,
-        "flow_bearing_deg": result.flowBearingDegrees,
-        "camera_height_m": result.cameraHeightM,
+        "flow_bearing_deg": jsonNumber(result.flowBearingDegrees),
+        "camera_height_m": jsonNumber(result.cameraHeightM),
         "scale_description": result.rectifierDescription,
-        "elapsed_s": result.elapsedSeconds,
+        "elapsed_s": jsonNumber(result.elapsedSeconds),
         "warnings": result.warnings,
         "motion": result.motion.summary(),
         "tracking_degraded": result.motion.trackingDegraded,
     ]
     if !finite.isEmpty {
-        run["velocity_mean_ms"] = finite.reduce(0, +) / Double(finite.count)
-        run["velocity_median_ms"] = finite[finite.count / 2]
-        run["velocity_max_ms"] = finite[finite.count - 1]
+        run["velocity_mean_ms"] = jsonNumber(finite.reduce(0, +) / Double(finite.count))
+        run["velocity_median_ms"] = jsonNumber(numpyMedian(finite))
+        run["velocity_max_ms"] = jsonNumber(finite[finite.count - 1])
     }
     if let step = result.suggestedFrameStep { run["suggested_frame_step"] = step }
 
     let stations: [[String: Any]] = result.stations.map { s in
         var d: [String: Any] = [
             "index": s.index,
-            "station_m": s.stationM,
-            "x_world_m": s.world.x,
-            "z_world_m": s.world.z,
-            "range_m": s.rangeM,
+            "station_m": jsonNumber(s.stationM),
+            "x_world_m": jsonNumber(s.world.x),
+            "z_world_m": jsonNumber(s.world.z),
+            "range_m": jsonNumber(s.rangeM),
+            "u_px": jsonNumber(s.pixel?.u ?? .nan),
+            "v_px": jsonNumber(s.pixel?.v ?? .nan),
             "n_windows": s.windowCount,
             "coherency": jsonNumber(s.coherency),
             "valid_fraction": jsonNumber(s.validFraction),
             "sx_m_per_px": jsonNumber(s.sxMetresPerColumn),
             "st_s_per_px": jsonNumber(s.stSecondsPerRow),
-            "flags": s.flags.map(\.rawValue),
+            "flags": s.flags.map(\.pythonName),
         ]
         d["phi_deg"] = jsonNumber(s.phiRad.isFinite ? s.phiRad * 180 / .pi : .nan)
         d["tan_phi"] = jsonNumber(s.tanPhi)
         d["velocity_ms"] = jsonNumber(s.velocityMs)
         d["velocity_raw_ms"] = jsonNumber(s.velocityRawMs)
-        d["velocity_std_ms"] = jsonNumber(s.velocityStdMs)
+        // As in the CSV: the desktop's angle-only sigma under its own name, the
+        // phone's total beside it.
+        d["velocity_std_ms"] = jsonNumber(s.velocityStdAngleMs)
+        d["velocity_std_total_ms"] = jsonNumber(s.velocityStdMs)
         d["scale_sigma_rel"] = jsonNumber(s.relativeScaleSigma)
         return d
     }
@@ -141,10 +171,14 @@ public func summaryJSON(_ result: StivResult, bridge: DesktopBridge? = nil) thro
         let reference: [String: Any] = [
             "width": bridge.imageWidth,
             "height": bridge.imageHeight,
-            "section_start_px": [bridge.sectionStartPx.u, bridge.sectionStartPx.v],
-            "section_end_px": [bridge.sectionEndPx.u, bridge.sectionEndPx.v],
+            "section_start_px": [jsonNumber(bridge.sectionStartPx.u), jsonNumber(bridge.sectionStartPx.v)],
+            "section_end_px": [jsonNumber(bridge.sectionEndPx.u), jsonNumber(bridge.sectionEndPx.v)],
         ]
-        root["reference_frame"] = reference
+        var withDownstream = reference
+        if let px = bridge.downstreamPx {
+            withDownstream["downstream_px"] = [jsonNumber(px.u), jsonNumber(px.v)]
+        }
+        root["reference_frame"] = withDownstream
     }
     return try JSONSerialization.data(
         withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
@@ -215,15 +249,24 @@ public func surveyYAML(result: StivResult, bridge: DesktopBridge?) -> String {
     out.append("  edge_trim: \(fmt(s.section.edgeTrim))")
     out.append("")
 
+    // `stiv.geometry.resolve_flow_direction` applies `reverse` *after*
+    // resolving the direction, exactly as `resolveFlowDirection` does here.
+    // `flowBearingDegrees` is the direction after that reversal, so writing
+    // it as `angle_deg` alongside `reverse: true` reversed the flow twice and
+    // the desktop re-run measured it backwards.  The resolved bearing goes out
+    // with `reverse: false`; only the `auto` form, which the desktop resolves
+    // afresh from the same section and downstream marker, carries the flag.
     out.append("flow:")
-    if let px = bridge?.downstreamPx {
+    if s.flow.direction == .auto, let px = bridge?.downstreamPx {
         out.append("  direction: auto")
         out.append("  downstream_px: [\(fmt(px.u)), \(fmt(px.v))]")
+        out.append("  reverse: \(s.flow.reverse)")
     } else {
         out.append("  direction: angle")
-        out.append("  angle_deg: \(fmt(result.flowBearingDegrees))")
+        out.append("  angle_deg: \(fmt(result.flowBearingDegrees))"
+                 + "     # resolved, any reversal included")
+        out.append("  reverse: false")
     }
-    out.append("  reverse: \(s.flow.reverse)")
     out.append("  auto_flip: \(s.flow.autoFlip)")
     out.append("")
 

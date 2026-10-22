@@ -190,16 +190,60 @@ final class SectionLayoutTests: XCTestCase {
         XCTAssertGreaterThan(ranges.last!, 24)
     }
 
-    func testAutomaticSampleCountIsAboutOnePerPixel() throws {
+    /// `stiv.geometry.default_n_samples`: one column per pixel *where the
+    /// image is finest along the line*.  In an oblique view the near end
+    /// covers more pixels per metre than the far end, and counting pixels end
+    /// to end left it undersampled; now no column spans more than a pixel
+    /// anywhere on the line.
+    func testAutomaticSampleCountResolvesTheFinestPartOfTheLine() throws {
         var s = survey()
         s.sti.sampleCount = nil
         let projection = makeProjection(heightM: 3)
         let layout = try buildSection(survey: s, rectifier: projection)
         for line in layout.searchLines {
-            let a = try XCTUnwrap(projection.worldToImage(line.samples.first!))
-            let b = try XCTUnwrap(projection.worldToImage(line.samples.last!))
-            let pixels = ((a.u - b.u) * (a.u - b.u) + (a.v - b.v) * (a.v - b.v)).squareRoot()
-            XCTAssertEqual(Double(line.sampleCount), pixels + 1, accuracy: 1.5)
+            let a = try XCTUnwrap(line.samples.first)
+            let b = try XCTUnwrap(line.samples.last)
+            // Local pixels per metre along the line, sampled densely.
+            var finest = 0.0
+            for k in 0...200 {
+                let t = Double(k) / 200
+                let p = PlanePoint(x: a.x + t * (b.x - a.x), z: a.z + t * (b.z - a.z))
+                let d = 1e-4
+                let ux = (b.x - a.x) / line.lengthM, uz = (b.z - a.z) / line.lengthM
+                let f = try XCTUnwrap(projection.worldToImage(PlanePoint(x: p.x + d * ux, z: p.z + d * uz)))
+                let g = try XCTUnwrap(projection.worldToImage(PlanePoint(x: p.x - d * ux, z: p.z - d * uz)))
+                finest = max(finest, ((f.u - g.u) * (f.u - g.u) + (f.v - g.v) * (f.v - g.v)).squareRoot() / (2 * d))
+            }
+            let pxPerColumn = finest * line.sxMetresPerColumn
+            XCTAssertLessThanOrEqual(pxPerColumn, 1.0 + 1e-3, "station \(line.index)")
+            XCTAssertGreaterThan(pxPerColumn, 0.99, "station \(line.index)")
+            XCTAssertEqual(line.sampleCount, Int((line.lengthM * finest).rounded()) + 1)
+
+            // ...which is markedly more than the end-to-end count here.
+            let pa = try XCTUnwrap(projection.worldToImage(a))
+            let pb = try XCTUnwrap(projection.worldToImage(b))
+            let endToEnd = ((pa.u - pb.u) * (pa.u - pb.u) + (pa.v - pb.v) * (pa.v - pb.v)).squareRoot()
+            XCTAssertGreaterThan(Double(line.sampleCount), 1.2 * endToEnd)
+        }
+    }
+
+    /// Looking straight down the scale is uniform, and the count is the
+    /// original end-to-end one: rounding error in the derivative must not flip
+    /// a count that sits on a half.
+    func testANadirViewKeepsTheEndToEndCount() throws {
+        var s = survey()
+        s.sti.sampleCount = nil
+        s.section.start = PlanePoint(x: -2, z: 0)
+        s.section.end = PlanePoint(x: 2, z: 0)
+        s.flow.downstream = PlanePoint(x: 0, z: -5)
+        s.sti.searchLineLengthM = 2
+        let nadir = makeProjection(heightM: 6, downDegrees: 90)
+        let layout = try buildSection(survey: s, rectifier: nadir)
+        for line in layout.searchLines {
+            let pa = try XCTUnwrap(nadir.worldToImage(line.samples.first!))
+            let pb = try XCTUnwrap(nadir.worldToImage(line.samples.last!))
+            let endToEnd = ((pa.u - pb.u) * (pa.u - pb.u) + (pa.v - pb.v) * (pa.v - pb.v)).squareRoot()
+            XCTAssertEqual(line.sampleCount, Int(endToEnd.rounded(.toNearestOrEven)) + 1)
         }
     }
 
@@ -210,6 +254,43 @@ final class SectionLayoutTests: XCTestCase {
         s.section.end = PlanePoint(x: 60, z: -6)
         let layout = try buildSection(survey: s, rectifier: makeProjection(heightM: 2))
         XCTAssertFalse(layout.stationsOutsideFrame.isEmpty)
+    }
+
+    /// An `angle` survey with no angle used to run along world +X.
+    func testAnAngleFlowWithoutAnAngleIsRejected() {
+        var s = survey()
+        s.flow.direction = .angle
+        XCTAssertThrowsError(try buildSection(survey: s, rectifier: makeProjection()))
+        s.flow.angleDegrees = 90
+        let layout = try? buildSection(survey: s, rectifier: makeProjection())
+        XCTAssertEqual(layout?.flowBearingDegrees ?? .nan, 90, accuracy: 1e-9)
+    }
+
+    /// `atan2(z, x)`: from +X towards +Z, the same number the Python calls
+    /// counter-clockwise in its `(X, Y) = (x, z)` frame.
+    func testTheBearingIsMeasuredFromXTowardsZ() throws {
+        var s = survey()
+        s.flow.direction = .points
+        s.flow.from = PlanePoint(x: 0, z: 0)
+        s.flow.to = PlanePoint(x: 0, z: 1)          // straight along +Z
+        XCTAssertEqual(try buildSection(survey: s, rectifier: makeProjection()).flowBearingDegrees,
+                       90, accuracy: 1e-9)
+    }
+
+    func testANegativeStationCountThrowsRatherThanTraps() {
+        var s = survey()
+        s.section.stationCount = -1
+        XCTAssertThrowsError(try buildSection(survey: s, rectifier: makeProjection()))
+    }
+
+    func testStationCentresCarryTheirReferencePixel() throws {
+        let projection = makeProjection(heightM: 3)
+        let layout = try buildSection(survey: survey(), rectifier: projection)
+        for line in layout.searchLines {
+            let px = try XCTUnwrap(line.centrePx)
+            let expected = try XCTUnwrap(projection.worldToImage(line.centre))
+            XCTAssertEqual(px, expected)
+        }
     }
 
     func testDegenerateSectionIsRejected() {

@@ -99,8 +99,10 @@ final class PipelineTests: XCTestCase {
         let result = analyse(survey: s, layout: layout,
                              stis: recordedStis(layout: layout, st: st) { _ in -0.8 })
 
-        XCTAssertTrue(result.warnings.contains { $0.contains("opposite to the assumed") },
-                      "no direction warning in:\n\(result.warnings)")
+        let warning = try XCTUnwrap(result.warnings.first { $0.contains("opposite to the assumed") },
+                                    "no direction warning in:\n\(result.warnings)")
+        XCTAssertTrue(warning.contains("mirrored"), warning)
+        XCTAssertTrue(warning.contains("set flow.reverse to true"), warning)
         // auto_flip reports the magnitude along the corrected direction and warns,
         // rather than reporting negative flow: that is what the flag is for.
         for station in result.stations {
@@ -127,11 +129,17 @@ final class PipelineTests: XCTestCase {
                       "a featureless surface must not produce clean stations")
     }
 
+    /// The scale term is reported in sigma, and flagged, but never fails a
+    /// station.  This runs with interpolation *on* -- the default, and what the
+    /// app does -- because that is where folding the scale term into the
+    /// failure test did its damage: the far station was flagged
+    /// `highUncertainty` and silently replaced by its neighbours.
     func testScaleUncertaintyIsFoldedIntoSigma() throws {
         var s = survey(stations: 5)
         s.section.start = PlanePoint(x: 0, z: -4)
         s.section.end = PlanePoint(x: 0, z: -40)   // runs away from the camera
-        s.quality.interpolateFlagged = false
+        s.flow.downstream = PlanePoint(x: 20, z: -22)
+        XCTAssertTrue(s.quality.interpolateFlagged)
         let layout = try buildSection(survey: s, rectifier: projection(heightM: 1.5))
         let st = s.capture.stSecondsPerRow
         let result = analyse(survey: s, layout: layout,
@@ -141,11 +149,85 @@ final class PipelineTests: XCTestCase {
         XCTAssertEqual(sigmas, sigmas.sorted(), "scale sigma must grow with range")
         XCTAssertLessThan(sigmas.first!, 0.10)
         XCTAssertGreaterThan(sigmas.last!, 0.20)
-        // The far station must be flagged, and its velocity sigma must exceed
-        // the pure-angle sigma of the near one.
-        XCTAssertTrue(result.stations.last!.flags.contains(.scaleUncertain))
+
+        let far = result.stations.last!
+        XCTAssertTrue(far.flags.contains(.scaleUncertain))
+        XCTAssertFalse(far.flags.contains(.highUncertainty), "\(far.flags)")
+        XCTAssertFalse(far.flags.contains(.interpolated), "\(far.flags)")
+        XCTAssertEqual(far.velocityMs, far.velocityRawMs, "reported, not replaced")
+        XCTAssertEqual(far.velocityMs, 1.0, accuracy: 0.12)
+        // The reported sigma is the angle term and the scale term in quadrature.
+        let scaleTerm = abs(far.velocityMs) * far.relativeScaleSigma
+        XCTAssertEqual(far.velocityStdMs,
+                       (far.velocityStdAngleMs * far.velocityStdAngleMs + scaleTerm * scaleTerm).squareRoot(),
+                       accuracy: 1e-12)
+        XCTAssertGreaterThan(far.velocityStdMs, 2 * far.velocityStdAngleMs)
         XCTAssertTrue(result.warnings.contains { $0.contains("raising the camera") },
                       "expected the raise-the-camera advice in:\n\(result.warnings)")
+    }
+
+    /// The audit's case: a camera 1 m above the water and a section out to
+    /// 70 m.  Every station measures cleanly; the far ones have a large scale
+    /// uncertainty, and the advice says velocities are still reported -- so
+    /// they must be.
+    func testCleanFarBankStationsAreNotReplaced() throws {
+        var s = survey(stations: 7)
+        s.section.start = PlanePoint(x: 0, z: -5)
+        s.section.end = PlanePoint(x: 0, z: -70)
+        s.flow.downstream = PlanePoint(x: 20, z: -37)
+        let layout = try buildSection(survey: s, rectifier: projection(heightM: 1.0))
+        let st = s.capture.stSecondsPerRow
+        let result = analyse(survey: s, layout: layout,
+                             stis: recordedStis(layout: layout, st: st) { _ in 1.0 })
+        for station in result.stations {
+            XCTAssertFalse(station.failed, "station \(station.index): \(station.flags)")
+            XCTAssertFalse(station.flags.contains(.interpolated), "station \(station.index)")
+            XCTAssertEqual(station.velocityMs, 1.0, accuracy: 0.12, "station \(station.index)")
+        }
+        XCTAssertGreaterThan(result.stations.last!.relativeScaleSigma, 0.5)
+    }
+
+    /// With `autoFlip` off the pipeline only warns: nothing is mirrored, and
+    /// no station reports the corrected magnitude.
+    func testUpstreamLinesWithoutAutoFlipAreWarnedAboutButNotMirrored() throws {
+        var s = survey()
+        s.flow.autoFlip = false
+        let layout = try buildSection(survey: s, rectifier: projection())
+        let st = s.capture.stSecondsPerRow
+        let result = analyse(survey: s, layout: layout,
+                             stis: recordedStis(layout: layout, st: st) { _ in -0.8 })
+        let direction = result.warnings.filter { $0.contains("opposite to the assumed") }
+        XCTAssertEqual(direction.count, 1, "\(result.warnings)")
+        XCTAssertTrue(direction[0].contains("set flow.reverse to true"), direction[0])
+        // The direction came from the downstream marker, so that is what to check.
+        XCTAssertTrue(direction[0].contains("really is downstream"), direction[0])
+        XCTAssertFalse(direction[0].contains("mirrored"), direction[0])
+        XCTAssertFalse(result.stations.contains { abs($0.velocityMs - 0.8) < 0.2 },
+                       "\(result.stations.map(\.velocityMs))")
+    }
+
+    /// The result keeps one single-precision display copy per station, and
+    /// the old `stis` accessor still reads them.
+    @available(*, deprecated, message: "exercises the deprecated StivResult.stis")
+    func testConditionedStisAreRetainedAsFloatPreviews() throws {
+        let s = survey(stations: 3)
+        let layout = try buildSection(survey: s, rectifier: projection())
+        let st = s.capture.stSecondsPerRow
+        let stis = recordedStis(layout: layout, st: st) { _ in 0.9 }
+        let result = analyse(survey: s, layout: layout, stis: stis)
+
+        XCTAssertEqual(result.stiPreviews.count, 3)
+        XCTAssertEqual(result.stis.count, 3)
+        for (i, preview) in result.stiPreviews.enumerated() {
+            let conditioned = preprocess(stis[i].data, settings: s.sti)
+            XCTAssertEqual(preview.rows, conditioned.rows)
+            XCTAssertEqual(preview.cols, conditioned.cols)
+            XCTAssertEqual(preview.pixels, conditioned.data.map { Float($0) })
+            XCTAssertEqual(result.stis[i].data.data, preview.pixels.map { Double($0) })
+            XCTAssertEqual(result.stis[i].stSecondsPerRow, st)
+            XCTAssertEqual(displayBytes(preview), displayBytes(result.stis[i].data))
+        }
+        XCTAssertEqual(Array(result.stis.indices), [0, 1, 2])
     }
 
     func testSuggestsAFrameStepWhenTanPhiIsOutOfRange() throws {
