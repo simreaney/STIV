@@ -1,9 +1,24 @@
+# Large local inputs and run outputs
 examples/DJI_0659.MP4
 /notebooks/stiv_output
 /notebooks/stiv_output2
 /results
-/stiv/__pycache__
-/tests/__pycache__
 /papers
-.DS_Store
+
+# Python build and cache artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+.pytest_cache/
+
+# Swift / Xcode per-user and build state
 /ios/StivKit/.build
+/ios/build/
+xcuserdata/
+.swiftpm/xcode/xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
