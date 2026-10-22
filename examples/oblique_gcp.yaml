@@ -3,10 +3,16 @@
 # bridge / tower camera.
 #
 # This is the geometry of the original paper (Figs. 1 and 13).  With the camera
-# looking across the river rather than down at it, scale varies across the
-# frame, so the mapping needs ground control points: >= 4 features whose image
-# and real-world positions are both known, all lying on (or very near) the
-# water-surface plane.
+# looking out over the river rather than straight down at it, scale varies
+# across the frame, so the mapping needs ground control points: >= 4 features
+# whose image and real-world positions are both known, all lying on (or very
+# near) the water-surface plane.
+#
+# Here the camera looks along a 42 m wide reach from a bridge: the two banks
+# run up the image, the cross-section spans the bottom of the frame from bank
+# to bank, and the river flows towards the camera.  World X runs across the
+# river (0 m at the left waterline, 42 m at the right) and world Y along it,
+# away from the camera.
 #
 # Good GCPs: surveyed markers, bridge piers at the waterline, boulders whose
 # positions you have taken with RTK GNSS.  Spread them across the whole
@@ -29,7 +35,8 @@ rectify:
     - [1310,  520]
     - [ 640,  530]
     - [ 968,  690]          # a 5th point lets RANSAC reject a mis-click and
-                            # gives a meaningful RMSE in the run report
+                            # gives a meaningful RMSE in the run report;
+                            # a boulder mid-channel
   # Matching real-world coordinates, metres, on the water plane. Any local grid
   # will do -- easting/northing, or a tape measure along the bank.
   gcp_world:
@@ -37,28 +44,32 @@ rectify:
     - [ 42.0,   0.0]
     - [ 42.0,  28.0]
     - [  0.0,  28.0]
-    - [ 21.0,  12.5]
+    - [ 20.58, 11.78]
 
 section:
-  start_px: [455, 815]
-  end_px:   [1465, 795]
+  start_px: [455, 815]      # left waterline
+  end_px:   [1465, 795]     # right waterline: 42.1 m across
   n_stations: 50
   edge_trim: 0.03
   name: uono_flood_section
 
 flow:
   # In an oblique view the flow is rarely horizontal on screen. Two points
-  # along a visible streamline are the most reliable way to set the direction.
+  # along a visible streamline are the most reliable way to set the direction;
+  # they must point downstream and run roughly at right angles to the section
+  # *on the water*, which in this view means up the image, not across it.
   direction: points
-  from_px: [900, 700]
-  to_px:   [520, 760]
+  from_px: [971, 635]
+  to_px:   [967, 771]
 
 stabilise:
   enabled: true
   model: homography         # appropriate when the static scene is roughly planar
   static_mask_px:
-    # Track only the far bank and the structures on it.
-    - [[300, 380], [1700, 360], [1700, 520], [300, 540]]
+    # Track only static ground: the two banks, kept clear of the waterline.
+    # The top of the frame is excluded too -- it is more river.
+    - [[0, 520], [600, 520], [263, 1080], [0, 1080]]         # left bank
+    - [[1350, 510], [1920, 510], [1920, 1080], [1682, 1080]]  # right bank
 
 stiv:
   # In an oblique view the far side of the section has much coarser ground

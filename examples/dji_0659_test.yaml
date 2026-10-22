@@ -59,7 +59,7 @@ stiv:
   window_px: 31
   window_overlap: 0.5
   gradient_order: 4
-  smooth_sigma: 0.0
+  smooth_sigma: 1.5        # the default; 0 lets fine texture alias and read low
   velocity_range_ms: [-0.5, 4.0]   # brackets the ~0.6-0.7 m/s median with room for faster rapids
   estimator: eq14
 

@@ -55,7 +55,9 @@ class OrientationField:
 
     phi: np.ndarray           # (nt, nx) radians, at window centres
     coherency: np.ndarray     # (nt, nx) in [0, 1]
-    energy: np.ndarray        # (nt, nx) trace of J; gradient power
+    #: (nt, nx) trace of J, the window's gradient power.  Eq. (14) uses it to
+    #: drop windows with no texture at all -- see :func:`flat_windows`.
+    energy: np.ndarray
     centres_t: np.ndarray     # STI row index of each window centre
     centres_x: np.ndarray     # STI column index of each window centre
 
@@ -70,9 +72,12 @@ class AngleEstimate:
 
     phi: float                    # radians; nan if nothing usable
     tan_phi: float
-    #: Coherency-weighted spread of in-range angles, radians.
+    #: Standard deviation of the summed Eq. (14) histogram, radians: the
+    #: *spread* of the individual window angles about the mean, not the
+    #: standard error of the mean itself.
     phi_std: float
-    #: Fraction of windows falling inside [phi_min, phi_max].
+    #: Fraction of all windows that carry texture and fall inside
+    #: [phi_min, phi_max].  Featureless windows count against it.
     valid_fraction: float
     #: Mean coherency of the in-range windows.
     mean_coherency: float
@@ -141,6 +146,23 @@ def _window_radius(window_px: int, window_type: str) -> int:
     raise ValueError(f"window_type must be 'box' or 'gaussian', got {window_type!r}")
 
 
+def _margin(window_px: int, window_type: str, gradient_order: int) -> int:
+    """Pixels trimmed from every edge of the STI: window support plus stencil."""
+    if gradient_order not in _STENCILS:
+        raise ValueError(f"gradient order must be one of {sorted(_STENCILS)}, got {gradient_order}")
+    return _window_radius(window_px, window_type) + len(_STENCILS[gradient_order]) // 2
+
+
+def min_sti_size(window_px: int, window_type: str = "box", gradient_order: int = 4) -> int:
+    """Smallest STI extent, in rows or in columns, that fits one analysis window.
+
+    :func:`structure_tensor_field` refuses anything smaller.  Exposed so the
+    pipeline can reject a clip that is too short *before* reading the video,
+    rather than discovering it station by station afterwards.
+    """
+    return 2 * _margin(window_px, window_type, gradient_order) + 2
+
+
 def _window_filter(a: np.ndarray, window_px: int, window_type: str) -> np.ndarray:
     """Apply the window function ``w`` of Eq. (3) over the local area ``A``."""
     if window_type == "box":
@@ -187,7 +209,7 @@ def structure_tensor_field(
         raise ValueError(f"STI must be 2-D (time, space), got shape {sti.shape}")
 
     nt, nx = sti.shape
-    margin = _window_radius(window_px, window_type) + len(_STENCILS[gradient_order]) // 2
+    margin = _margin(window_px, window_type, gradient_order)
     if nt <= 2 * margin + 1 or nx <= 2 * margin + 1:
         raise ValueError(
             f"STI of shape {sti.shape} is too small for a {window_px}px window "
@@ -246,6 +268,31 @@ def structure_tensor_field(
 # --------------------------------------------------------------------------- #
 # Eq. (14): coherency-weighted mean orientation angle
 # --------------------------------------------------------------------------- #
+#: A window whose gradient energy (the trace of J) is at or below this fraction
+#: of the STI's mean window energy is treated as featureless.  Such a window has
+#: no orientation at all, but Eq. (6) still returns phi = 0 for it -- and the
+#: lowest coherency level of Eq. (14), C >= 0, admits it -- so without this it
+#: casts a vote for *zero velocity*.  Patches that are numerically flat (a
+#: saturated glint, samples that left the frame and were filled with their
+#: column mean, a uniform bank) sit many orders of magnitude below real texture,
+#: so the exact value is not critical; 1e-6 is far below the faintest texture an
+#: 8-bit camera can record against a full-scale highlight, (1/255)^2 ~ 1.5e-5.
+FLAT_WINDOW_REL_ENERGY = 1e-6
+
+
+def flat_windows(field: OrientationField) -> np.ndarray:
+    """Boolean mask of the windows that carry no texture, see ``FLAT_WINDOW_REL_ENERGY``.
+
+    The threshold is relative to the mean energy over *this* STI's windows, so
+    it does not care whether the STI was normalised.  An STI with no gradient
+    anywhere has a mean of zero, and then every window is flat.
+    """
+    energy = np.asarray(field.energy, dtype=np.float64)
+    finite = np.isfinite(energy)
+    ref = float(energy[finite].mean()) if finite.any() else 0.0
+    return ~finite | (energy <= FLAT_WINDOW_REL_ENERGY * ref)
+
+
 def mean_orientation_angle(
     field: OrientationField,
     phi_min: float,
@@ -269,6 +316,10 @@ def mean_orientation_angle(
     the mechanism the paper uses to discard vectors corrupted by obstacles in
     the field of view (Fig. 12).
 
+    Featureless windows (:func:`flat_windows`) are left out of the histogram
+    and count as invalid in ``valid_fraction``: their phi of exactly zero is
+    an artefact of Eq. (6), not a measurement of still water.
+
     Parameters
     ----------
     estimator
@@ -282,7 +333,7 @@ def mean_orientation_angle(
     phi = field.phi.ravel()
     coh = field.coherency.ravel()
 
-    finite = np.isfinite(phi) & np.isfinite(coh)
+    finite = np.isfinite(phi) & np.isfinite(coh) & ~flat_windows(field).ravel()
     in_range = finite & (phi >= phi_min) & (phi <= phi_max) & (coh >= min_coherency)
     valid_fraction = float(in_range.sum()) / max(1, phi.size)
 

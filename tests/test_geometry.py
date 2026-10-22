@@ -212,3 +212,40 @@ class TestGcpOutlierRejection:
         px = np.zeros((4, 2))
         with pytest.raises(ConfigError, match="coincident"):
             HomographyRectifier(px, self.world()[:4], SHAPE)
+
+
+class TestSampleDensity:
+    """``n_samples`` was set so the *mean* pixel spacing along a line was one
+    pixel.  In an oblique view the near end covers more pixels per metre than
+    the far end, so the near field was undersampled.
+    """
+
+    OBLIQUE = {
+        "method": "gcp",
+        "gcp_px": [[100, 520], [860, 520], [600, 200], [360, 200]],
+        "gcp_world": [[0.0, 0.0], [20.0, 0.0], [20.0, 30.0], [0.0, 30.0]],
+    }
+
+    def _oblique(self):
+        cfg = base_config(
+            rectify=self.OBLIQUE,
+            section={"start_px": [300, 400], "end_px": [660, 400]},
+            flow={"direction": "angle", "angle_deg": 90.0},
+            stiv={"search_line_length_m": 8.0},
+        )
+        return build_section(cfg, SHAPE)
+
+    def test_no_gap_wider_than_a_pixel_in_an_oblique_view(self):
+        for sl in self._oblique().search_lines:
+            gaps = np.linalg.norm(np.diff(sl.samples_px, axis=0), axis=1)
+            # Within the rounding of the sample count; the mean rule gave 1.5.
+            assert gaps.max() <= 1.0 + 0.5 / (sl.n_samples - 1) + 1e-9
+            mean_rule = int(round(np.linalg.norm(sl.samples_px[-1] - sl.samples_px[0]))) + 1
+            assert sl.n_samples > 1.4 * mean_rule
+
+    @pytest.mark.parametrize("length_m", [1.0, 2.99, 3.0, 3.01, 4.37])
+    def test_nadir_is_unchanged(self, length_m):
+        geom = build_section(base_config(stiv={"search_line_length_m": length_m}), SHAPE)
+        for sl in geom.search_lines:
+            ends = np.linalg.norm(sl.samples_px[-1] - sl.samples_px[0])
+            assert sl.n_samples == int(round(ends)) + 1

@@ -69,8 +69,14 @@ all of them. This implementation takes the minor eigenvector, and
 pip install -e .            # or: pip install -e '.[test,gui]'
 ```
 
-Needs Python ≥ 3.10, numpy, scipy, opencv-python, matplotlib, pandas, PyYAML,
-tqdm. The `gui` extra is only for the interactive `stiv pick`.
+Needs Python ≥ 3.10, numpy, scipy, opencv-python-headless, matplotlib, pandas,
+PyYAML, tqdm. The `gui` extra is only for the interactive `stiv pick`.
+
+OpenCV is the *headless* build: nothing here opens an OpenCV window (the point
+picker is a matplotlib window), and the headless wheel avoids clashing with
+the Qt libraries a GUI backend brings in. If something else in your environment
+needs the full `opencv-python`, keep just one of the two -- both install the
+same `cv2` module and overwrite each other.
 
 ## Interactive notebook UI
 
@@ -87,9 +93,13 @@ jupyter lab notebooks/STIV_Interactive.ipynb
 1. **Video** -- browse to a file, or generate a synthetic demo river with a
    *known* velocity profile to try the workflow risk-free first.
 2. **Scale** -- enter a ground resolution directly, or let it derive from
-   flight altitude and camera field of view; suggests a `frame_step`.
+   flight altitude and camera field of view; suggests a `frame_step`. Nothing
+   here is pre-filled: every velocity is proportional to the scale, so it has
+   to be typed in. Also sets which part of the clip to analyse.
 3. **Cross-section** -- click the section, a downstream point, and (optionally)
-   outline the water, directly on the video frame.
+   outline the water, directly on the frame at the analysis start time (the
+   frame the drone-motion correction measures drift from). Loading a different
+   video starts the survey afresh.
 4. **Settings** -- station count, expected velocity range, drone-motion
    compensation, and optional discharge, with sensible defaults and the fussier
    options tucked under "Advanced".
@@ -111,7 +121,7 @@ simulated drone drift, sway and yaw — analyses it, and reports the error again
 ground truth. Expect **≈0.6% relative RMSE**:
 
 ```
-stations       19/21 clean, 2 failed and interpolated
+stations       19/21 clean, 2 failed (2 interpolated)
 surface U      mean 0.783  median 0.902  max 1.209 m/s
 stabilisation: 1200 features, median residual 0.24 px, max frame shift 59.2 px,
                0/299 frames fell back to the previous transform, 18 feature top-up(s)
@@ -146,9 +156,18 @@ stiv pick flight.mp4 -o survey.yaml
 
 Opens a frame and asks you to click: the two ends of the cross-section, a point
 downstream (which fixes the flow direction), and optionally an outline of the
-water. Writes a config you then edit. Or start from
-[`examples/nadir_drone.yaml`](examples/nadir_drone.yaml) and fill in the
-coordinates by hand.
+water. `-t SECONDS` shows a later frame, and that time also becomes
+`video.start_s`, since drift is measured from the first analysed frame.
+
+The config it writes leaves the scale as `m_per_px: null` (with `--gcps`, the
+world coordinates of the control points as `null`s), and `stiv run` refuses the
+file until you fill it in -- there is no safe default for a number every
+velocity is proportional to. `stiv init flight.mp4` writes the same skeleton
+with the section ends also `null`, for filling in by hand, or start from
+[`examples/nadir_drone.yaml`](examples/nadir_drone.yaml). Neither command
+overwrites an existing file unless given `--force`. The video path is written
+relative to the config file's folder (or absolute, if the video is elsewhere),
+because that is what relative paths in a config are resolved against.
 
 ### 3. Run
 
@@ -160,15 +179,32 @@ Outputs, in `output.out_dir`:
 
 | File | Contents |
 |---|---|
-| `velocity.csv` | per station: distance, φ, tan φ, velocity, σ, coherency, flags |
+| `velocity.csv` | per station: distance, φ, tan φ, velocity, σ, coherency, flags (σ is explained below) |
 | `summary.json` | machine-readable run summary |
 | `report.txt` | the console summary, including warnings |
 | `velocity_profile.png` | velocity across the section with its uncertainty band, and coherency below |
 | `overview.png` | the frame with the section, search lines and flow direction drawn |
-| `sti_panel.png` | contact sheet of every STI (cf. Fig. 4) |
-| `sti_detail/*.png` | orientation vectors, coherency map and angle histogram (Figs. 8, 9, 11) |
+| `sti_panel.png` | contact sheet of up to 24 STIs, evenly spaced across the section (cf. Fig. 4) |
+| `sti/*.png` | every station's STI, full resolution (`output.save_sti_images`) |
+| `sti_detail/*.png` | orientation vectors, coherency map and angle histogram (Figs. 8, 9, 11) for the first, middle and last stations |
 | `discharge.png`, `discharge_panels.csv` | if depths were supplied |
+| `orientation_fields.npz` | per-window orientation and coherency fields, if `output.save_fields` |
 | `config_used.yaml` | the fully resolved config, for reproducibility |
+
+Each run lists the files it wrote in `.stiv_outputs.json`, and a re-run into
+the same folder first removes exactly those, so a run with fewer stations, or
+without discharge, leaves nothing stale behind. Nothing else is ever deleted: a
+folder with no such list -- a survey folder holding its own `overview.png`, say
+-- keeps everything, and same-named files are simply overwritten.
+In `summary.json` a value that could not be computed is `null`.
+
+The σ column of `velocity.csv` (`velocity_std_ms`) is the *spread* of the
+individual window velocities about the station's value -- how much the streaks
+in that STI disagree -- not the standard error of the station's velocity, which
+is smaller by a factor nothing here can estimate, since the overlapping windows
+are not independent. It is empty wherever the reported velocity is not the
+station's own measurement: interpolated, median-filtered or failed. In code it
+is `StationResult.velocity_spread_ms` (`velocity_std_ms` still works).
 
 ---
 
@@ -183,12 +219,31 @@ Camera motion is the dominant error source in UAV gauging: at 2 cm/px and 30 fps
 a drift of one pixel per frame is a spurious **0.6 m/s** on every station.
 Stabilisation is on by default. Supply `stabilise.water_mask_px` — without it the
 tracker may lock onto the moving water surface, and the run report will warn you
-when fewer than half the tracked features agree with the fitted motion.
+when fewer than half the tracked features agree with the fitted motion. If it
+finds fewer than 6 trackable features on static ground it cannot fit the motion
+at all and switches itself off: the summary then reads `DISABLED AUTOMATICALLY`,
+the warnings say so in capitals, and every velocity includes whatever the
+aircraft drifted. Give it `stabilise.static_mask_px` around textured bank, or
+set `stabilise.enabled: false` if the camera really was fixed.
 
 **Keep `tan φ` near 1.** Accuracy is best when a surface feature moves about one
 STI column per row, and the paper only validated `tan φ` from 0.1 to 7. Since
 `tan φ = U·St/Sx`, the knob is `video.frame_step` — the run warns you and names a
-better value when the median drifts out of range.
+better value when the median drifts out of range. If it is still above about 4
+at `frame_step: 1`, `St` cannot get any shorter, so make `Sx` coarser instead:
+record at a higher frame rate, fly higher, or set a smaller `stiv.n_samples` so
+the samples along each search line are further apart. A longer search line does
+not help: with the default automatic `n_samples` it only adds columns at the
+same spacing, and leaves `tan φ` where it was.
+
+**Use constant-frame-rate footage.** `St = frame_step/fps` is taken to be the
+same for every STI row; if it is not, the streaks bend and nothing downstream
+can tell. The run reads every frame's timestamp and warns when the intervals are
+irregular (variable frame rate, which phones often record, or dropped frames) or
+when they disagree with the frame rate the container reports -- velocities scale
+with it. Raw `.h264`/`.mjpeg` streams carry no timing at all, so set
+`video.fps_override` for them; a file that records no frame rate is an error
+until you do.
 
 **Leave `stiv.smooth_sigma` on.** It defaults to 1.5 px, and it is doing more
 than tidying up noise: a feature advancing `tan φ` columns per STI row *aliases*
@@ -207,12 +262,23 @@ answer toward the range you guessed.
 
 **Fly nadir if you can.** A straight-down view needs only a scale, and its
 resolution is uniform across the frame. Oblique views need ground control points
-and lose resolution with range.
+and lose resolution with range. Survey at least 5 (6 or more is better): a
+homography has exactly enough freedom to pass through 4, so with 4 their RMSE
+is zero whatever their errors, a blunder goes undetected, and the run warns you
+of this.
+
+**Give the analysis enough to work with.** Each STI must be at least as large
+as the `stiv.window_px` analysis window, in rows (frames) and columns (samples
+along the search line). A clip or search line too short for that is refused
+before any frames are processed, with a message naming what to change, rather
+than failing every station as `sti_too_small`.
 
 ### Reading the quality flags
 
 | Flag | Meaning |
 |---|---|
+| `no_orientation` | no window gave a usable streak angle at all |
+| `sti_too_small` | this station's STI is smaller than the `window_px` analysis window — lengthen its search line (if every station would be, the run stops up front) |
 | `low_coherency` | no streak-like structure — check the surface has texture |
 | `high_uncertainty` | the angle histogram is flat; usually a line straddling the bank |
 | `low_valid_fraction` | most windows fell outside `velocity_range_ms` — widen it |
@@ -224,6 +290,12 @@ and lose resolution with range.
 Advisory flags (`tan_phi_*`, `median_filtered`) never trigger interpolation: a
 genuinely slow patch near the bank is measuring correctly, and pulling it toward
 its faster neighbours would add error rather than remove it.
+
+With `quality.interpolate_flagged: false`, a failed station is reported with no
+velocity (empty in `velocity.csv`, a gap in `velocity_profile.png`) rather than
+filled in; its untrusted estimate stays in the `velocity_raw_ms` column, and is
+drawn hollow on the plot. Summary statistics are only ever taken over the
+reported profile.
 
 ---
 
@@ -244,6 +316,14 @@ Integration is the mid-section method of standard current-meter gauging. **`alph
 is the largest single uncertainty in the result** — 0.85 suits a logarithmic
 profile in a wide channel, but it varies with relative roughness and wind, and is
 worth calibrating against an ADCP transect if the site matters.
+
+"The banks" here means the waterline found from the bed survey, not the ends of
+the section as clicked. Stations outside it own no panel and add nothing, and
+`bank_coefficient` applies to the outermost stations that are in the water. A
+station in the water with no velocity (failed, and not interpolated) is filled
+from its neighbours for the discharge, with a warning. If no station has a
+velocity at all, the run warns and reports no discharge, and still writes the
+velocity results.
 
 ---
 
@@ -281,10 +361,13 @@ print(result.summary())
 result.to_frame().to_csv("velocity.csv", index=False)
 
 for s in result.stations:
-    if s.failed:
-        print(f"{s.station_m:6.2f} m  no data ({', '.join(s.flags)})")
-    else:
-        print(f"{s.station_m:6.2f} m  {s.velocity_ms:.3f} ± {s.velocity_std_ms:.3f} m/s")
+    if s.failed:  # interpolated from its neighbours, or no value at all
+        print(f"{s.station_m:6.2f} m  not measured ({', '.join(s.flags)})")
+    elif s.ok:
+        print(f"{s.station_m:6.2f} m  {s.velocity_ms:.3f} m/s "
+              f"(window spread {s.velocity_spread_ms:.3f} m/s)")
+    else:  # a real measurement with a caveat, e.g. tan_phi_low
+        print(f"{s.station_m:6.2f} m  {s.velocity_ms:.3f} m/s ({', '.join(s.flags)})")
 ```
 
 The pieces are usable on their own — `structure_tensor_field` and
@@ -294,7 +377,7 @@ analysis on STIs produced by other software.
 ## Tests
 
 ```bash
-pytest                     # 98 tests, ~20 s
+pytest                     # 290 tests, ~20 s
 ```
 
 The end-to-end tests render synthetic footage with a known velocity field and

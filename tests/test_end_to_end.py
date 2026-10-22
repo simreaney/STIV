@@ -13,6 +13,7 @@ import pytest
 
 from stiv import Config, run
 from stiv.analysis import ADVISORY_FLAGS
+from stiv.config import ConfigError
 from stiv.synthetic import SyntheticRiver, make_config, render
 
 
@@ -239,3 +240,133 @@ class TestOutputsAndQuality:
         result = analyse(river, video, d / "range",
                          stiv={"velocity_range_ms": [3.0, 6.0]})
         assert sum(s.failed for s in result.stations) > len(result.stations) // 2
+
+
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module")
+def oblique_clip(tmp_path_factory, clean_clip):
+    """The clean clip seen obliquely: every frame warped by one homography.
+
+    The far bank is compressed to about 60% of its nadir scale, so ``Sx`` is
+    only constant along a search line if the samples really are spaced in
+    world metres through the fitted homography.
+    """
+    import cv2
+
+    from stiv.synthetic import _open_writer
+
+    river, nadir, _ = clean_clip
+    d = tmp_path_factory.mktemp("oblique")
+    src = np.float32([[0, 0], [720, 0], [720, 420], [0, 420]])
+    dst = np.float32([[130, 30], [590, 30], [720, 420], [0, 420]])
+    H = cv2.getPerspectiveTransform(src, dst)
+
+    cap = cv2.VideoCapture(str(nadir))
+    writer, path = _open_writer(d / "oblique", river.fps, 720, 420)
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        writer.write(cv2.warpPerspective(frame, H, (720, 420), flags=cv2.INTER_LINEAR))
+    writer.release()
+    cap.release()
+
+    def to_image(p):
+        return cv2.perspectiveTransform(np.float64(p).reshape(-1, 1, 2), H).reshape(-1, 2).tolist()
+
+    nadir_gcps = [[40, 40], [680, 40], [680, 380], [40, 380], [360, 60], [200, 370]]
+    raw = make_config(river, path, d / "out", n_stations=15)
+    raw["rectify"] = {
+        "method": "gcp",
+        "gcp_px": to_image(nadir_gcps),
+        # World = the nadir view's own metres, so the truth profile still applies.
+        "gcp_world": [[u * river.m_per_px, -v * river.m_per_px] for u, v in nadir_gcps],
+    }
+    start, end = to_image([[360, river.bank_top_px], [360, river.bank_bottom_px]])
+    raw["section"].update(start_px=start, end_px=end)
+    raw["flow"]["downstream_px"] = to_image([[719, 210]])[0]
+    return river, raw
+
+
+class TestObliqueView:
+    def test_gcp_rectified_oblique_footage_recovers_the_profile(self, oblique_clip):
+        river, raw = oblique_clip
+        result = run(Config.from_dict(raw), progress=False)
+        stats = error_stats(result, river)
+        assert stats["rmse"] < 0.05
+        assert stats["rel"] < 0.10
+        # The lines run from near to far field, yet every one has a single Sx.
+        sl = result.geometry.search_lines[0]
+        steps = np.linalg.norm(np.diff(sl.samples_world, axis=0), axis=1)
+        assert np.allclose(steps, sl.sx_m_per_px, rtol=1e-6)
+
+
+class TestRunLevelFailures:
+    def test_every_station_failing_does_not_lose_the_result(self, clean_clip):
+        """A discharge error used to throw the whole velocity result away."""
+        river, video, d = clean_clip
+        res = analyse(river, video, d / "allfail",
+                      stiv={"velocity_range_ms": [2.0, 2.1]},
+                      discharge={"enabled": True, "depths_m": [1.0] * 15})
+        assert all(s.failed for s in res.stations)
+        assert np.isnan(res.velocities).all()          # no failed value is reported
+        assert res.discharge is None
+        assert any("discharge was not computed" in w for w in res.warnings)
+        assert "15 failed (0 interpolated)" in res.summary()
+
+    def test_a_clip_shorter_than_the_window_is_rejected_up_front(self, clean_clip):
+        river, video, d = clean_clip
+        with pytest.raises(ConfigError, match="STI rows"):
+            analyse(river, video, d / "short", video={"duration_s": 0.5})
+
+    def test_search_lines_shorter_than_the_window_are_rejected_up_front(self, clean_clip):
+        river, video, d = clean_clip
+        with pytest.raises(ConfigError, match="samples"):
+            analyse(river, video, d / "narrow", stiv={"search_line_length_m": 0.4})
+
+    def test_reverse_advice_says_to_toggle_it(self, clean_clip):
+        river, video, d = clean_clip
+        res = analyse(river, video, d / "noflip", flow={"reverse": True, "auto_flip": False})
+        (msg,) = [w for w in res.warnings if "opposite to the assumed downstream" in w]
+        assert "flow.reverse: false" in msg
+
+    def test_filled_stations_report_a_consistent_angle(self, clean_clip):
+        river, video, d = clean_clip
+        res = analyse(river, video, d / "consistent")
+        filled = [s for s in res.stations if "interpolated" in s.flags]
+        assert filled, "nothing was interpolated, so this proves nothing"
+        for s in filled:
+            assert s.tan_phi * s.sx_m_per_px / s.st_s_per_px == pytest.approx(s.velocity_ms)
+            assert np.isnan(s.velocity_std_ms)
+
+
+class TestStabiliserSwitchedOff:
+    def test_too_few_features_is_a_loud_warning(self, drone_clip):
+        river, video, d = drone_clip
+        res = analyse(river, video, d / "nofeatures",
+                      stabilise={"enabled": True,
+                                 "static_mask_px": [[[3, 3], [6, 3], [6, 6]]]})
+        assert res.stabilisation.auto_disabled
+        assert any("STABILISATION WAS SWITCHED OFF" in w for w in res.warnings)
+        assert "DISABLED AUTOMATICALLY" in res.summary()
+
+
+class TestRawStream:
+    def test_a_stream_with_no_frame_count_is_read_to_its_end(self, clean_clip, tmp_path):
+        """No frame count used to mean a 10**9-row buffer, i.e. terabytes."""
+        import cv2
+
+        river, video, d = clean_clip
+        raw = tmp_path / "river.mjpeg"
+        cap = cv2.VideoCapture(str(video))
+        with raw.open("wb") as fh:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                fh.write(cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes())
+        cap.release()
+
+        res = analyse(river, raw, d / "raw", video={"path": str(raw), "fps_override": river.fps})
+        assert res.n_frames == river.n_frames
+        assert error_stats(res, river)["rmse"] < 0.05

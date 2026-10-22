@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from . import geometry, orientation, sti as sti_mod
-from .config import Config
+from .config import Config, ConfigError, FlowConfig
 from .discharge import DischargeResult, compute_discharge
 from .geometry import SectionGeometry
 from .orientation import AngleEstimate, OrientationField
@@ -57,6 +57,28 @@ ADVISORY_FLAGS = frozenset(
     {"tan_phi_low", "tan_phi_high", "interpolated", "median_filtered"}
 )
 
+#: A station whose samples left the frame for more than this fraction of the
+#: STI is failed: the gaps are filled with the column mean, and past a few
+#: percent that fill starts to draw structure of its own.
+_MAX_OUT_OF_FRAME_FRACTION = 0.02
+#: The high-uncertainty test compares a station's spread with the larger of its
+#: own velocity and this fraction of the section's median speed, so a slow but
+#: well-resolved station by the bank is not condemned for a small denominator.
+_UNCERTAINTY_SCALE_FRACTION = 0.25
+#: Warn about the measurement as a whole when more than this fraction of the
+#: stations fail quality control.
+_FAILED_FRACTION_WARNING = 0.3
+#: Median |tan phi| outside this band earns a frame_step suggestion.  Fig. 7 of
+#: the paper is accurate over roughly 0.1-7; this is the comfortable middle.
+_TAN_PHI_ADVICE_BAND = (0.2, 4.0)
+#: Fewest usable values a median-filter window must hold for the filter to
+#: move its station.  The median of two values is their mean, which a single
+#: spike drags as far as it likes; from three up a lone outlier cannot win.
+_MIN_MEDIAN_VALUES = 3
+#: Fewest ground control points that leave a homography any redundancy.  Four
+#: determine it exactly, so their residuals are zero whatever their errors.
+_MIN_REDUNDANT_GCPS = 5
+
 
 @dataclass
 class StationResult:
@@ -76,12 +98,36 @@ class StationResult:
     coherency: float
     valid_fraction: float
     n_windows: int
+    #: Standard deviation of the window angles in the Eq. (14) histogram, rad.
     phi_std_rad: float
-    #: 1-sigma velocity spread implied by the angle histogram, m/s.
+    #: The same spread carried through Eq. (16), m/s: how much the individual
+    #: windows *scatter* about the station's velocity.  Despite the name it is
+    #: not the standard error of that velocity, which is smaller -- by a factor
+    #: that depends on how many of the overlapping windows are independent,
+    #: which nothing here estimates.  NaN where the reported velocity is not
+    #: this station's own measurement (interpolated, median-filtered or
+    #: failed), because then the spread describes a number that is no longer
+    #: reported.  The name is kept for the constructor, ``velocity.csv`` and the
+    #: iOS export; :attr:`velocity_spread_ms` is the same value under an honest
+    #: name.
     velocity_std_ms: float
     sx_m_per_px: float
     st_s_per_px: float
     flags: list[str] = field(default_factory=list)
+
+    @property
+    def velocity_spread_ms(self) -> float:
+        """:attr:`velocity_std_ms` by what it is: the window spread, m/s."""
+        return self.velocity_std_ms
+
+    @velocity_spread_ms.setter
+    def velocity_spread_ms(self, value: float) -> None:
+        self.velocity_std_ms = value
+
+    def add_flag(self, flag: str) -> None:
+        """Flag the station, once: a flag already present is not added again."""
+        if flag not in self.flags:
+            self.flags.append(flag)
 
     @property
     def failed(self) -> bool:
@@ -117,6 +163,12 @@ class StivResult:
     # ------------------------------------------------------------------ #
     @property
     def velocities(self) -> np.ndarray:
+        """The reported profile, m/s.
+
+        NaN where a station failed quality control and was not interpolated;
+        its raw value is still in ``StationResult.velocity_raw_ms``.  Nothing
+        downstream -- discharge, summary, report -- ever sees a failed value.
+        """
         return np.array([s.velocity_ms for s in self.stations])
 
     @property
@@ -138,7 +190,9 @@ class StivResult:
                     "tan_phi": s.tan_phi,
                     "velocity_ms": s.velocity_ms,
                     "velocity_raw_ms": s.velocity_raw_ms,
-                    "velocity_std_ms": s.velocity_std_ms,
+                    # Column name kept for the iOS export and existing scripts;
+                    # it is the window spread, see StationResult.
+                    "velocity_std_ms": s.velocity_spread_ms,
                     "coherency": s.coherency,
                     "valid_fraction": s.valid_fraction,
                     "n_windows": s.n_windows,
@@ -153,6 +207,7 @@ class StivResult:
         v = self.velocities
         clean = [s for s in self.stations if s.ok]
         failed = [s for s in self.stations if s.failed]
+        filled = [s for s in failed if "interpolated" in s.flags]
         finite = v[np.isfinite(v)]
         lines = [
             f"section        {self.config.section.name}: "
@@ -163,7 +218,7 @@ class StivResult:
             f"flow direction {self.geometry.flow_bearing_deg:+.1f} deg in world frame",
             self.stabilisation.summary(),
             f"stations       {len(clean)}/{len(self.stations)} clean, "
-            f"{len(failed)} failed and interpolated",
+            f"{len(failed)} failed ({len(filled)} interpolated)",
         ]
         if finite.size:
             lines += [
@@ -187,7 +242,26 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
 
     source = FrameSource(cfg.video)
     log.info("video: %s", source.info)
-    log.info("using %d frames, step %d (St = %.4f s)", source.n_frames, source.step, source.st_s_per_px)
+    if source.n_frames is None:
+        log.info("using every frame to the end of the video, step %d (St = %.4f s)",
+                 source.step, source.st_s_per_px)
+    else:
+        log.info("using %d frames, step %d (St = %.4f s)",
+                 source.n_frames, source.step, source.st_s_per_px)
+
+    # An STI shorter than the analysis window fails at every station, and
+    # used to be reported as a texture or velocity-range problem afterwards.
+    need = orientation.min_sti_size(
+        cfg.stiv.window_px, cfg.stiv.window_type, cfg.stiv.gradient_order
+    )
+    if source.n_frames is not None and source.n_frames < need:
+        raise ConfigError(
+            f"the clip gives only {source.n_frames} STI rows (frames left after "
+            f"video.start_s, duration_s and frame_step: {source.step}), but a "
+            f"{cfg.stiv.window_px} px {cfg.stiv.window_type} window needs at least "
+            f"{need}; use a longer video.duration_s, a smaller video.frame_step, or "
+            f"a smaller stiv.window_px"
+        )
 
     geom = geometry.build_section(cfg, source.shape)
     log.info("rectification: %s", geom.rectifier.describe())
@@ -195,6 +269,22 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
         "section %.2f m wide, %d stations, %.2f m search lines along %+.1f deg",
         geom.width_m, len(geom.search_lines), cfg.stiv.search_line_length_m, geom.flow_bearing_deg,
     )
+
+    narrow = [sl.index for sl in geom.search_lines if sl.n_samples < need]
+    if narrow and len(narrow) == len(geom.search_lines):
+        raise ConfigError(
+            f"the search lines have only {min(sl.n_samples for sl in geom.search_lines)} "
+            f"samples, but a {cfg.stiv.window_px} px {cfg.stiv.window_type} window "
+            f"needs at least {need}; lengthen stiv.search_line_length_m, raise "
+            f"stiv.n_samples, or use a smaller stiv.window_px"
+        )
+    if narrow:
+        warnings.append(
+            f"{len(narrow)} search line(s) have fewer than the {need} samples a "
+            f"{cfg.stiv.window_px} px window needs (stations {narrow[:5]}"
+            f"{'...' if len(narrow) > 5 else ''}) and will fail; lengthen "
+            f"stiv.search_line_length_m or use a smaller stiv.window_px"
+        )
 
     outside = geometry.check_lines_in_frame(geom, source.shape)
     if outside:
@@ -207,6 +297,7 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
     _rectification_warnings(geom, warnings)
 
     stis, stab_report, reference_bgr = _collect_stis(cfg, source, geom, progress)
+    warnings.extend(source.warnings)
 
     stations, fields, estimates = _analyse_stis(cfg, stis, geom)
 
@@ -219,12 +310,19 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
 
     disch = None
     if cfg.discharge.enabled:
-        disch = compute_discharge(
-            cfg.discharge,
-            [s.station_m for s in stations],
-            [s.velocity_ms for s in stations],
-            geom.width_m,
-        )
+        # A discharge that cannot be computed -- every station failed, say --
+        # must not take the velocity profile down with it.
+        try:
+            disch = compute_discharge(
+                cfg.discharge,
+                [s.station_m for s in stations],
+                [s.velocity_ms for s in stations],
+                geom.width_m,
+            )
+        except ConfigError as exc:
+            warnings.append(f"discharge was not computed: {exc}")
+        else:
+            warnings.extend(disch.warnings)
 
     return StivResult(
         config=cfg,
@@ -255,6 +353,16 @@ def _rectification_warnings(geom: SectionGeometry, warnings: list[str]) -> None:
     rect = geom.rectifier
     if not isinstance(rect, geometry.HomographyRectifier):
         return
+
+    if rect.n_gcp < _MIN_REDUNDANT_GCPS:
+        warnings.append(
+            f"the homography was fitted to only {rect.n_gcp} ground control points, "
+            f"the minimum it needs, so it passes through every one of them exactly: "
+            f"its RMSE of {rect.rmse_m:.3f} m says nothing about their accuracy, and "
+            f"a blunder in any one goes undetected while scaling every velocity. "
+            f"Survey at least {_MIN_REDUNDANT_GCPS} (6 or more is better) so the fit "
+            f"has redundancy and a bad point can be rejected."
+        )
 
     tolerance_m = rect.inlier_threshold_m
     if rect.rmse_m > tolerance_m:
@@ -318,13 +426,8 @@ def _collect_stis(
     return collector.finish(), report, reference_bgr
 
 
-def _estimate_angle(
-    cfg: Config, s: SpaceTimeImage, field_: OrientationField, v_lo: float, v_hi: float
-) -> AngleEstimate:
-    """Run Eq. (14) over one orientation field for a given velocity range."""
-    phi_min, phi_max = orientation.angle_range_from_velocity(
-        v_lo, v_hi, s.sx_m_per_px, s.st_s_per_px
-    )
+def _eq14(cfg: Config, field_: OrientationField, phi_min: float, phi_max: float) -> AngleEstimate:
+    """Run Eq. (14) over one orientation field for a given angle range."""
     return orientation.mean_orientation_angle(
         field_,
         phi_min,
@@ -334,6 +437,16 @@ def _estimate_angle(
         min_coherency=cfg.stiv.min_coherency,
         estimator=cfg.stiv.estimator,
     )
+
+
+def _estimate_angle(
+    cfg: Config, s: SpaceTimeImage, field_: OrientationField, v_lo: float, v_hi: float
+) -> AngleEstimate:
+    """Run Eq. (14) over one orientation field for a given velocity range."""
+    phi_min, phi_max = orientation.angle_range_from_velocity(
+        v_lo, v_hi, s.sx_m_per_px, s.st_s_per_px
+    )
+    return _eq14(cfg, field_, phi_min, phi_max)
 
 
 def _apply_estimate(
@@ -354,13 +467,13 @@ def _apply_estimate(
         st.tan_phi = math.nan
         st.velocity_ms = math.nan
         st.velocity_raw_ms = math.nan
-        st.velocity_std_ms = math.nan
+        st.velocity_spread_ms = math.nan
         st.phi_std_rad = math.nan
         st.coherency = 0.0
         st.valid_fraction = 0.0 if est is None else est.valid_fraction
         st.n_windows = 0
-        if "sti_too_small" not in st.flags and "no_orientation" not in st.flags:
-            st.flags.append("no_orientation")
+        if "sti_too_small" not in st.flags:
+            st.add_flag("no_orientation")
         return
 
     sign = -1.0 if negate else 1.0
@@ -371,7 +484,7 @@ def _apply_estimate(
     st.velocity_raw_ms = st.velocity_ms
     # Propagate the angle spread through Eq. (16): dU/dphi = k * sec^2(phi).
     k = s.sx_m_per_px / s.st_s_per_px
-    st.velocity_std_ms = abs(k / max(math.cos(phi) ** 2, 1e-6)) * est.phi_std
+    st.velocity_spread_ms = abs(k / max(math.cos(phi) ** 2, 1e-6)) * est.phi_std
     st.phi_std_rad = est.phi_std
     st.coherency = est.mean_coherency
     st.valid_fraction = est.valid_fraction
@@ -410,13 +523,15 @@ def _analyse_stis(
             st_s_per_px=s.st_s_per_px,
         )
 
-        s.data = sti_mod.preprocess(s.data, cfg.stiv)
+        # Conditioning and orientation run in float64 throughout: the Swift
+        # port is held to these numbers to 1e-9.
+        conditioned = sti_mod.preprocess(s.data, cfg.stiv)
 
         field_ = None
         est = None
         try:
             field_ = orientation.structure_tensor_field(
-                s.data,
+                conditioned,
                 window_px=cfg.stiv.window_px,
                 window_type=cfg.stiv.window_type,
                 overlap=cfg.stiv.window_overlap,
@@ -424,13 +539,28 @@ def _analyse_stis(
             )
             est = _estimate_angle(cfg, s, field_, v_lo, v_hi)
         except ValueError as exc:
-            st.flags.append("sti_too_small")
+            st.add_flag("sti_too_small")
             log.warning("station %d: %s", sl.index, exc)
+
+        # From here on the conditioned STI is only drawn and exported, for
+        # which float32 is ample.  It is written back over the raw samples --
+        # a view into the collector's single buffer -- so the result holds one
+        # float32 copy of the STIs rather than a float64 one beside the raw.
+        if (
+            isinstance(s.data, np.ndarray)
+            and s.data.dtype == np.float32
+            and s.data.flags.writeable
+            and s.data.shape == conditioned.shape
+        ):
+            s.data[...] = conditioned
+        else:
+            s.data = conditioned.astype(np.float32)
+        del conditioned
 
         _apply_estimate(cfg, st, s, est)
 
-        if s.out_of_frame_fraction > 0.02:
-            st.flags.append("out_of_frame")
+        if s.out_of_frame_fraction > _MAX_OUT_OF_FRAME_FRACTION:
+            st.add_flag("out_of_frame")
 
         stations.append(st)
         fields.append(field_)
@@ -442,7 +572,42 @@ def _analyse_stis(
 # --------------------------------------------------------------------------- #
 # quality control
 # --------------------------------------------------------------------------- #
+def _report_velocity(st: StationResult, velocity_ms: float) -> None:
+    """Replace a station's reported velocity with one it did not measure.
+
+    Everything that describes the reported number is kept consistent with it:
+    ``tan_phi`` and ``phi_rad`` are recomputed through Eq. (16), and the
+    spreads are cleared, since they describe the measurement that was replaced
+    rather than the value now reported -- an interpolated value's uncertainty
+    is the interpolation error, which nothing here can estimate.  The raw
+    measurement stays in ``velocity_raw_ms``; the diagnostics that explain why
+    it was replaced (coherency, valid fraction) are left alone.
+    """
+    st.velocity_ms = float(velocity_ms)
+    if np.isfinite(velocity_ms) and st.sx_m_per_px > 0:
+        st.tan_phi = float(velocity_ms) * st.st_s_per_px / st.sx_m_per_px
+        st.phi_rad = math.atan(st.tan_phi)
+    else:
+        st.tan_phi = math.nan
+        st.phi_rad = math.nan
+    st.velocity_spread_ms = math.nan
+    st.phi_std_rad = math.nan
+
+
 def _quality_control(cfg: Config, stations: list[StationResult], warnings: list[str]) -> None:
+    """Flag doubtful stations, then fill or blank the failed ones.
+
+    The order is deliberate, and the Swift port mirrors it:
+
+    1. flag every station on its measured values;
+    2. median-filter the *usable* stations only (if asked), so no failed
+       value can leak into a good neighbour;
+    3. interpolate the failed stations from the *filtered* usable values, so
+       a spike the filter removed cannot come back through a filled gap;
+    4. blank to NaN whatever failed and is still unfilled (its raw value stays
+       in ``velocity_raw_ms``), so no failed number can reach the discharge
+       or the summary.
+    """
     q = cfg.quality
     lo, hi = q.tan_phi_range
 
@@ -451,25 +616,25 @@ def _quality_control(cfg: Config, stations: list[StationResult], warnings: list[
     # condemned merely for having a small denominator.
     v_all = np.array([abs(s.velocity_ms) for s in stations], dtype=float)
     finite = v_all[np.isfinite(v_all)]
-    v_scale = 0.25 * float(np.median(finite)) if finite.size else 0.0
+    v_scale = _UNCERTAINTY_SCALE_FRACTION * float(np.median(finite)) if finite.size else 0.0
 
     for s in stations:
         if np.isfinite(s.valid_fraction) and s.valid_fraction < q.min_valid_fraction:
-            s.flags.append("low_valid_fraction")
+            s.add_flag("low_valid_fraction")
         if np.isfinite(s.coherency) and s.coherency < q.min_mean_coherency:
-            s.flags.append("low_coherency")
-        if np.isfinite(s.velocity_std_ms) and np.isfinite(s.velocity_ms):
+            s.add_flag("low_coherency")
+        if np.isfinite(s.velocity_spread_ms) and np.isfinite(s.velocity_ms):
             reference = max(abs(s.velocity_ms), v_scale)
-            if reference > 0 and s.velocity_std_ms > q.max_relative_uncertainty * reference:
-                s.flags.append("high_uncertainty")
+            if reference > 0 and s.velocity_spread_ms > q.max_relative_uncertainty * reference:
+                s.add_flag("high_uncertainty")
         if np.isfinite(s.tan_phi):
             a = abs(s.tan_phi)
             if a > hi:
                 # Steep streaks: too little spatial displacement per frame is
                 # resolvable.  Section 2.3 tested only up to tan phi = 7.
-                s.flags.append("tan_phi_high")
+                s.add_flag("tan_phi_high")
             elif a < lo:
-                s.flags.append("tan_phi_low")
+                s.add_flag("tan_phi_low")
 
     if q.median_filter_stations and q.median_filter_stations > 1:
         _median_filter(stations, int(q.median_filter_stations))
@@ -477,8 +642,34 @@ def _quality_control(cfg: Config, stations: list[StationResult], warnings: list[
     if q.interpolate_flagged:
         _interpolate_flagged(stations)
 
-    n_bad = sum(1 for s in stations if s.failed)
-    if n_bad > 0.3 * max(1, len(stations)):
+    unfilled = [s for s in stations if s.failed and "interpolated" not in s.flags]
+    for s in unfilled:
+        _report_velocity(s, math.nan)
+    if unfilled and q.interpolate_flagged:
+        n_usable = sum(1 for s in stations if not s.failed)
+        warnings.append(
+            f"{len(unfilled)} failed station(s) could not be interpolated -- only "
+            f"{n_usable} station(s) measured a usable velocity, and interpolation "
+            f"needs two -- so they report no velocity"
+        )
+
+    # A clip or a search line too small for the window fails every station it
+    # touches, and is not a texture or velocity-range problem: say so plainly.
+    need = orientation.min_sti_size(
+        cfg.stiv.window_px, cfg.stiv.window_type, cfg.stiv.gradient_order
+    )
+    too_small = [s for s in stations if "sti_too_small" in s.flags]
+    if too_small:
+        warnings.append(
+            f"{len(too_small)} of {len(stations)} stations produced a space-time "
+            f"image too small for the {cfg.stiv.window_px} px {cfg.stiv.window_type} "
+            f"window, which needs at least {need} rows (frames) and {need} columns "
+            f"(samples); use more frames (video.duration_s, video.frame_step), "
+            f"longer search lines, or a smaller stiv.window_px"
+        )
+
+    n_bad = sum(1 for s in stations if s.failed and "sti_too_small" not in s.flags)
+    if n_bad > _FAILED_FRACTION_WARNING * max(1, len(stations)):
         warnings.append(
             f"{n_bad} of {len(stations)} stations failed quality control; "
             f"check that the water surface has visible texture, that "
@@ -488,34 +679,53 @@ def _quality_control(cfg: Config, stations: list[StationResult], warnings: list[
 
 
 def _median_filter(stations: list[StationResult], k: int) -> None:
-    """Median-filter the velocity profile across stations.
+    """Median-filter the velocity profile across the *usable* stations.
+
+    Only stations that did not fail take part, either as inputs or as outputs:
+    a failed station's raw value is exactly what the filter must not spread
+    into its neighbours.  It runs before interpolation, so the gaps are then
+    filled from the filtered values.  The window is ``k`` stations wide by
+    index and centred; failed stations and the ends of the section leave it
+    holding fewer values, and a station whose window holds fewer than
+    ``_MIN_MEDIAN_VALUES`` is left as measured rather than replaced by what
+    would really be the mean of two.
 
     Any station the filter actually moves is flagged.  The reported velocity is
     then no longer the one that station measured, and a silently substituted
     number that still reports ``ok`` is worse than no filter at all.
     """
+    if k % 2 == 0:
+        log.warning(
+            "quality.median_filter_stations = %d is even, but a centred median "
+            "needs an odd window; using %d stations", k, k + 1,
+        )
     v = np.array([s.velocity_ms for s in stations], dtype=float)
+    usable = np.array([not s.failed for s in stations], dtype=bool) & np.isfinite(v)
     half = k // 2
-    out = v.copy()
-    for i in range(len(v)):
+    for i, s in enumerate(stations):
+        if not usable[i]:
+            continue
         lo, hi = max(0, i - half), min(len(v), i + half + 1)
-        window = v[lo:hi]
-        window = window[np.isfinite(window)]
-        if window.size:
-            out[i] = float(np.median(window))
-    for s, before, after in zip(stations, v, out):
-        s.velocity_ms = float(after)
-        unchanged = before == after or (np.isnan(before) and np.isnan(after))
-        if not unchanged and "median_filtered" not in s.flags:
-            s.flags.append("median_filtered")
+        window = v[lo:hi][usable[lo:hi]]
+        if window.size < _MIN_MEDIAN_VALUES:
+            continue
+        after = float(np.median(window))
+        if after != v[i]:
+            _report_velocity(s, after)
+            s.add_flag("median_filtered")
 
 
-def _interpolate_flagged(stations: list[StationResult]) -> None:
+def _interpolate_flagged(stations: list[StationResult]) -> int:
     """Replace *failed* stations with an interpolation of their neighbours.
 
     Advisory flags are deliberately left alone: a station reading a genuinely
     slow patch near the bank is measuring correctly, and pulling it towards its
     faster neighbours would introduce error rather than remove it.
+
+    The usable values are taken as they stand -- after the median filter, when
+    there is one.  Failed stations beyond the outermost usable one take that
+    station's value.  Nothing happens with fewer than two usable stations.
+    Returns the number of stations filled.
     """
     x = np.array([s.station_m for s in stations], dtype=float)
     v = np.array([s.velocity_ms for s in stations], dtype=float)
@@ -523,13 +733,31 @@ def _interpolate_flagged(stations: list[StationResult]) -> None:
     usable = ~failed & np.isfinite(v)
 
     if usable.sum() < 2 or not failed.any():
-        return
+        return 0
     filled = np.interp(x, x[usable], v[usable])
     for s, val, bad in zip(stations, filled, failed):
         if bad:
-            s.velocity_ms = float(val)
-            if "interpolated" not in s.flags:
-                s.flags.append("interpolated")
+            _report_velocity(s, float(val))
+            s.add_flag("interpolated")
+    return int(failed.sum())
+
+
+def _reverse_advice(flow: FlowConfig) -> str:
+    """How to point the search lines downstream, given how they were pointed."""
+    if flow.reverse:
+        advice = "set flow.reverse: false (it is currently true)"
+    else:
+        advice = "set flow.reverse: true"
+    if flow.direction == "auto":
+        if flow.downstream_px is None:
+            advice += ", or give flow.downstream_px"
+        else:
+            advice += ", or check that flow.downstream_px really is downstream of the section"
+    elif flow.direction == "points":
+        advice += ", or swap flow.from_px and flow.to_px"
+    else:
+        advice += ", or add 180 to flow.angle_deg"
+    return advice
 
 
 def _direction_check(
@@ -567,15 +795,7 @@ def _direction_check(
     for s, field_ in zip(stis, fields):
         if field_ is None:
             continue
-        est = orientation.mean_orientation_angle(
-            field_,
-            -limit,
-            limit,
-            coherency_levels=cfg.stiv.coherency_levels,
-            n_bins=cfg.stiv.n_angle_bins,
-            min_coherency=cfg.stiv.min_coherency,
-            estimator=cfg.stiv.estimator,
-        )
+        est = _eq14(cfg, field_, -limit, limit)
         if np.isfinite(est.phi):
             probe.append(
                 orientation.velocity_from_angle(est.phi, s.sx_m_per_px, s.st_s_per_px)
@@ -593,8 +813,9 @@ def _direction_check(
         f"the median velocity along the search lines is {med:.3f} m/s, i.e. the "
         f"flow runs opposite to the assumed downstream direction"
     )
+    advice = _reverse_advice(cfg.flow)
     if not cfg.flow.auto_flip:
-        warnings.append(msg + "; set flow.reverse: true, or give flow.downstream_px.")
+        warnings.append(f"{msg}; {advice}.")
         return
 
     v_lo, v_hi = cfg.stiv.velocity_range_ms
@@ -612,9 +833,9 @@ def _direction_check(
         estimates[st.index] = est
 
     warnings.append(
-        msg + "; the search range was mirrored and the stations re-analysed "
-        "(flow.auto_flip). Set flow.reverse: true or give flow.downstream_px "
-        "to point the search lines the right way in the first place."
+        f"{msg}; the search range was mirrored and the stations re-analysed "
+        f"(flow.auto_flip). To point the search lines the right way in the "
+        f"first place, {advice}."
     )
 
 
@@ -626,29 +847,59 @@ def _range_advice(
     Accuracy is best when ``tan phi`` is around 1 (Fig. 7), i.e. when a surface
     feature moves about one STI column per row.  Since ``tan phi = U St / Sx``
     and ``St = frame_step / fps``, the step can be scaled to move it there.
+
+    Judged on every station's *measured* angle, failed or not -- it is when a
+    run fails wholesale that this advice matters most -- recovered from
+    ``velocity_raw_ms`` since the reported angle of a filled station is not a
+    measurement.
     """
-    tans = np.array([abs(s.tan_phi) for s in stations if np.isfinite(s.tan_phi)])
+    tans = np.array(
+        [
+            abs(s.velocity_raw_ms * s.st_s_per_px / s.sx_m_per_px)
+            for s in stations
+            if np.isfinite(s.velocity_raw_ms) and s.sx_m_per_px > 0
+        ]
+    )
     if tans.size == 0:
         return
     med = float(np.median(tans))
     if med <= 0:
         return
 
-    if 0.2 <= med <= 4.0:
+    band_lo, band_hi = _TAN_PHI_ADVICE_BAND
+    if band_lo <= med <= band_hi:
         return
 
-    suggested = max(1, int(round(source.step / med)))
-    if suggested == source.step:
-        return
-
-    if med > 4.0:
+    if med > band_hi:
+        suggested = max(1, int(round(source.step / med)))
+        if suggested < source.step:
+            warnings.append(
+                f"median tan(phi) is {med:.1f}, near the top of the range the method "
+                f"was validated over (Fig. 7 of the paper stops at 7). Features move "
+                f"far between STI rows -- try video.frame_step: {suggested}."
+            )
+            return
+        # Already reading every frame, so St cannot shrink any further and
+        # only Sx is left.  A longer search line does not change Sx when the
+        # sample count is automatic -- the samples stay about a pixel apart and
+        # the line merely gains columns -- so that is not offered.
+        sx = float(np.median([s.sx_m_per_px for s in stations]))
+        n_cols = max(16, int(round(cfg.stiv.search_line_length_m / (sx * med))) + 1)
+        longer = (
+            " A longer search line does not help: with automatic stiv.n_samples "
+            "it only adds columns." if cfg.stiv.n_samples is None else ""
+        )
         warnings.append(
-            f"median tan(phi) is {med:.1f}, near the top of the range the method "
-            f"was validated over (Fig. 7 of the paper stops at 7). Features move "
-            f"far between frames -- try video.frame_step: {suggested}, or a "
-            f"longer stiv.search_line_length_m."
+            f"median tan(phi) is {med:.1f} with video.frame_step already 1, near the "
+            f"top of the range the method was validated over (Fig. 7 of the paper "
+            f"stops at 7): features move about {med:.0f} STI columns per frame. "
+            f"Since tan(phi) = U St / Sx, what helps is a shorter St -- record at a "
+            f"higher frame rate -- or a coarser Sx: fly higher, or set "
+            f"stiv.n_samples to about {n_cols} so the samples are spaced wider "
+            f"(only if the surface texture is coarser than that spacing).{longer}"
         )
     else:
+        suggested = max(1, int(round(source.step / med)))
         warnings.append(
             f"median tan(phi) is {med:.2f}: features barely move between frames, "
             f"so velocity resolution is poor. Try video.frame_step: {suggested} "

@@ -12,7 +12,14 @@ from typing import Optional
 
 import numpy as np
 
-from .config import ConfigError
+from .config import (
+    ConfigError,
+    OutputConfig,
+    SectionConfig,
+    default_duration_s,
+    path_for_config,
+    survey_dict,
+)
 from .video import probe, read_frame_at
 
 
@@ -97,13 +104,31 @@ def pick_points(video: str | Path, n_points: Optional[int], prompt: str,
 
 def build_config_interactively(
     video: str | Path,
-    out_dir: str = "stiv_output",
+    out_dir: str = OutputConfig.out_dir,
     t_s: float = 0.0,
     with_gcps: bool = False,
-    n_stations: int = 30,
+    n_stations: int = SectionConfig.n_stations,
+    config_path: Optional[str | Path] = None,
 ) -> dict:
-    """Walk the user through defining a survey, returning a config dict."""
+    """Walk the user through defining a survey, returning a raw config dict.
+
+    The frame shown is the one at ``t_s``, which also becomes ``video.start_s``:
+    the stabiliser measures drift relative to the first analysed frame, so the
+    points must be clicked on that frame or they are off by however far the
+    aircraft has drifted in between.
+
+    ``video.path`` is written relative to the folder of ``config_path`` (the
+    file the config will be saved as) when the video is inside it, otherwise
+    absolute -- :meth:`Config.from_yaml` resolves relative paths against the
+    config file, not the working directory.  The scale is left as a ``null``
+    placeholder (or, with ``with_gcps``, the world coordinates of the control
+    points), which the config refuses to run with until it is filled in.
+    """
     info = probe(video)
+    if info.duration_s and t_s >= info.duration_s:
+        raise ConfigError(
+            f"-t {t_s:g} s is past the end of the video ({info.duration_s:.1f} s long)"
+        )
 
     pts = pick_points(
         video, 2,
@@ -114,28 +139,14 @@ def build_config_interactively(
     if len(pts) < 2:
         raise ConfigError("a cross-section needs two endpoints; none were selected")
 
-    cfg: dict = {
-        "video": {"path": str(video), "start_s": t_s, "duration_s": min(30.0, info.duration_s or 30.0)},
-        "section": {
-            "start_px": [round(pts[0][0], 1), round(pts[0][1], 1)],
-            "end_px": [round(pts[1][0], 1), round(pts[1][1], 1)],
-            "n_stations": n_stations,
-            "name": Path(str(video)).stem,
-        },
-        "stiv": {"search_line_length_m": 4.0, "velocity_range_ms": [-0.5, 5.0]},
-        "output": {"out_dir": out_dir},
-    }
-
     down = pick_points(
         video, 1,
         "Click one point DOWNSTREAM of the cross-section "
         "(this fixes which way the flow runs).",
         t_s,
     )
-    cfg["flow"] = {"direction": "auto"}
-    if down:
-        cfg["flow"]["downstream_px"] = [round(down[0][0], 1), round(down[0][1], 1)]
 
+    gcps = None
     if with_gcps:
         gcps = pick_points(
             video, None,
@@ -146,13 +157,6 @@ def build_config_interactively(
         )
         if len(gcps) < 4:
             raise ConfigError(f"a homography needs at least 4 GCPs; {len(gcps)} were clicked")
-        cfg["rectify"] = {
-            "method": "gcp",
-            "gcp_px": [[round(u, 1), round(v, 1)] for u, v in gcps],
-            "gcp_world": [[0.0, 0.0] for _ in gcps],  # placeholder: user fills these in
-        }
-    else:
-        cfg["rectify"] = {"method": "scale", "m_per_px": 0.02}
 
     water = pick_points(
         video, None,
@@ -161,8 +165,19 @@ def build_config_interactively(
         "Press enter immediately to skip.",
         t_s,
     )
-    cfg["stabilise"] = {"enabled": True}
-    if len(water) >= 3:
-        cfg["stabilise"]["water_mask_px"] = [[[round(u, 1), round(v, 1)] for u, v in water]]
 
-    return cfg
+    video_entry = (path_for_config(video, config_path) if config_path is not None
+                   else str(Path(video).expanduser().resolve()))
+    return survey_dict(
+        video_entry,
+        start_s=t_s,
+        duration_s=default_duration_s(info.duration_s, t_s),
+        gcp_px=gcps,                 # gcp_world is left as null placeholders
+        start_px=pts[0],
+        end_px=pts[1],
+        n_stations=n_stations,
+        name=Path(str(video)).stem,
+        downstream_px=down[0] if down else None,
+        water_mask_px=[water] if len(water) >= 3 else None,
+        out_dir=out_dir,
+    )

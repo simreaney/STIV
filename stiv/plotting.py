@@ -13,6 +13,11 @@ single light appearance rather than adapting to a viewer theme.  Colours are
 the validated reference palette; magnitude uses a single-hue blue ramp and the
 space-time images stay greyscale, since they are photographs rather than
 encodings of an abstract quantity.
+
+Figures are built on :class:`matplotlib.figure.Figure` with an Agg canvas of
+their own rather than through ``pyplot``, so importing this module never
+changes the process-wide backend -- in a notebook, a later inline or ipympl
+figure keeps working after a run has written its report.
 """
 
 from __future__ import annotations
@@ -22,11 +27,10 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
 from .analysis import StivResult
@@ -78,8 +82,33 @@ _RC = {
 }
 
 
+#: Narrowest overview figure, inches, that still holds its three-entry legend.
+_MIN_OVERVIEW_WIDTH_IN = 6.5
+
+
 def _style():
-    return plt.rc_context(_RC)
+    return matplotlib.rc_context(_RC)
+
+
+def _figure(**kwargs) -> Figure:
+    """A figure on its own Agg canvas, unknown to pyplot and its backend.
+
+    Create it inside :func:`_style` -- rcParams are read when the figure is
+    built and again when it is saved.
+    """
+    fig = Figure(**kwargs)
+    FigureCanvasAgg(fig)
+    return fig
+
+
+def _velocity_label(st, digits: int = 2) -> str:
+    """A station's reported velocity, or what stands in for it."""
+    if np.isfinite(st.velocity_ms):
+        return f"{st.velocity_ms:.{digits}f} m/s"
+    raw = getattr(st, "velocity_raw_ms", math.nan)
+    if np.isfinite(raw):
+        return f"excluded (raw {raw:.{digits}f})"
+    return "no value"
 
 
 # --------------------------------------------------------------------------- #
@@ -89,8 +118,14 @@ def plot_overview(result: StivResult, path: Path, dpi: int = 150) -> Path:
     rgb = frame[:, :, ::-1] if frame.ndim == 3 else frame
     h, w = rgb.shape[:2]
 
+    # About 110 frame pixels to the inch, capped at 13 x 9 in.  A small frame
+    # -- a 336 px thermal sensor, a 480 px proxy -- is scaled up to at least
+    # _MIN_OVERVIEW_WIDTH_IN, aspect kept: any narrower and the legend beneath
+    # the image is wider than the figure, and constrained layout gives up.
+    scale = max(1.0 / 110.0, _MIN_OVERVIEW_WIDTH_IN / w)
     with _style():
-        fig, ax = plt.subplots(figsize=(min(13, w / 110), min(9, h / 110)))
+        fig = _figure(figsize=(min(13, w * scale), min(9, h * scale)))
+        ax = fig.subplots()
         ax.imshow(rgb)
         ax.set_axis_off()
         ax.grid(False)
@@ -141,7 +176,6 @@ def plot_overview(result: StivResult, path: Path, dpi: int = 150) -> Path:
             loc="left",
         )
         fig.savefig(path, dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
     return path
 
 
@@ -153,31 +187,59 @@ def _outline():
 
 # --------------------------------------------------------------------------- #
 def plot_velocity_profile(result: StivResult, path: Path, dpi: int = 150) -> Path:
-    """Surface velocity across the section, with its uncertainty band."""
+    """Surface velocity across the section, with its uncertainty band.
+
+    A station that failed quality control is drawn one of two ways.  With
+    ``quality.interpolate_flagged`` on it carries the ``interpolated`` flag and
+    its reported value is its neighbours' interpolation, so it sits on the
+    profile line.  With it off the station is excluded -- the profile has a gap
+    there -- and its raw, untrusted estimate is drawn hollow, off the line, so
+    it can be inspected without being mistaken for a measurement.
+    """
     x = result.stations_m
     v = result.velocities
     sd = np.array([s.velocity_std_ms for s in result.stations])
     coh = np.array([s.coherency for s in result.stations])
     failed = np.array([s.failed for s in result.stations])
+    interp = failed & np.array(["interpolated" in s.flags for s in result.stations])
+    excluded = failed & ~interp
+    raw = np.array([getattr(s, "velocity_raw_ms", math.nan) for s in result.stations],
+                   dtype=float)
+    # Where an excluded station's value lives: the raw estimate, unless the
+    # station still reports one of its own.
+    v_excl = np.where(np.isfinite(v), v, raw)
+    excl_shown = excluded & np.isfinite(v_excl)
+    excl_blank = excluded & ~np.isfinite(v_excl)
+    # The profile line only joins reported values; excluded stations are gaps.
+    v_line = np.where(excluded, np.nan, v)
 
     with _style():
-        fig, (ax, axc) = plt.subplots(
-            2, 1, figsize=(9.5, 5.6), sharex=True,
-            gridspec_kw={"height_ratios": [3.0, 1.0]},
+        fig = _figure(figsize=(9.5, 5.6))
+        ax, axc = fig.subplots(
+            2, 1, sharex=True, gridspec_kw={"height_ratios": [3.0, 1.0]},
         )
 
         band = np.where(np.isfinite(sd), sd, 0.0)
-        ax.fill_between(x, v - band, v + band, color=SERIES_1, alpha=0.16, linewidth=0)
-        ax.plot(x, v, color=SERIES_1, lw=2.0, solid_capstyle="round", zorder=3)
+        ax.fill_between(x, v_line - band, v_line + band, color=SERIES_1, alpha=0.16,
+                        linewidth=0)
+        ax.plot(x, v_line, color=SERIES_1, lw=2.0, solid_capstyle="round", zorder=3)
         ax.scatter(x[~failed], v[~failed], s=30, color=SERIES_1, zorder=4,
                    edgecolor=SURFACE, linewidth=1.2)
-        if failed.any():
-            ax.scatter(x[failed], v[failed], s=46, marker="X", color=CRITICAL, zorder=5,
+        if interp.any():
+            ax.scatter(x[interp], v[interp], s=46, marker="X", color=CRITICAL, zorder=5,
                        edgecolor=SURFACE, linewidth=1.2)
+        if excl_shown.any():
+            ax.scatter(x[excl_shown], v_excl[excl_shown], s=46, marker="X",
+                       facecolor="none", edgecolor=CRITICAL, linewidth=1.2, zorder=5)
+        if excl_blank.any():
+            # No number at all: mark the station along the foot of the axes.
+            ax.scatter(x[excl_blank], np.zeros(int(excl_blank.sum())), s=40, marker="|",
+                       color=CRITICAL, transform=ax.get_xaxis_transform(), zorder=5,
+                       clip_on=False)
 
-        finite = v[np.isfinite(v)]
+        finite = v_line[np.isfinite(v_line)]
         if finite.size:
-            i = int(np.nanargmax(np.where(np.isfinite(v), v, -np.inf)))
+            i = int(np.nanargmax(np.where(np.isfinite(v_line), v_line, -np.inf)))
             ax.annotate(f"max {v[i]:.2f} m/s", (x[i], v[i]), xytext=(0, 12),
                         textcoords="offset points", ha="center",
                         color=INK, fontsize=9)
@@ -198,9 +260,16 @@ def plot_velocity_profile(result: StivResult, path: Path, dpi: int = 150) -> Pat
                           markeredgecolor=SURFACE, label="STIV surface velocity"),
                    Line2D([], [], color=SERIES_1, lw=6, alpha=0.25,
                           label="±1σ from the angle histogram")]
-        if failed.any():
+        if interp.any():
             handles.append(Line2D([], [], color=CRITICAL, lw=0, marker="X", markersize=7,
                                   label="failed QC (interpolated)"))
+        if excl_shown.any():
+            handles.append(Line2D([], [], lw=0, marker="X", markersize=7,
+                                  markerfacecolor="none", markeredgecolor=CRITICAL,
+                                  label="failed QC (excluded; raw value)"))
+        if excl_blank.any():
+            handles.append(Line2D([], [], color=CRITICAL, lw=0, marker="|", markersize=8,
+                                  label="failed QC (excluded; no value)"))
         ax.legend(handles=handles, loc="best", labelcolor=INK_2, fontsize=8.5)
 
         # Coherency shares the x-axis in its own panel rather than a second
@@ -217,7 +286,6 @@ def plot_velocity_profile(result: StivResult, path: Path, dpi: int = 150) -> Pat
                        f"{result.geometry.start_px[1]:.0f})")
 
         fig.savefig(path, dpi=dpi)
-        plt.close(fig)
     return path
 
 
@@ -241,8 +309,8 @@ def plot_sti_panel(result: StivResult, path: Path, max_panels: int = 24,
     nrows = int(math.ceil(len(idx) / ncols))
 
     with _style():
-        fig, axes = plt.subplots(nrows, ncols, figsize=(2.05 * ncols, 2.5 * nrows))
-        axes = np.atleast_1d(axes).ravel()
+        fig = _figure(figsize=(2.05 * ncols, 2.5 * nrows))
+        axes = np.atleast_1d(fig.subplots(nrows, ncols, squeeze=False)).ravel()
 
         for ax in axes:
             ax.set_axis_off()
@@ -258,7 +326,7 @@ def plot_sti_panel(result: StivResult, path: Path, max_panels: int = 24,
             ax.tick_params(labelsize=7, length=2)
             ax.set_title(
                 f"{st.station_m:.1f} m\n"
-                f"{st.velocity_ms:.2f} m/s   C={st.coherency:.2f}",
+                f"{_velocity_label(st)}   C={st.coherency:.2f}",
                 fontsize=8, color=CRITICAL if st.failed else INK,
             )
             for spine in ax.spines.values():
@@ -270,7 +338,6 @@ def plot_sti_panel(result: StivResult, path: Path, max_panels: int = 24,
             fontsize=10, color=INK, x=0.01, ha="left",
         )
         fig.savefig(path, dpi=dpi)
-        plt.close(fig)
     return path
 
 
@@ -283,9 +350,8 @@ def plot_sti_detail(result: StivResult, index: int, path: Path, dpi: int = 150) 
     est = result.estimates[index]
 
     with _style():
-        fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.4),
-                                 gridspec_kw={"width_ratios": [1.25, 1.0, 1.0]})
-        ax0, ax1, ax2 = axes
+        fig = _figure(figsize=(13.5, 4.4))
+        ax0, ax1, ax2 = fig.subplots(1, 3, gridspec_kw={"width_ratios": [1.25, 1.0, 1.0]})
 
         extent = [0, s.length_m, s.duration_s, 0]
         ax0.imshow(to_display(s.data), cmap="gray", aspect="auto", extent=extent)
@@ -334,7 +400,7 @@ def plot_sti_detail(result: StivResult, index: int, path: Path, dpi: int = 150) 
                 ax2.annotate(
                     f"  φ = {math.degrees(st.phi_rad):.1f}°\n"
                     f"  tan φ = {st.tan_phi:.2f}\n"
-                    f"  U = {st.velocity_ms:.3f} m/s",
+                    f"  U = {_velocity_label(st, 3)}",
                     (math.degrees(st.phi_rad), ax2.get_ylim()[1]),
                     va="top", color=INK, fontsize=9,
                 )
@@ -357,7 +423,6 @@ def plot_sti_detail(result: StivResult, index: int, path: Path, dpi: int = 150) 
             fontsize=9.5, color=INK_2, x=0.01, ha="left",
         )
         fig.savefig(path, dpi=dpi)
-        plt.close(fig)
     return path
 
 
@@ -369,9 +434,9 @@ def plot_discharge(result: StivResult, path: Path, dpi: int = 150) -> Path:
         raise ValueError("no discharge result to plot")
 
     with _style():
-        fig, (ax0, ax1, ax2) = plt.subplots(
-            3, 1, figsize=(9.5, 7.6), sharex=True,
-            gridspec_kw={"height_ratios": [1.3, 1.2, 1.0]},
+        fig = _figure(figsize=(9.5, 7.6))
+        ax0, ax1, ax2 = fig.subplots(
+            3, 1, sharex=True, gridspec_kw={"height_ratios": [1.3, 1.2, 1.0]},
         )
 
         ax0.plot(d.stations_m, d.surface_velocity_ms, color=SERIES_1, lw=2.0,
@@ -403,7 +468,6 @@ def plot_discharge(result: StivResult, path: Path, dpi: int = 150) -> Path:
         ax2.set_xlabel("distance along cross-section  (m)")
 
         fig.savefig(path, dpi=dpi)
-        plt.close(fig)
     return path
 
 

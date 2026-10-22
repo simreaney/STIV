@@ -9,9 +9,11 @@ import pytest
 from scipy.ndimage import gaussian_filter
 
 from stiv.orientation import (
+    OrientationField,
     angle_range_from_velocity,
     central_difference,
     mean_orientation_angle,
+    min_sti_size,
     structure_tensor_field,
     velocity_from_angle,
 )
@@ -192,3 +194,67 @@ def test_gaussian_window_trims_its_own_wider_support():
         moved = a.centres_t[np.any(np.abs(a.phi - b.phi) > 1e-9, axis=1)]
         # Only the first window row, which legitimately overlaps rows 2-4.
         assert list(moved) == [first_row]
+
+
+class TestFeaturelessWindows:
+    """A window with no gradient at all gets phi = 0 from Eq. (6) and passes
+    the C >= 0 level of Eq. (14), so it voted for *zero velocity*.  An STI that
+    was flat everywhere came back with valid_fraction 1.0.
+    """
+
+    def test_flat_windows_do_not_vote(self):
+        field = structure_tensor_field(synthetic_sti(2.0))
+        k = int(0.4 * field.phi.shape[1]) + 1
+        live = OrientationField(
+            phi=field.phi[:, k:], coherency=field.coherency[:, k:],
+            energy=field.energy[:, k:], centres_t=field.centres_t,
+            centres_x=field.centres_x[k:],
+        )
+        expected = mean_orientation_angle(live, *PHI_FULL)
+
+        # Blank the first 40% of the windows the way structure_tensor_field
+        # leaves a featureless patch: no energy, no coherency, phi exactly 0.
+        dead = np.zeros(field.phi.shape, bool)
+        dead[:, :k] = True
+        field.phi = np.where(dead, 0.0, field.phi)
+        field.coherency = np.where(dead, 0.0, field.coherency)
+        field.energy = np.where(dead, 0.0, field.energy)
+
+        est = mean_orientation_angle(field, *PHI_FULL)
+        assert est.tan_phi == pytest.approx(expected.tan_phi, rel=1e-12)
+        assert est.tan_phi == pytest.approx(2.0, rel=0.05)
+        assert est.n_used == expected.n_used == int((~dead).sum())
+        # The blank windows count against the valid fraction, not for it.
+        assert est.valid_fraction == pytest.approx((~dead).mean())
+
+    def test_an_all_flat_sti_has_no_valid_windows(self):
+        field = structure_tensor_field(np.full((120, 120), 3.0))
+        est = mean_orientation_angle(field, *PHI_FULL)
+        assert est.valid_fraction == 0.0
+        assert math.isnan(est.phi)
+
+    def test_flat_columns_in_a_real_sti_bias_it_less(self):
+        sti = synthetic_sti(2.0)
+        sti[:, :80] = 0.0
+        est = mean_orientation_angle(structure_tensor_field(sti), *PHI_FULL)
+        # 1.37 when the flat windows voted.  The windows straddling the edge
+        # of the blank still see a static vertical edge, so not all the way.
+        assert est.tan_phi > 1.55
+
+    def test_the_threshold_is_relative_to_the_sti(self):
+        sti = synthetic_sti(1.0)
+        a = mean_orientation_angle(structure_tensor_field(sti), *PHI_FULL)
+        b = mean_orientation_angle(structure_tensor_field(sti * 1e-6), *PHI_FULL)
+        assert b.tan_phi == pytest.approx(a.tan_phi, rel=1e-9)
+        assert b.n_used == a.n_used
+
+
+@pytest.mark.parametrize("window_type", ["box", "gaussian"])
+@pytest.mark.parametrize("order", [2, 4, 6])
+def test_min_sti_size_is_exactly_what_the_tensor_accepts(window_type, order):
+    need = min_sti_size(31, window_type, order)
+    structure_tensor_field(np.random.default_rng(0).standard_normal((need, need)),
+                           window_px=31, window_type=window_type, gradient_order=order)
+    with pytest.raises(ValueError, match="too small"):
+        structure_tensor_field(np.zeros((need - 1, need)), window_px=31,
+                               window_type=window_type, gradient_order=order)

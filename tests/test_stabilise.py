@@ -12,8 +12,9 @@ import cv2
 import numpy as np
 import pytest
 
+from stiv import stabilise as stabilise_mod
 from stiv.config import StabiliseConfig
-from stiv.stabilise import Stabiliser, _to_u8, _u8_scaling
+from stiv.stabilise import Stabiliser, _fit_transform, _to_u8, _u8_scaling
 
 
 def _texture(low_contrast: bool = False) -> np.ndarray:
@@ -112,3 +113,98 @@ class TestFeatureRedetection:
         for _ in range(3):
             s.update(_shift(base, 1.0, 0.0))
         assert s.report.n_redetections == 0
+
+
+class TestAutomaticDisable:
+    """With too few features the stabiliser switched itself off, and the run
+    report then said only "disabled" -- indistinguishable from a fixed camera
+    the user had chosen not to stabilise -- with no warning at all.
+    """
+
+    def test_it_is_loud_and_distinguishable_from_a_choice(self):
+        blank = np.full((200, 300), 128, np.uint8)
+        s = Stabiliser(StabiliseConfig(enabled=True), blank)
+
+        assert not s.enabled
+        assert s.report.auto_disabled
+        assert "DISABLED AUTOMATICALLY" in s.report.summary()
+        (warning,) = s.report.warnings()
+        assert "STABILISATION WAS SWITCHED OFF" in warning
+        assert "static_mask_px" in warning
+
+    def test_a_deliberate_choice_stays_quiet(self):
+        s = Stabiliser(StabiliseConfig(enabled=False), _texture())
+        assert not s.report.auto_disabled
+        assert s.report.summary() == "stabilisation: disabled"
+        assert s.report.warnings() == []
+
+
+class TestFitAcceptance:
+    """The RANSAC threshold was a hard-coded 3 px and the residual was taken
+    over the RANSAC inliers only, which lie within 3 px by construction -- so
+    with the default ``max_reprojection_px`` of 3 the bad-fit guard could never
+    fire.  And the minimum-support test counted tracked points, not inliers.
+    """
+
+    def _rigged(self, monkeypatch, n_agree, n_scatter, shift=(5.0, 0.0), cfg=None):
+        """A stabiliser whose next update sees exactly the tracks given."""
+        s = Stabiliser(cfg or StabiliseConfig(redetect_fraction=0.0), _texture())
+        n = n_agree + n_scatter
+        assert len(s.ref_pts) >= n
+        s.ref_pts = s.ref_pts[:n]
+        s.cur_pts = s.cur_pts[:n]
+        s.alive = s.alive[:n]
+        s.dead_streak = s.dead_streak[:n]
+
+        rng = np.random.default_rng(7)
+        nxt = s.ref_pts.astype(np.float64).copy()
+        nxt[:n_agree] += shift
+        nxt[n_agree:] += rng.uniform(-40, 40, (n_scatter, 2))
+        calls = []
+
+        def fake_lk(prev, cur, pts, guess, **kw):
+            calls.append(1)
+            if len(calls) % 2:           # forward: where each feature went
+                out = nxt
+            else:                        # backward: every track is consistent
+                out = s.ref_pts
+            return (out.reshape(-1, 1, 2).astype(np.float32),
+                    np.ones((n, 1), np.uint8), np.zeros((n, 1), np.float32))
+
+        monkeypatch.setattr(stabilise_mod.cv2, "calcOpticalFlowPyrLK", fake_lk)
+        return s
+
+    def test_a_fit_resting_on_a_handful_of_points_is_rejected(self, monkeypatch):
+        s = self._rigged(monkeypatch, n_agree=4, n_scatter=16)
+        m = s.update(_texture().astype(np.uint8))
+        assert s.report.n_failed == 1
+        assert np.allclose(m, np.eye(3))               # the previous transform, held
+
+    def test_a_minority_consensus_is_rejected(self, monkeypatch):
+        s = self._rigged(monkeypatch, n_agree=8, n_scatter=32)
+        s.update(_texture().astype(np.uint8))
+        assert s.report.n_failed == 1
+        assert s.report.inlier_fraction[-1] < 0.3
+
+    def test_a_rejected_fit_stays_out_of_the_residual_statistics(self, monkeypatch):
+        """Its near-zero residual describes a transform that was never used,
+        and used to pull the summary's median residual down."""
+        s = self._rigged(monkeypatch, n_agree=8, n_scatter=32)
+        s.update(_texture().astype(np.uint8))
+        assert np.isnan(s.report.rmse_px[-1])
+        assert 0.0 < s.report.inlier_fraction[-1] < 0.3   # still the real fraction
+        assert "no transform accepted" in s.report.summary()
+
+    def test_a_clear_consensus_is_accepted(self, monkeypatch):
+        s = self._rigged(monkeypatch, n_agree=30, n_scatter=10)
+        m = s.update(_texture().astype(np.uint8))
+        assert s.report.n_failed == 0
+        assert m[0, 2] == pytest.approx(5.0, abs=1e-3)
+
+    def test_the_ransac_threshold_is_max_reprojection_px(self):
+        rng = np.random.default_rng(1)
+        src = rng.uniform(0, 500, (60, 2))
+        dst = src + 2.0 * rng.standard_normal((60, 2))   # ~2.8 px rms scatter
+        _, tight = _fit_transform(src, dst, "similarity", 1.0)
+        _, loose = _fit_transform(src, dst, "similarity", 6.0)
+        assert tight.sum() < loose.sum()

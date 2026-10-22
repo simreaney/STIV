@@ -4,20 +4,31 @@ Everything the analysis needs is described by :class:`Config`, which is normally
 loaded from a YAML file.  Nested dataclasses mirror the YAML structure, so a
 config file reads like the analysis it describes::
 
-    video:      {path: flight.mp4, start: 0.0, duration: 30.0}
+    video:      {path: flight.mp4, start_s: 0.0, duration_s: 30.0}
     rectify:    {method: scale, m_per_px: 0.021}
     section:    {start_px: [310, 880], end_px: [1640, 830], n_stations: 40}
     flow:       {direction: auto}
     stiv:       {search_line_length_m: 4.0, window_px: 31}
+
+:func:`survey_dict` is the one place a *new* survey's raw config is put
+together, so ``stiv init``, ``stiv pick`` and the notebook wizard all start from
+the same schema defaults.
 """
 
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field, fields, is_dataclass
+import datetime
+import math
+import numbers
+import re
+import typing
+from collections.abc import Sequence as _AbcSequence
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Union
 
+import numpy as np
 import yaml
 
 Point = Sequence[float]
@@ -324,17 +335,33 @@ class Config:
     # ------------------------------------------------------------------ #
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":
-        path = Path(path)
+        path = Path(path).expanduser()
         if not path.is_file():
             raise ConfigError(f"config file not found: {path}")
-        with path.open("r", encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
-        cfg = cls.from_dict(raw)
-        cfg.resolve_paths(path.parent)
-        return cfg
+        try:
+            raw = yaml.load(path.read_text(encoding="utf-8"), Loader=_ConfigLoader)
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"could not parse {path}{_yaml_error_detail(exc)}") from exc
+        except UnicodeDecodeError as exc:
+            raise ConfigError(f"{path} is not a UTF-8 text file") from exc
+        # Paths are resolved against the config file *before* validating, so the
+        # up-front checks (the bathymetry file exists, say) look where the run
+        # itself will look.
+        return cls.from_dict(raw if raw is not None else {}, base=path.parent)
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "Config":
+    def from_dict(cls, raw: dict[str, Any], base: Optional[str | Path] = None) -> "Config":
+        """Build and validate a config from its raw mapping.
+
+        Relative paths are resolved against ``base`` when it is given (that is
+        what :meth:`from_yaml` passes: the config file's folder), and otherwise
+        left relative to the working directory.
+        """
+        if not isinstance(raw, dict):
+            raise ConfigError(
+                f"a config must be a mapping of sections ({', '.join(f.name for f in fields(cls))}), "
+                f"not {type(raw).__name__}"
+            )
         unknown = set(raw) - {f.name for f in fields(cls)}
         if unknown:
             raise ConfigError(
@@ -352,65 +379,136 @@ class Config:
             sub_cls = f.default_factory  # type: ignore[misc]
             kwargs[f.name] = _build(sub_cls().__class__, section_raw, f.name)
         cfg = cls(**kwargs)
+        cfg.normalise_types()
+        cfg.resolve_paths(Path(base) if base is not None else None)
         cfg.validate()
         return cfg
 
-    def resolve_paths(self, base: Path) -> None:
-        """Make relative paths in the config relative to the config file."""
+    def resolve_paths(self, base: Optional[Path] = None) -> None:
+        """Expand ``~`` and make relative paths relative to ``base``.
+
+        ``base`` is the config file's folder for a config read from YAML; with
+        no ``base`` only the ``~`` is expanded.
+        """
 
         def _abs(p: Optional[str]) -> Optional[str]:
             if not p:
                 return p
-            q = Path(p)
-            return str(q if q.is_absolute() else (base / q).resolve())
+            q = Path(p).expanduser()
+            if base is None or q.is_absolute():
+                return str(q)
+            return str((base / q).resolve())
 
         self.video.path = _abs(self.video.path) or ""
         self.discharge.bathymetry_csv = _abs(self.discharge.bathymetry_csv)
         self.output.out_dir = _abs(self.output.out_dir) or "stiv_output"
 
+    def normalise_types(self) -> None:
+        """Coerce every field to the type the schema declares, or say why not.
+
+        YAML is loosely typed: PyYAML reads ``15e-1`` and ``6e1`` as strings
+        (a YAML 1.1 float needs a decimal point), ``30.0`` where a count is
+        meant is a float, and nothing stops a list turning up where a number
+        should be.  Left alone, those surface as a ``TypeError`` from deep in
+        the analysis -- or, worse, not at all.
+        """
+        for sec in fields(self):
+            obj = getattr(self, sec.name)
+            hints = _type_hints(type(obj))
+            for f in fields(obj):
+                where = f"{sec.name}.{f.name}"
+                value = getattr(obj, f.name)
+                setattr(obj, f.name, _coerce(value, hints[f.name], where, _default_of(f)))
+
     # ------------------------------------------------------------------ #
     def validate(self) -> None:
-        v, r, s, st = self.video, self.rectify, self.section, self.stiv
+        self.normalise_types()
+        v, r, s, st, q = self.video, self.rectify, self.section, self.stiv, self.quality
 
         if not v.path:
             raise ConfigError("video.path is required")
         if v.frame_step < 1:
             raise ConfigError("video.frame_step must be >= 1")
+        # Both of these are silently ignored by the frame reader when zero,
+        # which is the opposite of what anyone writing a zero would expect.
+        if v.max_frames is not None and v.max_frames < 2:
+            raise ConfigError(
+                "video.max_frames must be >= 2 (STIV needs at least two frames), "
+                "or null for no limit"
+            )
+        if v.fps_override is not None and not v.fps_override > 0:
+            raise ConfigError(
+                "video.fps_override must be > 0, or null to use the frame rate the "
+                "video file reports"
+            )
+        if v.channel_weights is not None:
+            _check_len(v.channel_weights, 3, "video.channel_weights", "3 numbers, in BGR order")
 
         if r.method not in {"scale", "gcp"}:
             raise ConfigError("rectify.method must be 'scale' or 'gcp'")
         if r.method == "gcp":
             if not r.gcp_px or not r.gcp_world:
-                raise ConfigError("rectify.method='gcp' needs gcp_px and gcp_world")
+                raise ConfigError(
+                    "rectify.method='gcp' needs gcp_px and gcp_world: fill in the "
+                    "image position of each control point and its surveyed world "
+                    "position in metres, in the same order"
+                )
             if len(r.gcp_px) != len(r.gcp_world):
                 raise ConfigError("gcp_px and gcp_world must have the same length")
             if len(r.gcp_px) < 4:
                 raise ConfigError("a homography needs at least 4 ground control points")
-        elif r.m_per_px is None and r.altitude_m is None:
+            for i, (p, w) in enumerate(zip(r.gcp_px, r.gcp_world)):
+                _check_len(p, 2, f"rectify.gcp_px[{i}]")
+                _check_len(w, 2, f"rectify.gcp_world[{i}]")
+        elif r.m_per_px is not None:
+            if not r.m_per_px > 0:
+                raise ConfigError("rectify.m_per_px must be > 0")
+        elif r.altitude_m is None:
             raise ConfigError(
-                "rectify.method='scale' needs m_per_px, or altitude_m plus "
-                "either hfov_deg or (sensor_width_mm and focal_length_mm)"
+                "rectify.m_per_px is not set: fill in the ground sample distance "
+                "(metres per pixel), or give altitude_m plus either hfov_deg or "
+                "(sensor_width_mm and focal_length_mm)"
             )
+        else:
+            if not r.altitude_m > 0:
+                raise ConfigError("rectify.altitude_m must be > 0")
+            has_lens = r.sensor_width_mm is not None and r.focal_length_mm is not None
+            if r.hfov_deg is None and not has_lens:
+                raise ConfigError(
+                    "rectify.altitude_m alone does not give a scale: add the camera's "
+                    "hfov_deg, or sensor_width_mm and focal_length_mm"
+                )
+            if r.hfov_deg is not None and not 0.0 < r.hfov_deg < 180.0:
+                raise ConfigError("rectify.hfov_deg must be in (0, 180) degrees")
 
         if s.start_px is None or s.end_px is None:
             raise ConfigError(
-                "section.start_px and section.end_px are required "
-                "(run `stiv pick <video>` to click them on a frame)"
+                "section.start_px and section.end_px are not set: fill in the two "
+                "ends of the cross-section in image pixels "
+                "(or run `stiv pick <video>` to click them on a frame)"
             )
+        _check_len(s.start_px, 2, "section.start_px")
+        _check_len(s.end_px, 2, "section.end_px")
         if s.n_stations < 2:
             raise ConfigError("section.n_stations must be >= 2")
         if not 0.0 <= s.edge_trim < 0.5:
             raise ConfigError("section.edge_trim must be in [0, 0.5)")
 
-        if self.flow.direction not in {"auto", "angle", "points"}:
+        fl = self.flow
+        if fl.direction not in {"auto", "angle", "points"}:
             raise ConfigError("flow.direction must be 'auto', 'angle' or 'points'")
-        if self.flow.direction == "angle" and self.flow.angle_deg is None:
+        if fl.direction == "angle" and fl.angle_deg is None:
             raise ConfigError("flow.direction='angle' needs flow.angle_deg")
-        if self.flow.direction == "points" and (self.flow.from_px is None or self.flow.to_px is None):
+        if fl.direction == "points" and (fl.from_px is None or fl.to_px is None):
             raise ConfigError("flow.direction='points' needs flow.from_px and flow.to_px")
+        for name in ("from_px", "to_px", "downstream_px"):
+            if getattr(fl, name) is not None:
+                _check_len(getattr(fl, name), 2, f"flow.{name}")
 
         if st.search_line_length_m <= 0:
             raise ConfigError("stiv.search_line_length_m must be > 0")
+        if st.n_samples is not None and st.n_samples < 16:
+            raise ConfigError("stiv.n_samples must be >= 16, or null for one per image pixel")
         if st.window_px < 5 or st.window_px % 2 == 0:
             raise ConfigError("stiv.window_px must be an odd integer >= 5")
         if st.window_type not in {"box", "gaussian"}:
@@ -421,18 +519,53 @@ class Config:
             raise ConfigError("stiv.gradient_order must be 2, 4 or 6")
         if st.estimator not in {"eq14", "peak"}:
             raise ConfigError("stiv.estimator must be 'eq14' or 'peak'")
+        _check_len(st.velocity_range_ms, 2, "stiv.velocity_range_ms", "[min, max]")
         lo, hi = st.velocity_range_ms
         if lo >= hi:
             raise ConfigError("stiv.velocity_range_ms must be [min, max] with min < max")
         if not st.coherency_levels:
             raise ConfigError("stiv.coherency_levels must not be empty")
+        if st.n_angle_bins < 2:
+            raise ConfigError("stiv.n_angle_bins must be >= 2")
 
-        if self.stabilise.model not in {"similarity", "affine", "homography"}:
+        _check_len(q.tan_phi_range, 2, "quality.tan_phi_range", "[min, max]")
+        if not 0.0 <= q.tan_phi_range[0] < q.tan_phi_range[1]:
+            raise ConfigError("quality.tan_phi_range must be [min, max] with 0 <= min < max")
+        # An even window is accepted, as it always has been: the filter is
+        # centred, so it widens it to the next odd number and says so in the log.
+        if q.median_filter_stations < 0:
+            raise ConfigError(
+                "quality.median_filter_stations must be a number of stations, "
+                "or 0 to disable the filter"
+            )
+
+        stab = self.stabilise
+        if stab.model not in {"similarity", "affine", "homography"}:
             raise ConfigError("stabilise.model must be 'similarity', 'affine' or 'homography'")
+        for name in ("static_mask_px", "water_mask_px"):
+            for i, poly in enumerate(getattr(stab, name) or []):
+                if len(poly) < 3:
+                    raise ConfigError(
+                        f"stabilise.{name}[{i}] must be a polygon of at least 3 [x, y] points"
+                    )
+                for j, p in enumerate(poly):
+                    _check_len(p, 2, f"stabilise.{name}[{i}][{j}]")
 
         d = self.discharge
-        if d.enabled and d.bathymetry_csv is None and d.depths_m is None:
-            raise ConfigError("discharge.enabled needs bathymetry_csv or depths_m")
+        if d.enabled:
+            if d.depths_m is not None:
+                # Checked here rather than after the video has been processed,
+                # which is the first point the analysis itself would notice.
+                if len(d.depths_m) != s.n_stations:
+                    raise ConfigError(
+                        f"discharge.depths_m has {len(d.depths_m)} entries but "
+                        f"section.n_stations is {s.n_stations}; give one depth per "
+                        f"station, or use bathymetry_csv to interpolate instead"
+                    )
+            elif d.bathymetry_csv is None:
+                raise ConfigError("discharge.enabled needs bathymetry_csv or depths_m")
+            else:
+                _check_bathymetry(d.bathymetry_csv, d.water_level_m)
         if d.enabled and not 0.0 < d.alpha <= 1.5:
             raise ConfigError("discharge.alpha should be a velocity index in (0, 1.5]")
         if d.enabled and not 0.0 < d.bank_coefficient <= 1.0:
@@ -447,12 +580,14 @@ class Config:
         if any(not 0.0 <= c <= 1.0 for c in st.coherency_levels):
             raise ConfigError("stiv.coherency_levels must all be in [0, 1]")
 
+        if self.output.dpi < 1:
+            raise ConfigError("output.dpi must be >= 1")
+
     def to_dict(self) -> dict[str, Any]:
         return _asdict(self)
 
     def dump_yaml(self, path: str | Path) -> None:
-        with Path(path).open("w", encoding="utf-8") as fh:
-            yaml.safe_dump(self.to_dict(), fh, sort_keys=False, default_flow_style=False)
+        Path(path).write_text(yaml_text(self.to_dict()), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -469,6 +604,163 @@ def _build(cls: type, raw: dict[str, Any], name: str):
     return cls(**copy.deepcopy(raw))
 
 
+class _ConfigLoader(yaml.SafeLoader):
+    """``yaml.SafeLoader`` without two YAML 1.1 surprises.
+
+    Base-60 numbers: ``name: 12:30`` would load as the integer 750, and
+    ``start_s: 1:30`` as 90.  And timestamps: ``name: 2024-05-01`` would load
+    as a ``datetime.date``.  No config field is a date or a sexagesimal number,
+    so both are left as the text that was typed, and a numeric field given one
+    is refused with a message rather than silently converted.
+    """
+
+
+#: PyYAML's int and float patterns (``yaml.resolver.Resolver``), minus the
+#: sexagesimal alternatives.
+_NO_BASE60 = {
+    "tag:yaml.org,2002:int": re.compile(
+        r"""^(?:[-+]?0b[0-1_]+
+            |[-+]?0[0-7_]+
+            |[-+]?(?:0|[1-9][0-9_]*)
+            |[-+]?0x[0-9a-fA-F_]+)$""",
+        re.X,
+    ),
+    "tag:yaml.org,2002:float": re.compile(
+        r"""^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?
+            |\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?
+            |[-+]?\.(?:inf|Inf|INF)
+            |\.(?:nan|NaN|NAN))$""",
+        re.X,
+    ),
+}
+# Rebuilt in place, so the resolvers keep PyYAML's order of precedence.
+_ConfigLoader.yaml_implicit_resolvers = {
+    first: [(tag, _NO_BASE60.get(tag, rx)) for tag, rx in resolvers
+            if tag != "tag:yaml.org,2002:timestamp"]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+
+
+def _yaml_error_detail(exc: yaml.YAMLError) -> str:
+    """`` at line L, column C: problem`` for a YAML syntax error."""
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
+    problem = getattr(exc, "problem", None) or str(exc)
+    return f"{where}: {problem}"
+
+
+_HINTS: dict[type, dict[str, Any]] = {}
+
+
+def _type_hints(cls: type) -> dict[str, Any]:
+    # The module uses postponed annotations, so field types are strings until
+    # resolved; resolving is slow enough to be worth doing once per class.
+    if cls not in _HINTS:
+        _HINTS[cls] = typing.get_type_hints(cls)
+    return _HINTS[cls]
+
+
+def _default_of(f) -> Any:
+    if f.default is not MISSING:
+        return f.default
+    if f.default_factory is not MISSING:  # type: ignore[misc]
+        return f.default_factory()  # type: ignore[misc]
+    return MISSING
+
+
+def _coerce(value: Any, tp: Any, where: str, default: Any = MISSING) -> Any:
+    """Convert ``value`` to the schema type ``tp``, or raise a ConfigError."""
+    origin = typing.get_origin(tp)
+    if origin is Union:  # Optional[X]
+        if value is None:
+            return None
+        inner = [a for a in typing.get_args(tp) if a is not type(None)]
+        return _coerce(value, inner[0], where)
+
+    if value is None:
+        hint = (
+            f"; delete the line to use the default ({_asdict(default)!r})"
+            if default is not MISSING and default is not None else ""
+        )
+        raise ConfigError(f"{where} is empty (null): fill it in{hint}")
+
+    if origin in (_AbcSequence, list, tuple):
+        # Code building a config often holds its points as numpy arrays.
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if isinstance(value, (str, bytes)) or not isinstance(value, _AbcSequence):
+            raise ConfigError(f"{where} must be a list, got {value!r}")
+        (item_tp,) = typing.get_args(tp)[:1] or (Any,)
+        return [_coerce(v, item_tp, f"{where}[{i}]") for i, v in enumerate(value)]
+
+    if tp is bool:
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        raise ConfigError(f"{where} must be true or false, got {value!r}")
+
+    if tp is int:
+        x = value
+        if isinstance(x, str):
+            x = _parse_number(x, where, "a whole number")
+        if isinstance(x, bool) or not isinstance(x, numbers.Real):
+            raise ConfigError(f"{where} must be a whole number, got {value!r}")
+        if isinstance(x, numbers.Integral):
+            return int(x)
+        if math.isfinite(x) and float(x).is_integer():
+            return int(x)
+        raise ConfigError(f"{where} must be a whole number, got {value!r}")
+
+    if tp is float:
+        x = _parse_number(value, where) if isinstance(value, str) else value
+        if isinstance(x, bool) or not isinstance(x, numbers.Real):
+            raise ConfigError(f"{where} must be a number, got {value!r}")
+        x = float(x)
+        if math.isnan(x):
+            raise ConfigError(f"{where} must be a number, got NaN")
+        return x
+
+    if tp is str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, numbers.Real) and not isinstance(value, bool):
+            return str(value)
+        # A date typed into a name, from a mapping loaded by plain yaml.safe_load.
+        if isinstance(value, (datetime.date, datetime.time)):
+            return value.isoformat()
+        raise ConfigError(f"{where} must be text, got {value!r}")
+
+    return value
+
+
+def _parse_number(text: str, where: str, kind: str = "a number") -> float:
+    try:
+        return float(text.strip())
+    except ValueError:
+        raise ConfigError(f"{where} must be {kind}, got {text!r}") from None
+
+
+def _check_len(seq: Sequence, n: int, where: str, what: Optional[str] = None) -> None:
+    if len(seq) != n:
+        shape = what or ("[x, y]" if n == 2 else f"{n} numbers")
+        raise ConfigError(f"{where} must be {shape}, got {len(seq)} value(s): {list(seq)!r}")
+
+
+def _check_bathymetry(path: str, water_level_m: Optional[float]) -> None:
+    """Read the bathymetry file now, so a bad one fails before the video is read."""
+    if not Path(path).is_file():
+        raise ConfigError(f"discharge.bathymetry_csv not found: {path}")
+    from .discharge import load_bathymetry  # deferred: discharge imports this module
+
+    try:
+        dist, _ = load_bathymetry(path, water_level_m)
+    except ConfigError:
+        raise
+    except Exception as exc:  # pandas' parse errors are not ConfigErrors
+        raise ConfigError(f"could not read discharge.bathymetry_csv {path}: {exc}") from exc
+    if len(dist) < 2:
+        raise ConfigError(f"discharge.bathymetry_csv {path} needs at least two rows")
+
+
 def _asdict(obj: Any) -> Any:
     if is_dataclass(obj):
         return {f.name: _asdict(getattr(obj, f.name)) for f in fields(obj)}
@@ -477,3 +769,164 @@ def _asdict(obj: Any) -> Any:
     if isinstance(obj, Path):
         return str(obj)
     return obj
+
+
+# --------------------------------------------------------------------------- #
+# writing survey files
+# --------------------------------------------------------------------------- #
+class _SurveyDumper(yaml.SafeDumper):
+    """Writes a point as ``[310.0, 880.0]`` rather than two lines of dashes."""
+
+
+def _represent_list(dumper: yaml.SafeDumper, data: list):
+    flat = all(not isinstance(v, (list, tuple, dict)) for v in data)
+    return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=flat)
+
+
+_SurveyDumper.add_representer(list, _represent_list)
+_SurveyDumper.add_representer(tuple, _represent_list)
+
+
+def yaml_text(raw: dict[str, Any]) -> str:
+    """Render a raw config mapping as YAML, keeping the schema's key order."""
+    return yaml.dump(raw, Dumper=_SurveyDumper, sort_keys=False, default_flow_style=False)
+
+
+def path_for_config(target: str | Path, config_path: str | Path) -> str:
+    """How to spell ``target`` inside a config file saved at ``config_path``.
+
+    :meth:`Config.from_yaml` resolves a relative path against the config
+    file's folder, not the shell's working directory, so writing a path the way
+    it was typed (``footage/clip.mp4`` from ``-o configs/survey.yaml``) points
+    somewhere else entirely.  A target inside the config's folder is written
+    relative to it, so the two can be moved together; anything else is
+    written absolute.
+    """
+    t = Path(target).expanduser().resolve()
+    base = Path(config_path).expanduser().resolve().parent
+    try:
+        return t.relative_to(base).as_posix()
+    except ValueError:
+        return str(t)
+
+
+#: The paper analysed 30 s of footage; 20-40 s of steady hover is plenty.
+DEFAULT_DURATION_S = 30.0
+
+#: Surface speeds, m/s, at which a ``frame_step`` suggestion is tabulated.
+FRAME_STEP_SPEEDS_MS = (0.5, 1.0, 2.0, 3.0)
+
+
+def default_duration_s(video_duration_s: Optional[float], start_s: float = 0.0) -> float:
+    """A sensible ``video.duration_s`` for a new survey of this clip."""
+    if video_duration_s and video_duration_s > 0:
+        remaining = video_duration_s - start_s
+        if remaining > 0:
+            return round(min(DEFAULT_DURATION_S, remaining), 3)
+    return DEFAULT_DURATION_S
+
+
+def suggest_frame_step(m_per_px: float, fps: float, velocity_ms: float) -> int:
+    """The ``video.frame_step`` that puts ``tan phi`` near 1 at ``velocity_ms``.
+
+    ``tan phi = U * St / Sx`` with ``St = frame_step / fps`` and ``Sx`` about
+    one image pixel, so ``tan phi = 1`` at ``frame_step = m_per_px * fps / U``.
+    """
+    return max(1, round(m_per_px * fps / velocity_ms))
+
+
+def _point(p: Optional[Point]) -> Optional[list]:
+    if p is None:
+        return None
+    return [None if v is None else round(float(v), 1) for v in p]
+
+
+def survey_dict(
+    video_path: str,
+    *,
+    start_s: float = VideoConfig.start_s,
+    duration_s: Optional[float] = VideoConfig.duration_s,
+    frame_step: int = VideoConfig.frame_step,
+    fps_override: Optional[float] = VideoConfig.fps_override,
+    m_per_px: Optional[float] = None,
+    altitude_m: Optional[float] = None,
+    hfov_deg: Optional[float] = None,
+    gcp_px: Optional[Sequence[Point]] = None,
+    gcp_world: Optional[Sequence[Point]] = None,
+    start_px: Optional[Point] = None,
+    end_px: Optional[Point] = None,
+    n_stations: int = SectionConfig.n_stations,
+    edge_trim: float = SectionConfig.edge_trim,
+    name: str = SectionConfig.name,
+    downstream_px: Optional[Point] = None,
+    stabilise: bool = StabiliseConfig.enabled,
+    water_mask_px: Optional[Sequence[Sequence[Point]]] = None,
+    search_line_length_m: float = StiConfig.search_line_length_m,
+    window_px: int = StiConfig.window_px,
+    velocity_range_ms: Sequence[float] = StiConfig.velocity_range_ms,
+    bathymetry_csv: Optional[str] = None,
+    alpha: float = DischargeConfig.alpha,
+    bank_coefficient: float = DischargeConfig.bank_coefficient,
+    out_dir: str = OutputConfig.out_dir,
+) -> dict[str, Any]:
+    """The raw config of a new survey, with every default taken from the schema.
+
+    ``stiv init``, ``stiv pick`` and the notebook wizard all build their
+    config here, so a survey started from any of them analyses the same way.
+    Whatever the caller does not know yet is written as ``null`` -- the scale
+    and the section ends above all -- and :meth:`Config.validate` refuses to
+    run until it has been filled in, rather than running on a made-up value.
+
+    The scale comes from ``gcp_px``/``gcp_world`` if given, else from
+    ``altitude_m`` and ``hfov_deg``, else from ``m_per_px``.
+    """
+    if gcp_px is not None:
+        rectify: dict[str, Any] = {
+            "method": "gcp",
+            "gcp_px": [_point(p) for p in gcp_px],
+            "gcp_world": [_point(p) for p in gcp_world]
+            if gcp_world is not None else [[None, None] for _ in gcp_px],
+        }
+    elif altitude_m is not None:
+        rectify = {"method": "scale", "altitude_m": altitude_m, "hfov_deg": hfov_deg}
+    else:
+        rectify = {"method": "scale", "m_per_px": m_per_px}
+
+    stab: dict[str, Any] = {"enabled": bool(stabilise)}
+    if water_mask_px:
+        stab["water_mask_px"] = [[_point(p) for p in poly] for poly in water_mask_px]
+
+    video: dict[str, Any] = {
+        "path": str(video_path),
+        "start_s": float(start_s),
+        "duration_s": duration_s,
+        "frame_step": int(frame_step),
+    }
+    if fps_override is not None:
+        video["fps_override"] = float(fps_override)
+
+    return {
+        "video": video,
+        "rectify": rectify,
+        "section": {
+            "start_px": _point(start_px),
+            "end_px": _point(end_px),
+            "n_stations": int(n_stations),
+            "edge_trim": float(edge_trim),
+            "name": name,
+        },
+        "flow": {"direction": "auto", "downstream_px": _point(downstream_px)},
+        "stabilise": stab,
+        "stiv": {
+            "search_line_length_m": float(search_line_length_m),
+            "window_px": int(window_px),
+            "velocity_range_ms": [float(v) for v in velocity_range_ms],
+        },
+        "discharge": {
+            "enabled": bathymetry_csv is not None,
+            "bathymetry_csv": bathymetry_csv,
+            "alpha": float(alpha),
+            "bank_coefficient": float(bank_coefficient),
+        },
+        "output": {"out_dir": str(out_dir)},
+    }

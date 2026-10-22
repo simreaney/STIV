@@ -18,13 +18,34 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
-import yaml
 
 from . import __version__
-from .config import Config, ConfigError
+from .config import (
+    FRAME_STEP_SPEEDS_MS,
+    Config,
+    ConfigError,
+    SectionConfig,
+    default_duration_s,
+    path_for_config,
+    suggest_frame_step,
+    survey_dict,
+    yaml_text,
+)
 from .report import write_outputs as _write_outputs
 
 log = logging.getLogger("stiv")
+
+#: ``stiv demo`` defaults, shared with the notebook wizard's demo river so the
+#: two run exactly the same analysis.
+DEMO_DURATION_S = 10.0
+DEMO_V_MAX_MS = 1.2
+DEMO_NOISE = 0.02
+DEMO_DRIFT_PX = 45.0
+DEMO_N_STATIONS = 21
+
+#: Validation statistics are taken over stations faster than this, since a
+#: relative error is meaningless where the truth approaches zero.
+DEMO_MOVING_MS = 0.15
 
 
 # --------------------------------------------------------------------------- #
@@ -34,16 +55,35 @@ def _setup_logging(verbosity: int) -> None:
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 
+def _refuse_overwrite(path: Path, force: bool) -> None:
+    # A survey file is usually the product of careful clicking and editing, so
+    # it is never replaced silently.
+    if path.exists() and not force:
+        raise ConfigError(f"{path} already exists; pass --force to overwrite it")
+
+
+def _default_out_dir(config_path: Path) -> str:
+    # Relative, so it resolves next to the config file rather than the shell.
+    return config_path.with_suffix("").name + "_output"
+
+
 # --------------------------------------------------------------------------- #
 def cmd_info(args) -> int:
     from .video import probe
 
     info = probe(args.video)
+    # probe() reports 0 when the file records no frame rate (a raw .h264 or
+    # .mjpeg stream, say) rather than guessing one.
+    fps_known = info.fps > 0
     print(info)
     print()
     print("Suggested settings")
     print("------------------")
-    print(f"  video.duration_s      {min(30.0, info.duration_s or 30.0):.1f}   "
+    if not fps_known:
+        print("  video.fps_override    ?        (the file records no frame rate: set this "
+              "to the rate the footage was recorded at -- every velocity is "
+              "proportional to it)")
+    print(f"  video.duration_s      {default_duration_s(info.duration_s):.1f}   "
           f"(20-40 s of steady hover is plenty; the paper used 30 s)")
     if args.altitude_m and args.hfov_deg:
         import math
@@ -53,90 +93,84 @@ def cmd_info(args) -> int:
         print(f"  rectify.m_per_px      {gsd:.4f}   "
               f"(from {args.altitude_m} m altitude, {args.hfov_deg} deg HFOV; "
               f"ground width {gw:.1f} m)")
-        for v in (0.5, 1.0, 2.0, 3.0):
-            step = max(1, round(gsd * info.fps / v))
-            print(f"      if U ~ {v:>3.1f} m/s  ->  video.frame_step: {step}   "
-                  f"(puts tan phi near 1)")
+        if fps_known:
+            for v in FRAME_STEP_SPEEDS_MS:
+                print(f"      if U ~ {v:>3.1f} m/s  ->  video.frame_step: "
+                      f"{suggest_frame_step(gsd, info.fps, v)}   (puts tan phi near 1)")
+        else:
+            # Without a frame rate every suggestion would collapse to step 1.
+            print("      (no frame_step suggestion without a frame rate; re-run once "
+                  "you know it, or work it out as m_per_px * fps / U)")
     else:
         print("  pass --altitude-m and --hfov-deg to get a ground sample distance "
               "and a frame_step suggestion")
     return 0
 
 
+_INIT_HEADER = """\
+# STIV survey configuration (written by `stiv init`)
+#
+# `stiv run` refuses this file until the null placeholders are filled in:
+#
+#   rectify.m_per_px    ground sample distance, metres per pixel.  Or replace
+#                       it with the flight geometry:
+#                         altitude_m: 60.0   # above the WATER SURFACE
+#                         hfov_deg: 84.0     # your camera's horizontal FOV
+#   section.start_px    the two ends of the cross-section, in image pixels
+#   section.end_px      (`stiv pick` lets you click them on a frame instead)
+#
+# flow.downstream_px is optional: any image point downstream of the section,
+# which fixes the sign of the flow direction.
+#
+# Video: {info}
+
+"""
+
+
 def cmd_init(args) -> int:
     from .video import probe
 
+    out = Path(args.output)
+    _refuse_overwrite(out, args.force)
     info = probe(args.video)
-    h, w = info.shape
-    cfg = {
-        "video": {
-            "path": str(Path(args.video).resolve()),
-            "start_s": 0.0,
-            "duration_s": min(30.0, info.duration_s or 30.0),
-            "frame_step": 1,
-        },
-        "rectify": {
-            "method": "scale",
-            "m_per_px": 0.02,
-            "# or derive it from the flight": None,
-            "# altitude_m": 60.0,
-            "# hfov_deg": 84.0,
-        },
-        "section": {
-            "start_px": [round(w * 0.25), round(h * 0.5)],
-            "end_px": [round(w * 0.75), round(h * 0.5)],
-            "n_stations": 30,
-            "name": Path(args.video).stem,
-        },
-        "flow": {"direction": "auto"},
-        "stabilise": {"enabled": True},
-        "stiv": {
-            "search_line_length_m": 4.0,
-            "window_px": 31,
-            "velocity_range_ms": [-0.5, 5.0],
-        },
-        "discharge": {"enabled": False, "alpha": 0.85},
-        "output": {"out_dir": str(Path(args.output).with_suffix("").name + "_output")},
-    }
-    # Strip the comment placeholders before writing.
-    cfg["rectify"] = {k: v for k, v in cfg["rectify"].items() if not k.startswith("#")}
-
-    text = yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False)
-    header = (
-        "# STIV survey configuration\n"
-        "# Edit section.start_px / end_px to the two ends of your cross-section\n"
-        "# (in image pixels), and set the scale.  `stiv pick` can do both for you.\n"
-        "#\n"
-        f"# Video: {info}\n\n"
+    raw = survey_dict(
+        path_for_config(args.video, out),
+        duration_s=default_duration_s(info.duration_s),
+        name=Path(args.video).stem,
+        out_dir=_default_out_dir(out),
     )
-    Path(args.output).write_text(header + text, encoding="utf-8")
-    print(f"wrote {args.output}")
-    print("Next: edit the section coordinates and scale, then `stiv run "
-          f"{args.output}`")
+    out.write_text(_INIT_HEADER.format(info=info) + yaml_text(raw), encoding="utf-8")
+    print(f"wrote {out}")
+    print("Next: fill in the scale and the section coordinates, then "
+          f"`stiv run {out}`")
     return 0
 
 
 def cmd_pick(args) -> int:
     from .picker import build_config_interactively
 
-    cfg = build_config_interactively(
+    out = Path(args.output)
+    # Checked before any clicking, not after it.
+    _refuse_overwrite(out, args.force)
+    raw = build_config_interactively(
         args.video,
-        out_dir=str(Path(args.output).with_suffix("").name + "_output"),
+        out_dir=_default_out_dir(out),
         t_s=args.time,
         with_gcps=args.gcps,
         n_stations=args.n_stations,
+        config_path=out,
     )
-    Path(args.output).write_text(
-        "# STIV survey configuration (generated by `stiv pick`)\n"
-        + ("# NOTE: gcp_world coordinates are placeholders - replace them with\n"
-           "#       your surveyed positions in metres before running.\n" if args.gcps else "")
-        + yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False),
-        encoding="utf-8",
-    )
-    print(f"wrote {args.output}")
-    if not args.gcps:
-        print("Set rectify.m_per_px to your ground sample distance, then "
-              f"`stiv run {args.output}`")
+    header = "# STIV survey configuration (written by `stiv pick`)\n#\n"
+    if args.gcps:
+        header += ("# Fill in rectify.gcp_world -- the surveyed position of each control\n"
+                   "# point in metres, in the order they were clicked -- before running.\n\n")
+    else:
+        header += ("# Fill in rectify.m_per_px (metres per pixel), or replace it with\n"
+                   "# altitude_m plus hfov_deg, before running.\n\n")
+    out.write_text(header + yaml_text(raw), encoding="utf-8")
+    print(f"wrote {out}")
+    what = "rectify.gcp_world" if args.gcps else "rectify.m_per_px"
+    print(f"Fill in {what}, then `stiv run {out}`")
     return 0
 
 
@@ -171,22 +205,77 @@ def cmd_run(args) -> int:
     return 0
 
 
+def make_demo_river(
+    duration_s: float = DEMO_DURATION_S,
+    v_max_ms: float = DEMO_V_MAX_MS,
+    noise: float = DEMO_NOISE,
+    drift_px: float = DEMO_DRIFT_PX,
+):
+    """The synthetic river ``stiv demo`` renders: a hover with drift, sway and yaw."""
+    from .synthetic import SyntheticRiver
+
+    return SyntheticRiver(
+        duration_s=duration_s,
+        v_max_ms=v_max_ms,
+        noise=noise,
+        drone_drift_px=drift_px,
+        drone_sway_px=drift_px / 8.0 if drift_px else 0.0,
+        drone_yaw_deg=1.5 if drift_px else 0.0,
+    )
+
+
+def demo_validation(got: np.ndarray, truth: np.ndarray,
+                    moving_ms: float = DEMO_MOVING_MS) -> tuple[list[str], Optional[float]]:
+    """Report lines comparing a demo run with its ground truth, and the RMSE.
+
+    Stations with no reported velocity are left out of the statistics and
+    counted instead.  If no reported station is moving faster than
+    ``moving_ms`` -- a demo river rendered with ``--v-max 0.1``, say -- the
+    absolute errors are taken over every reported station and the relative
+    error is skipped, rather than taking the maximum of nothing.
+    """
+    got = np.asarray(got, dtype=float)
+    truth = np.asarray(truth, dtype=float)
+    err = got - truth
+    reported = np.isfinite(got)
+    moving = truth > moving_ms
+    m = moving & reported
+
+    lines = [f"  stations with U > {moving_ms:.2f} m/s : {int(moving.sum())}"]
+    if (moving & ~reported).any():
+        lines.append(f"  ...of which without a value : {int((moving & ~reported).sum())}")
+    if not m.any():
+        if not reported.any():
+            lines.append("  no station reported a velocity, so there is nothing to validate")
+            return lines, None
+        lines.append(f"  (none moving faster than {moving_ms:.2f} m/s with a value, so the "
+                     f"errors below are over all {int(reported.sum())} reported stations "
+                     f"and the relative error is omitted)")
+        m = reported
+        rel = None
+    else:
+        rel = 100 * np.sqrt(np.mean((err[m] / truth[m]) ** 2))
+
+    rmse = float(np.sqrt(np.mean(err[m] ** 2)))
+    lines += [
+        f"  RMSE                       : {rmse:.4f} m/s",
+        f"  bias                       : {err[m].mean():+.4f} m/s",
+    ]
+    if rel is not None:
+        lines.append(f"  relative RMSE              : {rel:.1f} %")
+    lines.append(f"  max absolute error         : {np.abs(err[m]).max():.4f} m/s")
+    return lines, rmse
+
+
 def cmd_demo(args) -> int:
     """Render a synthetic river with a known profile and check STIV recovers it."""
     from .analysis import run as run_analysis
-    from .synthetic import SyntheticRiver, make_config, render
+    from .synthetic import make_config, render
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    river = SyntheticRiver(
-        duration_s=args.duration,
-        v_max_ms=args.v_max,
-        noise=args.noise,
-        drone_drift_px=args.drift_px,
-        drone_sway_px=args.drift_px / 8.0 if args.drift_px else 0.0,
-        drone_yaw_deg=1.5 if args.drift_px else 0.0,
-    )
+    river = make_demo_river(args.duration, args.v_max, args.noise, args.drift_px)
     video = render(river, out_dir / "synthetic_river", progress=not args.quiet)
     print(f"rendered {video}  "
           f"({river.n_frames} frames, peak {river.v_max_ms:.2f} m/s, "
@@ -198,32 +287,34 @@ def cmd_demo(args) -> int:
     _write_outputs(result, cfg)
 
     _, truth = river.truth_profile(args.n_stations)
-    got = result.velocities
-    err = got - truth
-    m = truth > 0.15
+    lines, rmse = demo_validation(result.velocities, truth)
 
     print()
     print(result.summary())
     print()
     print("Validation against the known velocity field")
     print("-------------------------------------------")
-    print(f"  stations with U > 0.15 m/s : {int(m.sum())}")
-    print(f"  RMSE                       : {np.sqrt(np.mean(err[m] ** 2)):.4f} m/s")
-    print(f"  bias                       : {err[m].mean():+.4f} m/s")
-    print(f"  relative RMSE              : {100 * np.sqrt(np.mean((err[m] / truth[m]) ** 2)):.1f} %")
-    print(f"  max absolute error         : {np.abs(err[m]).max():.4f} m/s")
+    print("\n".join(lines))
     print()
     print(f"outputs written to {out_dir / 'analysis'}")
 
-    return 0 if np.sqrt(np.mean(err[m] ** 2)) < 0.1 else 1
+    return 0 if rmse is not None and rmse < 0.1 else 1
 
 
 # --------------------------------------------------------------------------- #
+def _add_verbosity(parser: argparse.ArgumentParser, default) -> None:
+    parser.add_argument("-q", "--quiet", action="store_true", default=default,
+                        help="only report warnings")
+    parser.add_argument("-v", "--verbose", action="store_true", default=default,
+                        help="debug logging")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    # Shared so that -q/-v work either side of the subcommand.
+    # -q/-v work either side of the subcommand.  The subcommand's copies
+    # default to SUPPRESS: a subparser writes its defaults over the parent's
+    # namespace, so a plain False there would undo `stiv -q run ...`.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("-q", "--quiet", action="store_true", help="only report warnings")
-    common.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    _add_verbosity(common, argparse.SUPPRESS)
 
     p = argparse.ArgumentParser(
         prog="stiv",
@@ -231,8 +322,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "(Fujita, Watanabe & Tsubaki, 2007).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
-        parents=[common],
     )
+    _add_verbosity(p, False)
     p.add_argument("--version", action="version", version=f"stiv {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -246,6 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("init", parents=[common], help="write a starter config file")
     s.add_argument("video")
     s.add_argument("-o", "--output", default="survey.yaml")
+    s.add_argument("--force", action="store_true", help="overwrite an existing config file")
     s.set_defaults(func=cmd_init)
 
     s = sub.add_parser("pick", parents=[common],
@@ -253,10 +345,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("video")
     s.add_argument("-o", "--output", default="survey.yaml")
     s.add_argument("-t", "--time", type=float, default=0.0,
-                   help="seconds into the video to display")
+                   help="seconds into the video to display; also becomes video.start_s, "
+                        "since the stabiliser measures drift from the first analysed frame")
     s.add_argument("--gcps", action="store_true",
                    help="also click ground control points for an oblique view")
-    s.add_argument("-n", "--n-stations", type=int, default=30)
+    s.add_argument("-n", "--n-stations", type=int, default=SectionConfig.n_stations)
+    s.add_argument("--force", action="store_true", help="overwrite an existing config file")
     s.set_defaults(func=cmd_pick)
 
     s = sub.add_parser("run", parents=[common],
@@ -273,12 +367,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("demo", parents=[common], help="render a synthetic river and validate against it")
     s.add_argument("--out-dir", default="stiv_demo")
-    s.add_argument("--duration", type=float, default=10.0)
-    s.add_argument("--v-max", type=float, default=1.2, help="peak surface velocity, m/s")
-    s.add_argument("--noise", type=float, default=0.02)
-    s.add_argument("--drift-px", type=float, default=45.0,
+    s.add_argument("--duration", type=float, default=DEMO_DURATION_S)
+    s.add_argument("--v-max", type=float, default=DEMO_V_MAX_MS, help="peak surface velocity, m/s")
+    s.add_argument("--noise", type=float, default=DEMO_NOISE)
+    s.add_argument("--drift-px", type=float, default=DEMO_DRIFT_PX,
                    help="simulated drone drift in pixels (0 for a fixed camera)")
-    s.add_argument("-n", "--n-stations", type=int, default=21)
+    s.add_argument("-n", "--n-stations", type=int, default=DEMO_N_STATIONS)
     s.set_defaults(func=cmd_demo)
 
     return p

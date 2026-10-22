@@ -292,6 +292,53 @@ def resolve_flow_direction(
     return d
 
 
+#: Points along a search line at which the local image scale is evaluated when
+#: choosing how many samples it needs.  A homography's scale along a line is
+#: monotonic, so the endpoints alone would do; the interior points cost nothing
+#: and keep the rule honest for any other rectifier.
+_SCALE_PROBES = 33
+#: Relative difference between the largest and the mean image scale along a
+#: line below which the scale is taken to be uniform (a nadir view).
+_UNIFORM_SCALE_RTOL = 1e-6
+
+
+def _max_px_per_m(rect: Rectifier, a_w: np.ndarray, b_w: np.ndarray) -> float:
+    """Largest image distance, pixels per metre, anywhere along a world segment."""
+    d = b_w - a_w
+    length = float(np.linalg.norm(d))
+    if length <= 0:
+        return 0.0
+    u = d / length
+    h = 1e-3 * length
+    s = np.linspace(0.0, length, _SCALE_PROBES)
+    centres = a_w[None, :] + s[:, None] * u[None, :]
+    fwd = rect.world_to_image(centres + h * u[None, :])
+    back = rect.world_to_image(centres - h * u[None, :])
+    return float(np.max(np.linalg.norm(fwd - back, axis=1)) / (2.0 * h))
+
+
+def default_n_samples(rect: Rectifier, a_w: np.ndarray, b_w: np.ndarray) -> int:
+    """Samples for a search line from ``a_w`` to ``b_w`` when none are configured.
+
+    One STI column per image pixel is the natural resolution limit -- *where
+    the image is finest along the line*.  In an oblique view the near end of a
+    line covers more pixels per metre than the far end, so counting pixels
+    end to end (the mean spacing) leaves the near field undersampled: 1.25 px
+    per column in the test geometry, which aliases the finest texture there.
+    So the count follows the largest local pixels-per-metre along the line,
+    rounded as before; in a nadir view that is the same number as the mean.
+    """
+    length = float(np.linalg.norm(b_w - a_w))
+    ab_px = rect.world_to_image([a_w, b_w])
+    span_mean = float(np.linalg.norm(ab_px[1] - ab_px[0]))
+    span_max = length * _max_px_per_m(rect, a_w, b_w)
+    # Uniform scale gives the same span both ways up to rounding error, and
+    # that error must not flip a count that sits on a half: nadir counts are
+    # pinned to the original rule.
+    span = span_max if span_max > span_mean * (1.0 + _UNIFORM_SCALE_RTOL) else span_mean
+    return int(np.clip(int(round(span)) + 1, 16, 4096))
+
+
 def build_section(cfg: Config, image_shape: tuple[int, int]) -> SectionGeometry:
     """Lay out the cross-section and its search lines from the config."""
     rect = build_rectifier(cfg.rectify, image_shape)
@@ -323,10 +370,7 @@ def build_section(cfg: Config, image_shape: tuple[int, int]) -> SectionGeometry:
 
         n = cfg.stiv.n_samples
         if n is None:
-            # One STI column per image pixel: the natural resolution limit.
-            ab_px = rect.world_to_image([a_w, b_w])
-            n = int(round(np.linalg.norm(ab_px[1] - ab_px[0]))) + 1
-            n = int(np.clip(n, 16, 4096))
+            n = default_n_samples(rect, a_w, b_w)
         if n < 16:
             raise ConfigError(f"stiv.n_samples must be >= 16, got {n}")
 

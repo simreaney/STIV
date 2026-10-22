@@ -5,11 +5,17 @@
 # single ground sample distance describes the whole frame, so no ground control
 # points are needed -- just the flight altitude and the lens.
 #
+# The footage is 4K UHD (3840 x 2160) from 30 m above the water with an 84 deg
+# lens: a ground sample distance of 1.41 cm/pixel, so the 1279-pixel section
+# below is 18.0 m from waterline to waterline -- the span of the depth survey
+# in bathymetry_example.csv.  The derived scale depends on the frame width, so
+# check `stiv info` before reusing these numbers on other footage.
+#
 #   stiv run examples/nadir_drone.yaml
 # -------------------------------------------------------------------------- #
 
 video:
-  path: ../footage/hover_60m.mp4
+  path: ../footage/hover_30m.mp4
   start_s: 4.0              # skip the first seconds while the aircraft settles
   duration_s: 30.0          # the paper used 30 s; 20-40 s is plenty
   frame_step: 1             # raise this if median tan(phi) comes out above ~4
@@ -17,9 +23,9 @@ video:
 rectify:
   method: scale
   # Either give the ground sample distance directly...
-  # m_per_px: 0.0213
+  # m_per_px: 0.0141
   # ...or let it be derived from the flight geometry:
-  altitude_m: 60.0          # height above the WATER SURFACE, not above take-off
+  altitude_m: 30.0          # height above the WATER SURFACE, not above take-off
   hfov_deg: 84.0            # DJI wide lenses are typically 82-84 degrees
   # sensor_width_mm: 6.3    # alternative to hfov_deg
   # focal_length_mm: 4.5
@@ -27,8 +33,8 @@ rectify:
 section:
   # Two ends of the cross-section, in image pixels. `stiv pick` writes these
   # for you by letting you click them on a frame.
-  start_px: [310, 880]      # left bank looking downstream
-  end_px:   [1640, 830]     # right bank
+  start_px: [330, 880]      # left waterline looking downstream; distance 0 m
+  end_px:   [1608, 830]     # right waterline, 18.0 m across
   n_stations: 40
   edge_trim: 0.02           # skip the outer 2% at each bank
   name: dee_upstream_gauge
@@ -42,16 +48,17 @@ stabilise:
   model: similarity
   # Strongly recommended: outline the water so the tracker only follows static
   # ground. Without it, features picked up on the moving surface bias the
-  # estimated camera motion.
+  # estimated camera motion.  This is the whole visible reach, bank to bank,
+  # top of the frame to the bottom.
   water_mask_px:
-    - [[290, 700], [1700, 660], [1720, 1010], [270, 1040]]
+    - [[266, 0], [1606, 0], [1690, 2160], [350, 2160]]
 
 stiv:
   search_line_length_m: 4.0
   window_px: 31             # the 31 x 31 local area A of the paper
   window_overlap: 0.5
   gradient_order: 4         # Eq. (12); use 6 for the wider stencil of Eq. (13)
-  smooth_sigma: 0.0         # try 1.0-2.0 if the surface texture is smooth
+  smooth_sigma: 1.5         # the default; keep it on (see "Getting good numbers")
   velocity_range_ms: [-0.5, 3.0]   # brackets the expected velocity
   estimator: eq14
 
@@ -63,7 +70,7 @@ quality:
 
 discharge:
   enabled: true
-  bathymetry_csv: bathymetry_example.csv
+  bathymetry_csv: bathymetry_example.csv   # 0-18 m from start_px, waterline to waterline
   alpha: 0.85               # surface -> depth-averaged velocity index
   bank_coefficient: 0.7
 

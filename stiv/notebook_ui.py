@@ -1,8 +1,9 @@
 """A guided, step-by-step Jupyter interface for building and running a STIV survey.
 
 Aimed at students setting up their first survey: one decision per screen, the
-running choices are always visible, sensible defaults are pre-filled, and
-nothing is analysed until "Run analysis" is pressed. It is a thin widget layer
+running choices are always visible, sensible defaults are pre-filled -- except
+the scale, which has no sensible default and must be typed in -- and nothing is
+analysed until "Run analysis" is pressed. It is a thin widget layer
 over the same public API used by the CLI (:mod:`stiv.config`, :mod:`stiv.analysis`,
 :mod:`stiv.report`) -- it does not duplicate any pipeline logic.
 
@@ -28,7 +29,21 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .config import Config, ConfigError, RectifyConfig
+from .config import (
+    FRAME_STEP_SPEEDS_MS,
+    Config,
+    ConfigError,
+    DischargeConfig,
+    OutputConfig,
+    RectifyConfig,
+    SectionConfig,
+    StabiliseConfig,
+    StiConfig,
+    VideoConfig,
+    default_duration_s,
+    suggest_frame_step,
+    survey_dict,
+)
 from .video import VideoInfo, probe, read_frame_at
 
 try:
@@ -52,39 +67,77 @@ MUTED = "#898781"
 
 @dataclass
 class _State:
-    out_dir: str = "stiv_output"
+    """Everything the wizard knows about the survey being built.
+
+    Defaults come from the config schema, so a survey built here analyses the
+    same way as one started with ``stiv init`` or ``stiv pick``.
+    """
+
+    out_dir: str = OutputConfig.out_dir
 
     video_path: Optional[str] = None
     is_demo: bool = False
     info: Optional[VideoInfo] = None
     frame_bgr: Optional[np.ndarray] = None
+    #: Time in the video of ``frame_bgr``, s.  The picker must show the frame
+    #: the analysis starts on: the stabiliser measures drift from there.
+    frame_t_s: float = 0.0
 
-    start_s: float = 0.0
+    start_s: float = VideoConfig.start_s
     duration_s: float = 20.0
+    #: The recording frame rate, when the file does not say (or says wrongly).
+    fps_override: Optional[float] = None
 
     scale_mode: str = "manual"  # "manual" | "flight"
-    m_per_px: Optional[float] = 0.02
-    altitude_m: float = 60.0
-    hfov_deg: float = 84.0
+    # No pre-filled scale: every velocity is proportional to it, and a
+    # plausible-looking default that nobody checked is worse than a blank.
+    m_per_px: Optional[float] = None
+    altitude_m: Optional[float] = None
+    hfov_deg: Optional[float] = None
 
     section_pts: list = field(default_factory=list)
     downstream_pts: list = field(default_factory=list)
     water_pts: list = field(default_factory=list)
+    #: Time of the frame the points above were clicked or confirmed on, s.
+    picks_t_s: Optional[float] = None
 
-    n_stations: int = 30
-    velocity_range: tuple = (-0.5, 5.0)
-    stabilise: bool = True
+    n_stations: int = SectionConfig.n_stations
+    velocity_range: tuple = tuple(StiConfig.velocity_range_ms)
+    stabilise: bool = StabiliseConfig.enabled
     frame_step: Optional[int] = None
-    window_px: int = 31
-    edge_trim: float = 0.02
+    window_px: int = StiConfig.window_px
+    edge_trim: float = SectionConfig.edge_trim
+    search_line_length_m: float = StiConfig.search_line_length_m
+    section_name: Optional[str] = None
 
     discharge_enabled: bool = False
     bathymetry_csv: Optional[str] = None
-    alpha: float = 0.85
-    bank_coefficient: float = 0.7
+    alpha: float = DischargeConfig.alpha
+    bank_coefficient: float = DischargeConfig.bank_coefficient
 
     result: object = None
     out_path: Optional[Path] = None
+
+    def clear(self) -> None:
+        """Back to a blank survey, keeping only the results folder.
+
+        Done in place rather than by replacing the object, because widget
+        callbacks built earlier hold a reference to it.
+        """
+        self.__dict__.update(_State(out_dir=self.out_dir).__dict__)
+
+
+def _parse_positive(text: str) -> Optional[float]:
+    """A strictly positive number typed into a text box, or None."""
+    try:
+        x = float(str(text).strip())
+    except ValueError:
+        return None
+    return x if np.isfinite(x) and x > 0 else None
+
+
+def _fmt_opt(x: Optional[float]) -> str:
+    return "" if x is None else f"{x:g}"
 
 
 # --------------------------------------------------------------------------- #
@@ -112,7 +165,7 @@ class Wizard:
         self.step = 0
         self._pick_stage = 0
         self._step2_box = None
-        self._step2_video_path = None
+        self._step2_key = None
         self._fig = None
         self._ax = None
         self._preview_box = W.Output()
@@ -138,18 +191,21 @@ class Wizard:
         return self
 
     def reset(self) -> None:
-        out_dir = self.state.out_dir
+        self._forget_survey()
+        self.step = 0
+        self._refresh()
+
+    def _forget_survey(self) -> None:
+        """Drop everything tied to the current video: picks, scale, settings."""
         if self._fig is not None:
             import matplotlib.pyplot as plt
 
             plt.close(self._fig)
-        self.state = _State(out_dir=out_dir)
-        self.step = 0
+        self.state.clear()
         self._pick_stage = 0
         self._step2_box = None
-        self._step2_video_path = None
+        self._step2_key = None
         self._fig = self._ax = None
-        self._refresh()
 
     # ------------------------------------------------------------------ #
     # navigation
@@ -218,7 +274,14 @@ class Wizard:
         if step == 1:
             m = self._resolved_m_per_px()
             if not m or m <= 0:
-                return False, "Enter a ground resolution, or a flight altitude and field of view, before continuing."
+                if s.scale_mode == "manual":
+                    return False, "Enter the ground resolution (metres per pixel) before continuing."
+                if s.altitude_m is None:
+                    return False, "Enter the flight altitude above the water surface before continuing."
+                return False, "Enter your camera's horizontal field of view (between 0 and 180 degrees) before continuing."
+            if self._fps() is None:
+                return False, ("This video does not record its frame rate. Enter the rate it was recorded "
+                               "at (frames per second) below the time window before continuing.")
             if s.duration_s <= 0:
                 return False, "Duration must be greater than zero."
             return True, ""
@@ -228,7 +291,7 @@ class Wizard:
             if len(s.downstream_pts) != 1:
                 return False, "Click a point downstream of the section, then press Confirm."
             if self._pick_stage < len(self._PICK_STAGES):
-                return False, "Finish (or skip) the water outline step, then press Confirm."
+                return False, "Confirm each picking stage (or skip the water outline), then press Next."
             return True, ""
         if step == 3:
             if s.discharge_enabled and not s.bathymetry_csv:
@@ -242,14 +305,29 @@ class Wizard:
             return None
         if s.scale_mode == "manual":
             return s.m_per_px
+        if s.altitude_m is None or s.hfov_deg is None or not s.hfov_deg < 180.0:
+            return None
         r = RectifyConfig(method="scale", altitude_m=s.altitude_m, hfov_deg=s.hfov_deg)
         return r.resolve_m_per_px(s.info.width)
 
+    def _fps(self) -> Optional[float]:
+        """The frame rate the analysis will use: the user's, else the file's."""
+        s = self.state
+        if s.fps_override:
+            return s.fps_override
+        if s.info is not None and s.info.fps > 0:
+            return s.info.fps
+        return None
+
     def _frame_step_table(self, m_per_px: float) -> str:
-        info = self.state.info
+        fps = self._fps()
+        if fps is None:
+            # Every suggestion would collapse to 1 without one.
+            return ("<p style='color:#888;font-size:0.9em'>Enter the frame rate below to get "
+                    "<code>frame_step</code> suggestions.</p>")
         rows = []
-        for v in (0.5, 1.0, 2.0, 3.0):
-            step = max(1, round(m_per_px * info.fps / v))
+        for v in FRAME_STEP_SPEEDS_MS:
+            step = suggest_frame_step(m_per_px, fps, v)
             rows.append(f"<tr><td>{v:.1f} m/s</td><td>{step}</td></tr>")
         return (
             "<table style='margin-top:6px;font-size:0.9em'>"
@@ -336,40 +414,51 @@ class Wizard:
         except ConfigError as exc:
             status.value = f"<span style='color:{CRITICAL}'>{exc}</span>"
             return
+        # A new video is a new survey: the previous video's picks would be
+        # off-frame or on the wrong features, and its scale, station count and
+        # velocity range were chosen for a different river.
+        self._forget_survey()
         s = self.state
         s.video_path = str(path)
         s.is_demo = is_demo
         s.info = info
         s.frame_bgr = frame
-        s.duration_s = min(30.0, info.duration_s or 30.0)
-        self._step2_video_path = None  # a stale picker figure would show the wrong frame
-        status.value = f"<span style='color:{GREEN}'>Loaded: {info}</span>"
+        s.frame_t_s = 0.0
+        s.duration_s = default_duration_s(info.duration_s)
+        status.value = f"<span style='color:{GREEN}'>Loaded: {info}</span>" + (
+            "" if info.fps > 0 else
+            f" <span style='color:{WARNING}'>The file does not record its frame rate; "
+            f"you will be asked for it in the next step.</span>"
+        )
         self._refresh_preview()
 
     def _generate_demo_video(self) -> None:
-        from .synthetic import SyntheticRiver, make_config, render
+        # The same river and the same config as `stiv demo`, so the wizard's
+        # demo reproduces the numbers the README quotes for it.
+        from .cli import DEMO_N_STATIONS, make_demo_river
+        from .synthetic import make_config, render
 
-        river = SyntheticRiver(
-            duration_s=10.0, v_max_ms=1.2, noise=0.02,
-            drone_drift_px=45.0, drone_sway_px=45.0 / 8.0, drone_yaw_deg=1.5,
-        )
+        river = make_demo_river()
         out_dir = Path.cwd() / "stiv_demo_data"
         video_path = render(river, out_dir / "synthetic_river.mp4", progress=False)
         self._load_video(str(video_path), is_demo=True, status=W.HTML())
 
         s = self.state
-        cfg_dict = make_config(river, video_path, out_dir / "analysis", n_stations=25)
+        raw = make_config(river, video_path, out_dir / "analysis", n_stations=DEMO_N_STATIONS)
         s.scale_mode = "manual"
-        s.m_per_px = cfg_dict["rectify"]["m_per_px"]
-        s.section_pts = [tuple(cfg_dict["section"]["start_px"]), tuple(cfg_dict["section"]["end_px"])]
-        s.downstream_pts = [tuple(cfg_dict["flow"]["downstream_px"])]
+        s.m_per_px = raw["rectify"]["m_per_px"]
+        s.section_pts = [tuple(raw["section"]["start_px"]), tuple(raw["section"]["end_px"])]
+        s.downstream_pts = [tuple(raw["flow"]["downstream_px"])]
         s.water_pts = []
-        s.n_stations = cfg_dict["section"]["n_stations"]
-        s.velocity_range = tuple(cfg_dict["stiv"]["velocity_range_ms"])
-        s.stabilise = cfg_dict["stabilise"]["enabled"]
+        s.picks_t_s = s.frame_t_s
+        s.section_name = raw["section"]["name"]
+        s.n_stations = raw["section"]["n_stations"]
+        s.frame_step = raw["video"].get("frame_step")
+        s.stabilise = raw["stabilise"]["enabled"]
+        s.search_line_length_m = raw["stiv"]["search_line_length_m"]
+        s.window_px = raw["stiv"]["window_px"]
+        s.velocity_range = tuple(raw["stiv"]["velocity_range_ms"])
         self._pick_stage = len(self._PICK_STAGES)
-        self._step2_box = None
-        self._step2_video_path = None
 
     # ------------------------------------------------------------------ #
     # step 1 -- scale
@@ -382,12 +471,14 @@ class Wizard:
             options=[("I know the ground resolution", "manual"), ("Calculate from flight altitude", "flight")],
             value=s.scale_mode,
         )
-        m_per_px_box = W.BoundedFloatText(value=s.m_per_px or 0.02, min=0.0001, max=5.0, step=0.001,
-                                           description="m / pixel")
-        altitude_box = W.BoundedFloatText(value=s.altitude_m, min=1.0, max=1000.0, step=1.0,
-                                           description="Altitude (m)")
-        hfov_box = W.BoundedFloatText(value=s.hfov_deg, min=10.0, max=170.0, step=1.0,
-                                       description="Camera HFOV (deg)")
+        # Text boxes rather than number boxes, so they can start out blank:
+        # the scale has no safe default and must be entered, not accepted.
+        m_per_px_box = W.Text(value=_fmt_opt(s.m_per_px), placeholder="e.g. 0.02",
+                              description="m / pixel")
+        altitude_box = W.Text(value=_fmt_opt(s.altitude_m), placeholder="e.g. 60",
+                              description="Altitude (m)")
+        hfov_box = W.Text(value=_fmt_opt(s.hfov_deg), placeholder="e.g. 84",
+                          description="Camera HFOV (deg)", style={"description_width": "initial"})
         resolved_label = W.HTML()
 
         manual_box = W.VBox([m_per_px_box])
@@ -400,9 +491,9 @@ class Wizard:
 
         def _update_resolved(*_):
             s.scale_mode = mode.value
-            s.m_per_px = m_per_px_box.value
-            s.altitude_m = altitude_box.value
-            s.hfov_deg = hfov_box.value
+            s.m_per_px = _parse_positive(m_per_px_box.value)
+            s.altitude_m = _parse_positive(altitude_box.value)
+            s.hfov_deg = _parse_positive(hfov_box.value)
             m = self._resolved_m_per_px()
             if m:
                 gw = m * info.width
@@ -420,7 +511,8 @@ class Wizard:
         _update_resolved()
 
         max_dur = info.duration_s if info.duration_s and info.duration_s > 0 else 3600.0
-        start_s_box = W.BoundedFloatText(value=s.start_s, min=0.0, max=max_dur, step=0.5, description="Start (s)")
+        start_s_box = W.BoundedFloatText(value=min(s.start_s, max_dur), min=0.0, max=max_dur, step=0.5,
+                                          description="Start (s)")
         duration_box = W.BoundedFloatText(value=min(s.duration_s, max_dur), min=1.0, max=max_dur, step=1.0,
                                            description="Duration (s)")
 
@@ -431,11 +523,33 @@ class Wizard:
         start_s_box.observe(_update_time, names="value")
         duration_box.observe(_update_time, names="value")
 
+        # Every velocity is proportional to the frame rate.  A file that does
+        # not record one (a raw .h264 stream, say) cannot be analysed without
+        # it, and one whose container reports the wrong rate needs correcting.
+        known = info.fps > 0
+        fps_box = W.Text(value=_fmt_opt(s.fps_override),
+                         placeholder=f"{info.fps:.3f} (from the file)" if known else "e.g. 30",
+                         description="Frame rate (fps)", style={"description_width": "initial"})
+        fps_note = W.HTML(
+            "<p style='color:#888;font-size:0.9em'>Leave blank to use the frame rate the file reports; "
+            "set it only if the run warns that the rate is wrong.</p>" if known else
+            f"<p style='color:{CRITICAL}'><b>This video does not record its frame rate.</b> Enter the "
+            f"rate it was recorded at -- every velocity is proportional to it.</p>"
+        )
+
+        def _update_fps(*_):
+            s.fps_override = _parse_positive(fps_box.value)
+            _update_resolved()            # the frame_step suggestions depend on it
+
+        fps_box.observe(_update_fps, names="value")
+
         return W.VBox([
             W.HTML("<h4>2. Set the scale</h4>"),
             mode, stack, resolved_label,
-            W.HTML("<hr><p>Which part of the video to analyse (20-40 s of steady hover is usually plenty):</p>"),
+            W.HTML("<hr><p>Which part of the video to analyse (20-40 s of steady hover is usually plenty). "
+                   "The cross-section is marked on the frame at the start time in the next step.</p>"),
             start_s_box, duration_box,
+            fps_note, fps_box,
         ])
 
     # ------------------------------------------------------------------ #
@@ -456,10 +570,33 @@ class Wizard:
                 "this cell."
             ) from exc
 
+    def _picker_frame(self) -> bool:
+        """Make ``frame_bgr`` the frame at the analysis start time.
+
+        The stabiliser takes the first *analysed* frame as its reference, so
+        points clicked on any other frame are off by however far the aircraft
+        drifted in between.  Returns True when points already clicked on a
+        different frame need checking again.
+        """
+        s = self.state
+        if s.frame_bgr is None or s.frame_t_s != s.start_s:
+            s.frame_bgr = read_frame_at(s.video_path, s.start_s)
+            s.frame_t_s = s.start_s
+        has_points = bool(s.section_pts or s.downstream_pts or s.water_pts)
+        return has_points and s.picks_t_s is not None and s.picks_t_s != s.frame_t_s
+
     def _build_step2(self):
         s = self.state
-        if self._step2_box is not None and self._step2_video_path == s.video_path:
+        key = (s.video_path, s.start_s)
+        if self._step2_box is not None and self._step2_key == key:
             return self._step2_box
+
+        stale_from = s.picks_t_s
+        stale = self._picker_frame()
+        if stale:
+            # Keep the points, but make every stage be looked at and confirmed
+            # again on the new frame before the wizard will move on.
+            self._pick_stage = 0
 
         self._ensure_interactive_backend()
         import matplotlib.pyplot as plt
@@ -507,9 +644,19 @@ class Wizard:
                 lines[stage["attr"]].set_data(xs, ys)
             fig.canvas.draw_idle()
 
+        stale_note = (
+            f"<div style='background:#fff4e5;border:1px solid {WARNING};padding:6px 10px;"
+            f"border-radius:4px;margin-bottom:6px'>The analysis now starts at {s.frame_t_s:.1f} s, so "
+            f"this is the frame at {s.frame_t_s:.1f} s; the points were placed on the frame at "
+            f"{stale_from:.1f} s. Any drone drift in between offsets them. Check each stage and press "
+            f"Confirm, or use Clear / Restart to re-click.</div>"
+            if stale else ""
+        )
+
         def _update_controls():
             stage = _current_stage()
             if stage is None:
+                s.picks_t_s = s.frame_t_s
                 stage_label.value = "<b>All set.</b> Press Next below to continue, or Restart to redo the picking."
                 confirm_btn.disabled = True
                 skip_btn.layout.display = "none"
@@ -517,7 +664,7 @@ class Wizard:
             n = len(_points(stage))
             need = stage["min"]
             extra = f", need at least {need}" if n < need else ""
-            stage_label.value = (
+            stage_label.value = stale_note + (
                 f"<b>Stage {self._pick_stage + 1} of {len(self._PICK_STAGES)}.</b> {stage['prompt']} "
                 f"({n} point{'s' if n != 1 else ''} clicked{extra})"
             )
@@ -537,6 +684,7 @@ class Wizard:
             if stage["max"] is not None and len(pts) >= stage["max"]:
                 return
             pts.append((float(event.xdata), float(event.ydata)))
+            s.picks_t_s = s.frame_t_s   # the frame these points belong to
             _redraw()
             _update_controls()
 
@@ -559,6 +707,7 @@ class Wizard:
             _update_controls()
 
         def _on_confirm(_btn):
+            s.picks_t_s = s.frame_t_s
             self._pick_stage += 1
             _redraw()
             _update_controls()
@@ -566,6 +715,7 @@ class Wizard:
         def _on_restart(_btn):
             for stage in self._PICK_STAGES:
                 _points(stage).clear()
+            s.picks_t_s = None
             self._pick_stage = 0
             _redraw()
             _update_controls()
@@ -591,7 +741,7 @@ class Wizard:
             ),
         ])
         self._step2_box = box
-        self._step2_video_path = s.video_path
+        self._step2_key = key
         return box
 
     # ------------------------------------------------------------------ #
@@ -668,31 +818,34 @@ class Wizard:
     # ------------------------------------------------------------------ #
     def _build_config(self) -> Config:
         s = self.state
-        raw: dict = {
-            "video": {"path": s.video_path, "start_s": s.start_s, "duration_s": s.duration_s},
-            "rectify": (
-                {"method": "scale", "m_per_px": s.m_per_px} if s.scale_mode == "manual"
-                else {"method": "scale", "altitude_m": s.altitude_m, "hfov_deg": s.hfov_deg}
-            ),
-            "section": {
-                "start_px": list(s.section_pts[0]), "end_px": list(s.section_pts[1]),
-                "n_stations": s.n_stations, "edge_trim": s.edge_trim,
-                "name": Path(s.video_path).stem,
-            },
-            "flow": {"direction": "auto", "downstream_px": list(s.downstream_pts[0])},
-            "stabilise": {"enabled": s.stabilise},
-            "stiv": {"velocity_range_ms": list(s.velocity_range), "window_px": s.window_px},
-            "output": {"out_dir": s.out_dir},
-        }
-        if s.frame_step:
-            raw["video"]["frame_step"] = s.frame_step
-        if len(s.water_pts) >= 3:
-            raw["stabilise"]["water_mask_px"] = [[list(p) for p in s.water_pts]]
-        if s.discharge_enabled:
-            raw["discharge"] = {
-                "enabled": True, "bathymetry_csv": s.bathymetry_csv,
-                "alpha": s.alpha, "bank_coefficient": s.bank_coefficient,
-            }
+        if not s.video_path:
+            raise ConfigError("no video has been loaded (step 1)")
+        manual = s.scale_mode == "manual"
+        raw = survey_dict(
+            s.video_path,
+            start_s=s.start_s,
+            duration_s=s.duration_s,
+            frame_step=s.frame_step or VideoConfig.frame_step,
+            fps_override=s.fps_override,
+            m_per_px=s.m_per_px if manual else None,
+            altitude_m=None if manual else s.altitude_m,
+            hfov_deg=None if manual else s.hfov_deg,
+            start_px=s.section_pts[0] if len(s.section_pts) == 2 else None,
+            end_px=s.section_pts[1] if len(s.section_pts) == 2 else None,
+            n_stations=s.n_stations,
+            edge_trim=s.edge_trim,
+            name=s.section_name or Path(s.video_path).stem,
+            downstream_px=s.downstream_pts[0] if s.downstream_pts else None,
+            stabilise=s.stabilise,
+            water_mask_px=[s.water_pts] if len(s.water_pts) >= 3 else None,
+            search_line_length_m=s.search_line_length_m,
+            window_px=s.window_px,
+            velocity_range_ms=s.velocity_range,
+            bathymetry_csv=s.bathymetry_csv if s.discharge_enabled else None,
+            alpha=s.alpha,
+            bank_coefficient=s.bank_coefficient,
+            out_dir=s.out_dir,
+        )
         return Config.from_dict(raw)
 
     def _recap_html(self, cfg: Config) -> str:
@@ -701,6 +854,8 @@ class Wizard:
         rows = [
             ("Video", Path(s.video_path).name),
             ("Ground resolution", f"{self._resolved_m_per_px():.4f} m/pixel"),
+            ("Frame rate", (f"{self._fps():.3f} fps" if self._fps() else "unknown")
+             + (" (entered)" if s.fps_override else "")),
             ("Analysis window", f"{s.start_s:.1f}s → {s.start_s + s.duration_s:.1f}s"),
             ("Cross-section", f"{width_px:.0f} px wide"),
             ("Stations", str(s.n_stations)),

@@ -43,7 +43,31 @@ _LK_PARAMS = dict(
     maxLevel=3,
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
 )
+#: Fewest features a transform may rest on -- counted twice: among the tracks
+#: that survive forward-backward checking, and again among the RANSAC inliers
+#: of the fit itself.  A similarity has four degrees of freedom, so two points
+#: determine it exactly and three or four barely constrain it.
 _MIN_INLIERS = 6
+#: Fewest tracks, as a fraction of those that survived forward-backward
+#: checking, that must agree with a fitted transform for it to be accepted.
+#: RANSAC returns the *largest* consensus, which is not the same as a good
+#: one: with most tracks on moving water or lost in blur, a handful of points
+#: can agree by accident, or a coherent patch of water texture can outvote the
+#: bank.  Below this the fit is treated as failed and the previous transform
+#: held.  Deliberately lower than the 0.5 at which the run report starts
+#: warning, so that a scene with some water in the mask degrades to a warning
+#: rather than to held transforms.
+_MIN_INLIER_FRACTION = 0.3
+#: Forward-backward tracking error, pixels, above which a track is discarded:
+#: tracked from the reference to the current frame and back, a feature on
+#: static ground lands where it started, while one on water or in a smear of
+#: motion blur does not.
+_MAX_FB_ERROR_PX = 1.5
+#: How far, in pixels, the automatic water corridor around the search lines is
+#: grown before features are looked for outside it.  Generous on purpose: a
+#: feature on the water just beside a search line moves with the flow, and a
+#: few of those can drag the fitted transform.
+_CORRIDOR_DILATE_PX = 60
 #: Frames a reference feature may fail to track before it is retired and its
 #: slot given to a fresh corner.  Short enough to keep the set healthy, long
 #: enough that a feature briefly lost to blur or a passing bird recovers.
@@ -67,14 +91,29 @@ class StabilisationReport:
     n_features: int = 0
     #: Times the tracked set was topped back up after features died.
     n_redetections: int = 0
-    #: Per-frame RMS reprojection error of the fitted transform, pixels.
+    #: Per-frame RMS reprojection error of the fitted transform over its
+    #: RANSAC inliers, pixels; NaN where no transform was accepted, so that the
+    #: summary's median residual describes only the transforms actually used.
     rmse_px: list[float] = field(default_factory=list)
     #: Per-frame displacement of the section centre, pixels.
     shift_px: list[float] = field(default_factory=list)
+    #: Per-frame fraction of the forward-backward-consistent tracks that agree
+    #: with the fitted transform -- rejected fits included, since a low value
+    #: is the evidence of tracks on water -- and 0 where none could be fitted.
     inlier_fraction: list[float] = field(default_factory=list)
     enabled: bool = True
+    #: True when stabilisation was *requested* but had to be switched off --
+    #: as opposed to ``enabled: false`` in the config, which is a choice.
+    auto_disabled: bool = False
+    #: Why it was switched off, when ``auto_disabled``.
+    disabled_reason: str = ""
 
     def summary(self) -> str:
+        if self.auto_disabled:
+            return (
+                f"stabilisation: DISABLED AUTOMATICALLY ({self.disabled_reason}); "
+                f"camera motion is NOT compensated"
+            )
         if not self.enabled:
             return "stabilisation: disabled"
         if not self.rmse_px:
@@ -82,9 +121,14 @@ class StabilisationReport:
         redetected = (
             f", {self.n_redetections} feature top-up(s)" if self.n_redetections else ""
         )
+        # Accepted transforms only: rejected fits are recorded as NaN.
+        accepted = [r for r in self.rmse_px if np.isfinite(r)]
+        residual = (
+            f"median residual {np.median(accepted):.2f} px" if accepted
+            else "no transform accepted"
+        )
         return (
-            f"stabilisation: {self.n_features} features, "
-            f"median residual {np.nanmedian(self.rmse_px):.2f} px, "
+            f"stabilisation: {self.n_features} features, {residual}, "
             f"max frame shift {np.max(self.shift_px):.1f} px, "
             f"{self.n_failed}/{self.n_frames} frames fell back to the previous "
             f"transform{redetected}"
@@ -92,6 +136,18 @@ class StabilisationReport:
 
     def warnings(self) -> list[str]:
         out = []
+        if self.auto_disabled:
+            # Not merely "disabled": the user asked for compensation and is
+            # not getting it, and every velocity carries the aircraft's drift.
+            out.append(
+                f"STABILISATION WAS SWITCHED OFF: {self.disabled_reason}, so the "
+                f"camera motion could not be tracked and every velocity includes "
+                f"any drift of the aircraft (at 2 cm/px and 30 fps, one pixel per "
+                f"frame is 0.6 m/s). Give stabilise.static_mask_px around textured "
+                f"static ground, or set stabilise.enabled: false if the camera "
+                f"really was fixed"
+            )
+            return out
         if not self.enabled:
             return out
         if self.n_features < 30:
@@ -124,7 +180,7 @@ def build_mask(
     cfg: StabiliseConfig,
     image_shape: tuple[int, int],
     exclude_px: Optional[np.ndarray] = None,
-    exclude_dilate_px: int = 60,
+    exclude_dilate_px: int = _CORRIDOR_DILATE_PX,
 ) -> np.ndarray:
     """Build the uint8 mask of regions in which to look for static features.
 
@@ -156,23 +212,29 @@ def build_mask(
     return mask
 
 
-def _fit_transform(src: np.ndarray, dst: np.ndarray, model: str):
-    """Fit ``src -> dst`` robustly; returns (3x3 matrix, inlier mask) or (None, None)."""
+def _fit_transform(src: np.ndarray, dst: np.ndarray, model: str, threshold_px: float):
+    """Fit ``src -> dst`` robustly; returns (3x3 matrix, inlier mask) or (None, None).
+
+    ``threshold_px`` is the RANSAC inlier threshold, i.e.
+    ``stabilise.max_reprojection_px``: a track further than that from the
+    fitted motion does not count as agreeing with it.
+    """
     if len(src) < _MIN_INLIERS:
         return None, None
     s = src.reshape(-1, 1, 2).astype(np.float32)
     d = dst.reshape(-1, 1, 2).astype(np.float32)
+    thr = float(threshold_px)
 
     if model == "homography":
-        M, inl = cv2.findHomography(s, d, cv2.RANSAC, 3.0, maxIters=2000, confidence=0.995)
+        M, inl = cv2.findHomography(s, d, cv2.RANSAC, thr, maxIters=2000, confidence=0.995)
         if M is None:
             return None, None
         return M, (inl.ravel().astype(bool) if inl is not None else None)
 
     if model == "affine":
-        A, inl = cv2.estimateAffine2D(s, d, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+        A, inl = cv2.estimateAffine2D(s, d, method=cv2.RANSAC, ransacReprojThreshold=thr)
     else:  # similarity: rotation + uniform scale + translation
-        A, inl = cv2.estimateAffinePartial2D(s, d, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+        A, inl = cv2.estimateAffinePartial2D(s, d, method=cv2.RANSAC, ransacReprojThreshold=thr)
     if A is None:
         return None, None
     M = np.vstack([A, [0.0, 0.0, 1.0]])
@@ -193,9 +255,14 @@ class Stabiliser:
     """Tracks static ground and reports, per frame, where the reference went.
 
     Usage is streaming: construct with the reference frame, then call
-    :meth:`update` once per subsequent frame.  :meth:`current_transform` returns
-    the 3x3 matrix mapping *reference* image coordinates to *current* frame
-    coordinates.
+    :meth:`update` once per subsequent frame.  Each call returns -- and leaves
+    in ``M`` -- the 3x3 matrix mapping *reference* image coordinates to
+    *current* frame coordinates.
+
+    A transform is accepted only if at least ``_MIN_INLIERS`` tracks, and at
+    least ``_MIN_INLIER_FRACTION`` of the tracks that survived the
+    forward-backward check, lie within ``stabilise.max_reprojection_px`` of it.
+    Otherwise the frame counts as failed and the previous transform is held.
     """
 
     def __init__(
@@ -210,7 +277,6 @@ class Stabiliser:
 
         self._u8 = _u8_scaling(reference_grey)
         self.ref = _to_u8(reference_grey, self._u8)
-        self.prev = self.ref
         self.mask = mask
 
         if not cfg.enabled:
@@ -247,14 +313,16 @@ class Stabiliser:
             )
             self.cfg = StabiliseConfig(**{**cfg.__dict__, "enabled": False})
             self.report.enabled = False
+            self.report.auto_disabled = True
+            self.report.disabled_reason = (
+                f"only {len(self.ref_pts)} trackable feature(s) found on static "
+                f"ground, at least {_MIN_INLIERS} needed"
+            )
 
     # ------------------------------------------------------------------ #
     @property
     def enabled(self) -> bool:
         return bool(self.cfg.enabled)
-
-    def current_transform(self) -> np.ndarray:
-        return self.M
 
     def update(self, frame_grey: np.ndarray, probe_px: Optional[np.ndarray] = None) -> np.ndarray:
         """Register one frame against the reference; returns the new transform."""
@@ -290,37 +358,44 @@ class Stabiliser:
                 **_LK_PARAMS,
             )
             fb_err = np.linalg.norm(back.reshape(-1, 2) - self.ref_pts, axis=1)
-            ok &= status_b.ravel().astype(bool) & (fb_err < 1.5)
+            ok &= status_b.ravel().astype(bool) & (fb_err < _MAX_FB_ERROR_PX)
 
         M, inliers = (None, None)
         if ok.sum() >= _MIN_INLIERS:
-            M, inliers = _fit_transform(self.ref_pts[ok], nxt[ok], self.cfg.model)
+            M, inliers = _fit_transform(
+                self.ref_pts[ok], nxt[ok], self.cfg.model, self.cfg.max_reprojection_px
+            )
+
+        rmse, inlier_frac = float("nan"), 0.0
+        if M is not None:
+            if inliers is None or len(inliers) != int(ok.sum()):
+                inliers = np.ones(int(ok.sum()), bool)
+            pred = transform_points(M, self.ref_pts[ok])
+            resid = np.linalg.norm(pred - nxt[ok], axis=1)
+            n_in = int(inliers.sum())
+            inlier_frac = n_in / max(1, len(inliers))
+            if n_in:
+                # Over the inliers only, so it is a fit residual, not a measure
+                # of how many tracks were on water; inlier_frac is that.  By
+                # construction it cannot exceed max_reprojection_px by much, so
+                # it is a diagnostic of accepted fits, never the acceptance test.
+                rmse = float(np.sqrt(np.mean(resid[inliers] ** 2)))
+            if n_in < _MIN_INLIERS or inlier_frac < _MIN_INLIER_FRACTION:
+                # A bad fit is worse than no update: hold the previous transform.
+                M = None
 
         if M is None:
             self.report.n_failed += 1
+            # A rejected fit's residual describes a transform that was not
+            # used; leave it out of the residual statistics.
             self.report.rmse_px.append(float("nan"))
-            self.report.inlier_fraction.append(0.0)
+            self.report.inlier_fraction.append(inlier_frac)
             self.report.shift_px.append(self._probe_shift(probe_px))
             # Keep the last good transform and re-seed from its prediction.
             self.cur_pts = transform_points(self.M, self.ref_pts).astype(np.float32)
             self.alive = np.zeros(len(self.ref_pts), bool)
             self.dead_streak = self.dead_streak + 1
-            self.prev = cur
             return self.M
-
-        pred = transform_points(M, self.ref_pts[ok])
-        resid = np.linalg.norm(pred - nxt[ok], axis=1)
-        if inliers is not None and inliers.any():
-            rmse = float(np.sqrt(np.mean(resid[inliers] ** 2)))
-            inlier_frac = float(inliers.mean())
-        else:
-            rmse = float(np.sqrt(np.mean(resid**2)))
-            inlier_frac = 1.0
-
-        if rmse > self.cfg.max_reprojection_px:
-            # A bad fit is worse than no update: hold the previous transform.
-            self.report.n_failed += 1
-            M = self.M
 
         self.M = M
         self.report.rmse_px.append(rmse)
@@ -330,15 +405,12 @@ class Stabiliser:
         # Keep good tracks; re-inject lost ones at the model-predicted position
         # so they can recover without breaking the reference correspondence.
         alive = np.zeros(len(self.ref_pts), bool)
-        alive[np.flatnonzero(ok)] = True
-        if inliers is not None:
-            alive[np.flatnonzero(ok)[~inliers]] = False
+        alive[np.flatnonzero(ok)[inliers]] = True
 
         self.cur_pts = transform_points(self.M, self.ref_pts).astype(np.float32)
         self.cur_pts[alive] = nxt[alive]
         self.alive = alive
         self.dead_streak = np.where(alive, 0, self.dead_streak + 1)
-        self.prev = cur
 
         # Features die as the aircraft drifts: bank texture leaves the frame,
         # motion blur washes a corner out.  Without a top-up the surviving set
