@@ -25,6 +25,7 @@ import Foundation
 import OSLog
 import StivKit
 import simd
+import UIKit
 
 private let log = Logger(subsystem: "org.stiv.app", category: "geometry")
 
@@ -96,6 +97,64 @@ func verifyProjectionParity(frame: ARFrame) -> Double {
             downward so camera y is negated; ARCamera.intrinsics is \
             column-major with the principal point in column 2.
             """)
+    }
+    let viewport = verifyViewportParity(frame: frame)
+    if viewport.isFinite {
+        if viewport < 1.0 {
+            log.info("""
+                viewport parity: the reticle's aspect-fill mapping agrees with ARKit to \
+                \(viewport, format: .fixed(precision: 3)) pt
+                """)
+        } else {
+            log.error("""
+                viewport parity FAILED: ViewportGeometry is \
+                \(viewport, format: .fixed(precision: 1)) pt from ARKit's projectPoint. \
+                Check the rotation for each interface orientation, then the fill scale.
+                """)
+        }
+    }
+    return worst
+}
+
+/// Compare `ViewportGeometry` -- the app's own aspect-fill mapping, which sizes
+/// the depth reticle -- against ARKit's viewport projection, in every
+/// orientation the app supports and for a phone-shaped viewport.
+///
+/// Returns the largest disagreement in points, or NaN if no test point was in
+/// view.  Composes StivKit's image projection with the viewport mapping, so it
+/// checks the pair; `verifyProjectionParity` has already checked the first.
+@discardableResult
+func verifyViewportParity(frame: ARFrame) -> Double {
+    let camera = frame.camera
+    let intrinsics = camera.stivIntrinsics
+    let planeY = Double(camera.transform.columns.3.y) - 2.0
+    let projection = camera.projection(onto: WaterPlane(y: planeY))
+    let origin = projection.pose.position
+
+    var worst = Double.nan
+    let cases: [(UIInterfaceOrientation, CGSize)] = [
+        (.portrait, CGSize(width: 393, height: 852)),
+        (.landscapeRight, CGSize(width: 852, height: 393)),
+        (.landscapeLeft, CGSize(width: 852, height: 393)),
+    ]
+    for (orientation, size) in cases {
+        let geometry = ViewportGeometry(imageSize: camera.imageResolution, viewportSize: size,
+                                        orientation: orientation)
+        for dx in stride(from: -6.0, through: 6.0, by: 3.0) {
+            for dz in stride(from: -18.0, through: -3.0, by: 3.0) {
+                let world = PlanePoint(x: origin.x + dx, z: origin.z + dz)
+                guard let image = projection.worldToImage(world),
+                      image.u >= 0, image.v >= 0,
+                      image.u <= Double(intrinsics.width),
+                      image.v <= Double(intrinsics.height) else { continue }
+                let mine = geometry.viewportPoint(image: image)
+                let theirs = camera.projectPoint(
+                    simd_float3(Float(world.x), Float(planeY), Float(world.z)),
+                    orientation: orientation, viewportSize: size)
+                let error = hypot(mine.x - CGFloat(theirs.x), mine.y - CGFloat(theirs.y))
+                worst = worst.isNaN ? Double(error) : max(worst, Double(error))
+            }
+        }
     }
     return worst
 }

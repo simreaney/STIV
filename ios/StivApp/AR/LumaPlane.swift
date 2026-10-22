@@ -141,17 +141,22 @@ func withDepthPlane<T>(
     defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
     guard let depthAddress = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
 
+    // The unlock is keyed to the lock succeeding, not to an address coming
+    // back: a buffer that locks but reports no base address must still be
+    // unlocked, or ARKit's pool is left holding a locked buffer.
     var confidenceAddress: UnsafeMutableRawPointer?
     var confidenceStride = 0
+    var lockedConfidence: CVPixelBuffer?
+    defer {
+        if let lockedConfidence {
+            CVPixelBufferUnlockBaseAddress(lockedConfidence, .readOnly)
+        }
+    }
     if let confidenceMap,
        CVPixelBufferLockBaseAddress(confidenceMap, .readOnly) == kCVReturnSuccess {
+        lockedConfidence = confidenceMap
         confidenceAddress = CVPixelBufferGetBaseAddress(confidenceMap)
         confidenceStride = CVPixelBufferGetBytesPerRow(confidenceMap)
-    }
-    defer {
-        if confidenceAddress != nil, let confidenceMap {
-            CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
-        }
     }
 
     let plane = DepthPlane(

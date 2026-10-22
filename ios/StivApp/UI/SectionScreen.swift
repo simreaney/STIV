@@ -16,47 +16,47 @@ struct SectionScreen: View {
     @EnvironmentObject private var capture: ARCaptureSession
 
     var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                ARPreview(session: capture.session).ignoresSafeArea()
-
-                if let camera = capture.camera, let plane = model.plane {
-                    let projector = OverlayProjector(
-                        camera: camera, planeY: plane.y,
-                        orientation: currentInterfaceOrientation(),
-                        viewportSize: geometry.size)
-
+        ZStack {
+            // The feed, the overlay, the tap target and the projector share
+            // one full-screen coordinate space; see `CameraFeed`.
+            CameraFeed(session: capture.session, onTap: tap) { size in
+                if let projector = projector(viewportSize: size) {
                     SectionOverlay(projector: projector,
                                    start: model.sectionStart,
                                    end: model.sectionEnd,
                                    layout: model.layout,
                                    downstream: model.downstream,
                                    waterPolygon: model.waterPolygon)
-                        .ignoresSafeArea()
-
-                    // A transparent tap target over the whole feed.  The
-                    // unprojection can fail -- a tap above the horizon hits no
-                    // plane -- and saying so is better than silently ignoring it.
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .onTapGesture { location in
-                            if let world = projector.world(at: location) {
-                                model.handleTap(world: world)
-                                model.rebuildLayout()
-                            } else {
-                                model.tapMissed()
-                            }
-                        }
                 }
-
-                VStack {
-                    TrackingBanner(advice: capture.trackingState.advice)
-                    Spacer()
-                    controls
-                }
-                .padding(16)
             }
+
+            VStack {
+                StatusBanners()
+                Spacer()
+                controls
+            }
+            .padding(16)
         }
+    }
+
+    private func projector(viewportSize: CGSize) -> OverlayProjector? {
+        guard let camera = capture.camera, let plane = model.plane else { return nil }
+        return OverlayProjector(camera: camera, planeY: plane.y,
+                                orientation: currentInterfaceOrientation(),
+                                viewportSize: viewportSize)
+    }
+
+    /// The unprojection can fail -- a tap above the horizon hits no plane --
+    /// and saying so is better than silently ignoring it.
+    private func tap(at location: CGPoint, viewportSize: CGSize) {
+        guard let projector = projector(viewportSize: viewportSize),
+              let world = projector.world(at: location) else {
+            model.tapMissed()
+            return
+        }
+        // The view the tap was made in is the one the user is aiming at the
+        // section from: the layout is built from it.
+        model.handleTap(world: world, seenFrom: CameraSnapshot(projector.camera))
     }
 
     private var controls: some View {
@@ -101,6 +101,9 @@ struct SectionScreen: View {
                 if let error = model.layoutError {
                     Text(error).font(.caption).foregroundStyle(.red)
                 }
+
+                RemeasureButton()
+                    .font(.footnote)
 
                 HStack(spacing: 10) {
                     Button {

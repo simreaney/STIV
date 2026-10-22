@@ -38,10 +38,12 @@
 		<string>arkit</string>
 	</array>
 
+	<!-- The launch screen is a plain colour from the asset catalogue: dark, like
+	     the app, so launching on a riverbank in the sun is not a white flash. -->
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>
-		<string></string>
+		<string>LaunchBackground</string>
 	</dict>
 
 	<!-- A cross-section is wide, so landscape is the natural way to hold the
@@ -62,8 +64,11 @@
 		<false/>
 	</dict>
 
-	<!-- Holding still for thirty seconds must not be interrupted by the screen
-	     dimming and the session losing tracking. -->
+	<!-- Opts out of iPad Split View and Slide Over: the AR session needs the
+	     camera and a viewport of its own. It does nothing to stop the screen
+	     dimming or locking; SurveyModel turns the idle timer off while the
+	     camera is in use, which is what keeps a thirty-second recording from
+	     being cut short by auto-lock. -->
 	<key>UIRequiresFullScreen</key>
 	<true/>
 	<key>UIStatusBarStyle</key>

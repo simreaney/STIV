@@ -40,7 +40,7 @@ struct SettingsScreen: View {
                 }
 
                 Section {
-                    Stepper(value: $model.survey.capture.frameStep, in: 1...30) {
+                    Stepper(value: frameStep, in: 1...model.maxFrameStep) {
                         HStack {
                             Text("Frame step")
                             Spacer()
@@ -101,6 +101,7 @@ struct SettingsScreen: View {
                         Slider(value: $model.survey.capture.durationSeconds,
                                in: 5...120, step: 5)
                     }
+                    memoryNote
                 }
 
                 Section {
@@ -147,9 +148,25 @@ struct SettingsScreen: View {
                 }
             }
             .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        model.go(to: .section)
+                    } label: {
+                        Label("Section", systemImage: "chevron.left")
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    RemeasureButton()
+                }
+            }
             .safeAreaInset(edge: .bottom) {
-                PrimaryButton(title: "Record", systemImage: "record.circle") {
-                    model.rebuildLayout()
+                // No layout rebuild here: this screen shows no camera feed, so
+                // the pose the phone has now says nothing about the section.
+                // The layout stays the one built from the view the section was
+                // tapped in, and Start rebuilds it from the live view.
+                PrimaryButton(title: "Record", systemImage: "record.circle",
+                              enabled: model.layout != nil) {
                     model.go(to: .record)
                 }
                 .padding(16)
@@ -157,6 +174,33 @@ struct SettingsScreen: View {
             }
             .onChange(of: model.survey.section.stationCount) { model.rebuildLayout() }
             .onChange(of: model.survey.sti.searchLineLengthM) { model.rebuildLayout() }
+        }
+    }
+
+    /// What the recording will cost in memory, and whether the budget will
+    /// shorten it.  Every frame is kept -- that is what lets the frame step be
+    /// changed afterwards -- so stations, search-line length and duration all
+    /// multiply together here.
+    @ViewBuilder
+    private var memoryNote: some View {
+        if let estimate = model.recordingEstimate {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Memory").foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(RecordingBudget.megabytes(estimate.bytesPerSecond))/s, "
+                       + "\(RecordingBudget.megabytes(estimate.totalBytes)) in all")
+                        .foregroundStyle(estimate.notice == nil ? Color.secondary : .orange)
+                        .monospacedDigit()
+                }
+                if let notice = estimate.notice {
+                    Text(notice).font(.caption2).foregroundStyle(.orange)
+                } else {
+                    Text("Within the \(RecordingBudget.megabytes(Double(RecordingBudget.bytes))) "
+                       + "budget. Recalculated from the live view when you press Start.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
         }
     }
 
@@ -169,6 +213,14 @@ struct SettingsScreen: View {
         let velocity = 0.5 * (model.survey.sti.velocityRangeMs.lowerBound
                               + model.survey.sti.velocityRangeMs.upperBound)
         return abs(velocity) * model.survey.capture.stSecondsPerRow / line.sxMetresPerColumn
+    }
+
+    /// The frame step, kept within what the planned recording can be
+    /// analysed at -- which moves with the duration and the window.
+    private var frameStep: Binding<Int> {
+        Binding(
+            get: { model.survey.capture.frameStep },
+            set: { model.survey.capture.frameStep = min(max($0, 1), model.maxFrameStep) })
     }
 
     /// The upper bound moves; the small negative lower bound stays, so a

@@ -26,16 +26,30 @@ struct ResultsScreen: View {
                 } else if model.isAnalysing {
                     ProgressView("Analysing…")
                 } else {
-                    ContentUnavailableView(
-                        "No result",
-                        systemImage: "waveform.slash",
-                        description: Text(model.analysisError ?? "Nothing was recorded."))
+                    VStack(spacing: 16) {
+                        ContentUnavailableView(
+                            "No result",
+                            systemImage: "waveform.slash",
+                            description: Text(model.analysisError ?? "Nothing was recorded."))
+                        // A recording that is in hand but was refused -- too
+                        // short for the window at this frame step, say -- can
+                        // still be retuned from here.
+                        if model.canRetune {
+                            Stepper(value: frameStep, in: 1...model.maxFrameStep) {
+                                Text("Frame step \(model.survey.capture.frameStep)")
+                                    .monospacedDigit()
+                            }
+                            .padding(.horizontal, 24)
+                        }
+                    }
                 }
             }
             .navigationTitle("Results")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("New") { model.go(to: .waterPlane) }
+                    // A new survey from scratch: the session restarts on a
+                    // fresh world frame, so nothing picked for this one holds.
+                    Button("New") { model.startNewSurvey() }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -82,7 +96,7 @@ struct ResultsScreen: View {
 
             if model.canRetune {
                 Section {
-                    Stepper(value: frameStep, in: 1...30) {
+                    Stepper(value: frameStep, in: 1...model.maxFrameStep) {
                         HStack {
                             Text("Frame step")
                             Spacer()
@@ -91,17 +105,24 @@ struct ResultsScreen: View {
                         }
                     }
                     if let suggested = result.suggestedFrameStep,
-                       suggested != model.survey.capture.frameStep {
+                       suggested != model.survey.capture.frameStep,
+                       suggested <= model.maxFrameStep {
                         Button("Use suggested step (\(suggested))") {
                             model.setFrameStep(suggested)
                         }
                     }
                     if model.isAnalysing { ProgressView() }
+                    if let error = model.analysisError {
+                        Text(error).font(.caption).foregroundStyle(.orange)
+                    }
                 } header: {
                     Text("Retune")
                 } footer: {
                     Text("Accuracy is best when tan φ is near 1 (Fig. 7). Changing the "
-                       + "frame step re-analyses the recording you already have.")
+                       + "frame step re-analyses the recording you already have. It stops at "
+                       + "\(model.maxFrameStep): beyond that the space-time images would be "
+                       + "shorter than the \(model.minimumStiRows) rows one analysis window "
+                       + "needs.")
                 }
             }
 
@@ -131,7 +152,7 @@ struct ResultsScreen: View {
                 Section("Flags") {
                     ForEach(usedFlags(result), id: \.self) { flag in
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(flag.rawValue).font(.caption.monospaced())
+                            Text(flag.pythonName).font(.caption.monospaced())
                             Text(flag.explanation).font(.caption2).foregroundStyle(.secondary)
                         }
                     }
@@ -228,7 +249,9 @@ struct CoherencyChart: View {
 
     var body: some View {
         Chart {
-            ForEach(result.stations, id: \.index) { station in
+            // A station with no orientation at all has no coherency either:
+            // no bar, rather than a bar of NaN height.
+            ForEach(result.stations.filter { $0.coherency.isFinite }, id: \.index) { station in
                 BarMark(x: .value("Distance", station.stationM),
                         y: .value("Coherency", station.coherency))
                     .foregroundStyle(station.coherency > 0.3 ? .green : .orange)
@@ -254,13 +277,19 @@ struct StationRow: View {
                 .frame(width: 74, alignment: .leading)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(station.velocityMs.isFinite
-                     ? "\(decimals(station.velocityMs, 3)) ± "
-                       + "\(decimals(station.velocityStdMs, 3)) m/s"
-                     : "no data")
+                // Interpolated, median-filtered and blanked stations carry a
+                // velocity with no sigma of their own; a failed station that
+                // could not be filled carries neither.
+                Text(!station.velocityMs.isFinite ? "no data"
+                     : station.velocityStdMs.isFinite
+                        ? "\(decimals(station.velocityMs, 3)) ± "
+                          + "\(decimals(station.velocityStdMs, 3)) m/s"
+                        : "\(decimals(station.velocityMs, 3)) m/s")
                     .font(.callout.monospacedDigit())
                 if !station.flags.isEmpty {
-                    Text(station.flags.map(\.rawValue).joined(separator: ", "))
+                    // The desktop's spelling, as in the exports, so a flag
+                    // reads the same here as in `velocity.csv`.
+                    Text(station.flags.map(\.pythonName).joined(separator: ", "))
                         .font(.caption2.monospaced())
                         .foregroundStyle(station.failed ? .red : .orange)
                 }
@@ -292,10 +321,10 @@ struct StiSheet: View {
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 10)],
                           spacing: 12) {
-                    ForEach(result.stis.indices, id: \.self) { index in
-                        let sti = result.stis[index]
+                    ForEach(result.stiPreviews.indices, id: \.self) { index in
+                        let preview = result.stiPreviews[index]
                         VStack(spacing: 4) {
-                            if let image = stiImage(sti.data) {
+                            if let image = stiImage(preview) {
                                 Image(uiImage: image)
                                     .resizable()
                                     .aspectRatio(contentMode: .fit)
@@ -319,15 +348,18 @@ struct StiSheet: View {
     }
 
     /// Render an STI as a greyscale image: space across, time down, as Fig. 4.
-    private func stiImage(_ matrix: Matrix) -> UIImage? {
-        let bytes = displayBytes(matrix)
+    ///
+    /// From the single-precision preview StivKit keeps for display, so no
+    /// double-precision copy of the STI is made just to be thrown away.
+    private func stiImage(_ preview: StiPreview) -> UIImage? {
+        let bytes = displayBytes(preview)
         guard !bytes.isEmpty else { return nil }
         let provider = CGDataProvider(data: Data(bytes) as CFData)
         guard let provider,
               let cgImage = CGImage(
-                width: matrix.cols, height: matrix.rows,
+                width: preview.cols, height: preview.rows,
                 bitsPerComponent: 8, bitsPerPixel: 8,
-                bytesPerRow: matrix.cols,
+                bytesPerRow: preview.cols,
                 space: CGColorSpaceCreateDeviceGray(),
                 bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
                 provider: provider, decode: nil,

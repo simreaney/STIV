@@ -54,6 +54,10 @@ func currentInterfaceOrientation() -> UIInterfaceOrientation {
 
 /// World-to-viewport projection for one camera pose and one water plane, bundled
 /// so an overlay can be drawn without every shape re-deriving it.
+///
+/// `viewportSize` must be the size of the view the feed is drawn in, and the
+/// points it takes and returns must be in that view's coordinates -- which is
+/// what `CameraFeed` hands its overlay and its taps, and nothing else does.
 struct OverlayProjector {
     let camera: ARCamera
     let planeY: Double
@@ -154,22 +158,179 @@ struct SectionOverlay: View {
 
 /// A centred reticle, for aiming at the waterline while the plane is fitted.
 ///
-/// It matches `WaterPlaneFitter`'s sampling window, so what the user sees framed
-/// is exactly what the fit is using.  A reticle that lied about that would be
-/// worse than none.
+/// It draws `WaterPlaneFitter`'s own sampling region, mapped into the viewport
+/// the way ARKit maps the camera image -- rotated, scaled to fill, cropped --
+/// so what the user sees framed is exactly what the fit is using.  A reticle
+/// that lied about that would be worse than none: the feed is magnified to
+/// fill a screen far narrower than the sensor, so a box sized as a fraction of
+/// the *screen* covers a different, smaller part of the scene than the same
+/// fraction of the *image*.
 struct DepthReticle: View {
-    /// Must match `WaterPlaneFitter.add(reticleFraction:)`.
-    let fraction: Double
+    /// `ARCamera.imageResolution`; `nil` until the first frame arrives.
+    let imageResolution: CGSize?
+    /// The whole viewport the feed is drawn into.
+    let viewportSize: CGSize
+    let orientation: UIInterfaceOrientation
     let active: Bool
 
     var body: some View {
-        GeometryReader { geometry in
-            let side = min(geometry.size.width, geometry.size.height) * fraction * 2
+        if let rect {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(active ? Color.green : Color.white.opacity(0.7), lineWidth: 2)
-                .frame(width: side, height: side)
-                .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+                .allowsHitTesting(false)
         }
-        .allowsHitTesting(false)
+    }
+
+    /// The sampled square, in viewport points.
+    var rect: CGRect? {
+        guard let imageResolution, imageResolution.width > 0 else { return nil }
+        let geometry = ViewportGeometry(imageSize: imageResolution, viewportSize: viewportSize,
+                                        orientation: orientation)
+        return geometry.viewportRect(image: WaterPlaneFitter.reticleRect(
+            imageWidth: imageResolution.width, imageHeight: imageResolution.height))
+    }
+}
+
+// MARK: - one coordinate space for the feed
+
+/// A layer that ignores the safe area and hands its content the size it really
+/// has: the whole screen.
+///
+/// `ARSCNView` draws the feed edge to edge, and ARKit's `projectPoint` and
+/// `unprojectPoint` map the world into *that* view.  A `GeometryReader` that
+/// respects the safe area reports a smaller size -- 59 points shorter at the
+/// top alone on a phone with a Dynamic Island -- and an overlay projected into
+/// it lands that far from the feed, and a tap lands on the wrong point of the
+/// river.  Ignoring the safe area *on the reader itself* makes the size, the
+/// origin and every child's local coordinates the feed's own.
+struct FullScreenLayer<Content: View>: View {
+    @ViewBuilder let content: (CGSize) -> Content
+
+    var body: some View {
+        GeometryReader { geometry in
+            content(geometry.size)
+                .frame(width: geometry.size.width, height: geometry.size.height)
+        }
+        .ignoresSafeArea()
+    }
+}
+
+/// The camera feed, with world-anchored overlays drawn and taps read in the
+/// feed's own full-screen coordinates.  Controls go on top of this, in a layer
+/// of their own that does respect the safe area.
+struct CameraFeed<Overlay: View>: View {
+    let session: ARSession
+    /// A tap on the feed: where, and in a viewport of what size -- the two
+    /// things `OverlayProjector` needs to turn it into a world point.
+    var onTap: ((CGPoint, CGSize) -> Void)?
+    @ViewBuilder let overlay: (CGSize) -> Overlay
+
+    init(session: ARSession,
+         onTap: ((CGPoint, CGSize) -> Void)? = nil,
+         @ViewBuilder overlay: @escaping (CGSize) -> Overlay) {
+        self.session = session
+        self.onTap = onTap
+        self.overlay = overlay
+    }
+
+    var body: some View {
+        FullScreenLayer { size in
+            ZStack {
+                ARPreview(session: session)
+                overlay(size)
+                if let onTap {
+                    // A transparent tap target over the whole feed, reading
+                    // locations in its own -- that is, the feed's -- space.
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture(coordinateSpace: .local) { onTap($0, size) }
+                }
+            }
+        }
+    }
+}
+
+extension CameraFeed where Overlay == EmptyView {
+    init(session: ARSession) {
+        self.init(session: session) { _ in EmptyView() }
+    }
+}
+
+// MARK: - shared banners and cards
+
+/// What the user should know about the session right now: tracking trouble
+/// and heat.  Shown wherever the camera is live.
+struct StatusBanners: View {
+    @EnvironmentObject private var model: SurveyModel
+    @EnvironmentObject private var capture: ARCaptureSession
+
+    var body: some View {
+        VStack(spacing: 6) {
+            TrackingBanner(advice: capture.trackingState.advice)
+            if let warning = model.thermalWarning {
+                Label(warning, systemImage: "thermometer.sun.fill")
+                    .font(.footnote)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.red.opacity(0.85), in: Capsule())
+                    .foregroundStyle(.white)
+            }
+        }
+    }
+}
+
+/// The camera is not running, why, and what to do about it.
+struct CaptureFailureCard: View {
+    @EnvironmentObject private var model: SurveyModel
+    let failure: CaptureFailure
+
+    var body: some View {
+        OverlayCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("The camera is not running", systemImage: "video.slash.fill")
+                    .font(.headline)
+                Text(failure.message)
+                    .font(.footnote)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    if failure.needsCameraPermission,
+                       let settings = URL(string: UIApplication.openSettingsURLString) {
+                        PrimaryButton(title: "Open Settings", systemImage: "gear") {
+                            UIApplication.shared.open(settings)
+                        }
+                    }
+                    PrimaryButton(title: "Try again", systemImage: "arrow.clockwise") {
+                        model.retryCapture()
+                    }
+                }
+            }
+        }
+        .padding(16)
+    }
+}
+
+/// Back to the water level, from a screen past it.
+///
+/// Confirmed first when there is a cross-section to lose: every tap was a ray
+/// that met the current level, and the same rays meet a new level elsewhere.
+struct RemeasureButton: View {
+    @EnvironmentObject private var model: SurveyModel
+    @State private var confirming = false
+
+    var body: some View {
+        Button {
+            if model.sectionStart == nil { model.remeasureWaterLevel() } else { confirming = true }
+        } label: {
+            Label("Re-measure water level", systemImage: "ruler")
+        }
+        .confirmationDialog("Measure the water level again?", isPresented: $confirming,
+                            titleVisibility: .visible) {
+            Button("Re-measure", role: .destructive) { model.remeasureWaterLevel() }
+        } message: {
+            Text("The cross-section will need tapping again: each tap was placed on the "
+               + "current water level.")
+        }
     }
 }

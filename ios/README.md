@@ -9,9 +9,12 @@ drone-specific parts replaced by what a phone actually has.
 ios/
   StivKit/          the numerics: a Swift port of the paper. No ARKit, no UIKit.
   StivApp/          the app: ARKit capture, the six-screen survey, results.
+  StivAppTests/     the app's tests, run in the simulator or on a phone.
   StivApp.xcodeproj hand-authored, Xcode 16 synchronized folders.
   project.yml       XcodeGen fallback, if the project above will not open.
-  tools/            the golden-fixture generator.
+  tools/            the test runner and the golden-fixture generator.
+  TESTING.md        what each layer of testing proves, and the field protocol.
+  DEPLOYING.md      getting the app onto a test iPhone.
 ```
 
 ## How the scale works
@@ -28,7 +31,13 @@ measure at close range.
 
 What gets measured is the **waterline**: the contour where water meets bank. It
 sits at water level by definition, it is texture the sensor handles well, and
-from a bank it is the nearest thing in the scene. Everything after that is
+from a bank it is the nearest thing in the scene. The water itself returns
+little that passes the confidence gate, so most samples in the aiming box are
+bank, all of them above the water; the fit therefore takes the *bottom* of the
+returns rather than the median of everything, which would sit ten or twenty
+centimetres high: the water's own cluster of heights when there is one, the foot
+of the bank's spread of heights when there is not, ignoring a small cluster of
+reflections below. Everything after that is
 ray–plane intersection: unproject any pixel through the camera intrinsics,
 intersect `y = y₀`, and read off world metres — including at a far bank thirty
 metres away where no depth measurement is possible at all.
@@ -66,6 +75,17 @@ are aligned by translation-only Lucas–Kanade, and the residual is the part of 
 image motion the pose failed to explain. It validates the near field; the far
 field is assumed to follow, and the report says so.
 
+A small residual is also corrected, as a correction to the *pose* — three
+rotations and three translations, fitted with each patch's depth — rather than
+as an image warp. The patches are a couple of metres away and the river tens of
+metres, and a translation error moves the two by different amounts where a
+rotation error moves them alike; correcting the pose gives each sample the shift
+its own depth implies. When the patches' depths are too alike to tell a turn
+from a slip, it corrects rotation only. A correction is applied only when it
+stands out from the alignment noise, so a correct pose is left alone; it is
+ramped in rather than applied in one frame, held rather than dropped when a
+check fails, and refused above a 6 px cap.
+
 ## Building
 
 Requires **Xcode 16+** and an **iPhone 12 Pro or later** for LiDAR. Non-Pro
@@ -77,47 +97,26 @@ checked at runtime.
 open ios/StivApp.xcodeproj
 ```
 
-The simulator gives you nothing useful: no camera, no world tracking, no depth.
+[DEPLOYING.md](DEPLOYING.md) walks through signing, installing on a test
+iPhone, Release builds for the field, and TestFlight.
 
-### Testing the numerics
+The simulator cannot run a survey — no camera, no world tracking, no depth —
+but it does run the app's tests, which stand in for all three.
 
-```bash
-cd ios/StivKit && swift test
-```
-
-Runs on a Mac without a simulator. Three of the tests exist specifically to
-catch the ways a structure-tensor port fails while still producing plausible
-numbers: an inverted eigenvector branch (returns `-1/tan φ`), a flipped gradient
-sign (`-tan φ`), and transposed axes (`1/tan φ`).
-
-For the strongest check, generate the golden fixture once — it compares the Swift
-structure tensor against the Python one to 1e-9, which is what catches a
-boundary rule off by one pixel or a histogram bin edge counted the other way:
+### Testing
 
 ```bash
-pip install -e .                          # repository root
-python ios/tools/make_golden_fixture.py
-cd ios/StivKit && swift test
+ios/tools/test.sh          # StivKit on the Mac, then the app in a simulator
+ios/tools/test.sh device   # the same on a connected iPhone, plus the ARKit checks
 ```
 
-Without the fixture those tests skip rather than fail.
-
-### On-device checks
-
-`ProjectionParity.swift` runs once per session in debug builds and compares the
-hand-written world-to-image projection against `ARCamera.projectPoint`. It is
-the only way to verify the *conventions* match ARKit's — the unit tests prove the
-geometry is self-consistent, not that its axes point the same way ARKit's do.
-Watch the console for `projection parity`.
-
-Two field checks are worth more than any of the above:
-
-1. **Static-scene null test.** Point at still water, or a wall, and record. The
-   velocity must come out ≈ 0. This catches a sign error, a rolling-shutter
-   bias, and pose noise leaking into the STI, all at once.
-2. **Known velocity.** Time a float over a measured distance and compare. The
-   desktop package hits ~3% relative RMSE on synthetic footage; a phone on a
-   real bank will be worse, and the point is to find out by how much.
+The first runs in about a minute and should pass before every commit. It covers
+the numerics against the paper and the Python, the pixel-buffer readers, the
+ARKit conversions, the water-level fit, the pose cross-check, and an end-to-end
+test that films a rendered river with a swaying hand-held camera and checks the
+velocity comes back. Two field checks — a null test on still water and a timed
+float — are worth more than all of it. [TESTING.md](TESTING.md) has what each
+layer proves, what it cannot, and the field protocol.
 
 ## What this version does not do
 
@@ -127,6 +126,11 @@ Two field checks are worth more than any of the above:
   be re-analysed with different geometry — though the frame step *can* be
   retuned afterwards, since every frame is recorded and `St` is applied at
   analysis time.
+- **Record for as long as you like.** Every frame is kept in memory, which is
+  what makes the frame step retunable, and a recording is held to a 300 MB
+  budget. The defaults fit comfortably; many long search lines do not, and the
+  app then shortens the recording, or thins the lines, and says so before it
+  starts.
 - **Glassy water.** STIV measures the motion of a pattern. No pattern, no
   measurement, in any implementation.
 - **Rolling shutter.** In an oblique view a search line spans image rows, each

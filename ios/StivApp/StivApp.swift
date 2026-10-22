@@ -33,6 +33,7 @@ struct StivApp: App {
 /// One screen per decision, in the order each one becomes answerable.
 struct SurveyFlowView: View {
     @EnvironmentObject private var model: SurveyModel
+    @EnvironmentObject private var capture: ARCaptureSession
 
     var body: some View {
         ZStack {
@@ -43,6 +44,14 @@ struct SurveyFlowView: View {
             case .settings:   SettingsScreen()
             case .record:     RecordScreen()
             case .results:    ResultsScreen()
+            }
+
+            // A camera that will not start -- refused permission, a sensor
+            // fault -- otherwise looks like a black feed asking the user to
+            // move the phone slowly.  Say what is wrong, and offer the way out.
+            if model.step.usesCamera, let failure = capture.failure {
+                Color.black.opacity(0.55).ignoresSafeArea()
+                CaptureFailureCard(failure: failure)
             }
         }
         .animation(.default, value: model.step)

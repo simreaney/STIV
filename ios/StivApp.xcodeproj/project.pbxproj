@@ -13,8 +13,19 @@
 		571400000000000000000012 /* StivKit in Frameworks */ = {isa = PBXBuildFile; productRef = 571400000000000000000011 /* StivKit */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		57140000000000000000001A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 571400000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 571400000000000000000002;
+			remoteInfo = STIV;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		571400000000000000000005 /* STIV.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = STIV.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		571400000000000000000014 /* StivAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = StivAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -41,6 +52,11 @@
 			path = StivApp;
 			sourceTree = "<group>";
 		};
+		571400000000000000000015 /* StivAppTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = StivAppTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -52,6 +68,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		571400000000000000000018 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -59,6 +82,7 @@
 			isa = PBXGroup;
 			children = (
 				571400000000000000000003 /* StivApp */,
+				571400000000000000000015 /* StivAppTests */,
 				571400000000000000000006 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -67,6 +91,7 @@
 			isa = PBXGroup;
 			children = (
 				571400000000000000000005 /* STIV.app */,
+				571400000000000000000014 /* StivAppTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -97,6 +122,33 @@
 			productReference = 571400000000000000000005 /* STIV.app */;
 			productType = "com.apple.product-type.application";
 		};
+/* App-hosted: the bundle is injected into STIV.app and runs inside it, so
+ * `@testable import STIV` reaches the AR adapters and StivKit resolves against
+ * the copy already linked into the app (BUNDLE_LOADER), rather than a second
+ * copy whose types would be distinct at runtime. */
+		571400000000000000000016 /* StivAppTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 57140000000000000000001C /* Build configuration list for PBXNativeTarget "StivAppTests" */;
+			buildPhases = (
+				571400000000000000000017 /* Sources */,
+				571400000000000000000018 /* Frameworks */,
+				571400000000000000000019 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				57140000000000000000001B /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				571400000000000000000015 /* StivAppTests */,
+			);
+			name = StivAppTests;
+			packageProductDependencies = (
+			);
+			productName = StivAppTests;
+			productReference = 571400000000000000000014 /* StivAppTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -110,6 +162,10 @@
 				TargetAttributes = {
 					571400000000000000000002 = {
 						CreatedOnToolsVersion = 16.0;
+					};
+					571400000000000000000016 = {
+						CreatedOnToolsVersion = 16.0;
+						TestTargetID = 571400000000000000000002;
 					};
 				};
 			};
@@ -130,12 +186,20 @@
 			projectRoot = "";
 			targets = (
 				571400000000000000000002 /* STIV */,
+				571400000000000000000016 /* StivAppTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		571400000000000000000009 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		571400000000000000000019 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -153,7 +217,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		571400000000000000000017 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		57140000000000000000001B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 571400000000000000000002 /* STIV */;
+			targetProxy = 57140000000000000000001A /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		57140000000000000000000B /* Debug */ = {
@@ -210,6 +289,8 @@
 		57140000000000000000000E /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -229,6 +310,8 @@
 		57140000000000000000000F /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -242,6 +325,38 @@
 				PRODUCT_NAME = STIV;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		57140000000000000000001D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "org.stiv.app.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/STIV.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/STIV";
+			};
+			name = Debug;
+		};
+		57140000000000000000001E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "org.stiv.app.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/STIV.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/STIV";
 			};
 			name = Release;
 		};
@@ -262,6 +377,15 @@
 			buildConfigurations = (
 				57140000000000000000000E /* Debug */,
 				57140000000000000000000F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		57140000000000000000001C /* Build configuration list for PBXNativeTarget "StivAppTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				57140000000000000000001D /* Debug */,
+				57140000000000000000001E /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

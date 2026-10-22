@@ -22,17 +22,41 @@ struct WaterPlaneScreen: View {
 
     var body: some View {
         ZStack {
-            ARPreview(session: capture.session).ignoresSafeArea()
-            DepthReticle(fraction: 0.125, active: capture.planeSampleCount > 0)
-                .ignoresSafeArea()
+            CameraFeed(session: capture.session) { size in
+                DepthReticle(imageResolution: capture.camera?.imageResolution,
+                             viewportSize: size,
+                             orientation: currentInterfaceOrientation(),
+                             active: capture.planeProgress > 0)
+            }
 
             VStack {
-                TrackingBanner(advice: capture.trackingState.advice)
+                StatusBanners()
                     .padding(.top, 8)
+                if let notice = model.notice { noticeCard(notice) }
                 Spacer()
                 if hasDepth { measuredControls } else { manualControls }
             }
             .padding(16)
+        }
+    }
+
+    /// Something that happened that the user did not ask for -- usually an
+    /// interruption that cost them the section -- and why they are back here.
+    private func noticeCard(_ notice: String) -> some View {
+        OverlayCard {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Text(notice)
+                    .font(.footnote)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                Button {
+                    model.dismissNotice()
+                } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .accessibilityLabel("Dismiss")
+            }
         }
     }
 
@@ -43,16 +67,15 @@ struct WaterPlaneScreen: View {
                     .font(.headline)
 
                 Text(capture.planeGuidance.isEmpty
-                     ? "Aim at the waterline within about 5 m and sweep along it."
+                     ? "Aim the box at the waterline within about 5 m and sweep along it."
                      : capture.planeGuidance)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                ProgressView(
-                    value: Double(min(capture.planeSampleCount,
-                                      WaterPlaneFitter.minimumSamples)),
-                    total: Double(WaterPlaneFitter.minimumSamples))
+                // Time and ground covered, not samples: one frame alone brings
+                // a couple of hundred samples, all from one spot.
+                ProgressView(value: capture.planeProgress, total: 1)
 
                 Toggle(isOn: $onWaterSurface) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -69,8 +92,7 @@ struct WaterPlaneScreen: View {
                 }
 
                 PrimaryButton(title: "Use this water level", systemImage: "checkmark",
-                              enabled: capture.planeSampleCount
-                                        >= WaterPlaneFitter.minimumSamples) {
+                              enabled: capture.planeReady) {
                     model.acceptMeasuredPlane(onWaterSurface: onWaterSurface)
                 }
             }
