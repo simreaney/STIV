@@ -1,0 +1,22 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "iOS: run app in simulator",
+            "detail": "Build STIV, launch it in the newest iPhone simulator (ios/tools/run.sh)",
+            "type": "shell",
+            "command": "${workspaceFolder}/ios/tools/run.sh",
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+        },
+        {
+            "label": "iOS: run app in simulator with logs",
+            "detail": "The same, then stream the app's console output until it quits",
+            "type": "shell",
+            "command": "${workspaceFolder}/ios/tools/run.sh",
+            "args": ["--logs"],
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+        }
+    ]
+}

@@ -101,7 +101,15 @@ open ios/StivApp.xcodeproj
 iPhone, Release builds for the field, and TestFlight.
 
 The simulator cannot run a survey — no camera, no world tracking, no depth —
-but it does run the app's tests, which stand in for all three.
+but it does run the app's tests, which stand in for all three. To look at the
+screens without Xcode:
+
+```bash
+ios/tools/run.sh           # build, then launch in the newest iPhone simulator
+ios/tools/run.sh --logs    # the same, streaming the app's console output
+```
+
+In VS Code the same is *Terminal → Run Task → iOS: run app in simulator*.
 
 ### Testing
 
