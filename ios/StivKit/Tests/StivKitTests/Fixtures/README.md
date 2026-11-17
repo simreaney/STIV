@@ -11,9 +11,10 @@ That writes `golden_sti.f32` and `golden.json` here, and `GoldenFixtureTests`
 and `GoldenAnalysisTests` compare the Swift port against the Python one, mostly
 to ~1e-9:
 
-- `stiv.sti.preprocess`, the STI conditioning;
+- `stiv.sti.preprocess`, the STI conditioning, also on an STI with missing
+  (NaN) samples, which are filled with their column's mean;
 - the structure tensor and the Eq. (14) estimate, with the box window and with
-  the Gaussian one;
+  the Gaussian one, and the histogram-peak estimator on the box field;
 - the window grids of sizes whose step lands on a rounding half (Python's
   `round` goes to even);
 - an STI with featureless windows, which Eq. (14) must leave out
@@ -37,7 +38,7 @@ stage of `stiv/analysis.py` (quality control, the median filter, interpolation,
 the direction check, the frame-step advice) changes.
 
 Sections added after the fixture was first committed -- `gaussian_field`,
-`window_grids` and `analysis` -- are optional: their tests skip, with a message
+`window_grids`, `analysis`, `peak_estimate` and `preprocess_missing` -- are optional: their tests skip, with a message
 naming the missing section, until the fixture is regenerated. To try a new
 fixture before replacing these files, write it elsewhere and point the tests at
 it:

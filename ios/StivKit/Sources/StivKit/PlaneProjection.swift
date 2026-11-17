@@ -17,8 +17,8 @@
 //  where no depth measurement is possible at all.
 //
 //  Deliberately free of `simd` and ARKit so it can be tested against a camera
-//  whose answer is known in closed form; `ARWaterPlaneRectifier` in the app
-//  target is a thin adapter that fills these types in from an `ARFrame`.
+//  whose answer is known in closed form; the app's `ARGeometry.swift` is a thin
+//  adapter that fills these types in from an `ARCamera`.
 
 import Foundation
 
@@ -169,7 +169,7 @@ public struct WaterPlane: Sendable, Equatable {
 /// One instance describes the *reference* pose -- the pose at which the user
 /// picked the cross-section.  Recording does not use it: the search-line sample
 /// points are world points, and each frame projects them through its own pose.
-public struct WaterPlaneProjection: PlaneRectifier, Sendable {
+public struct WaterPlaneProjection: Sendable {
     public let intrinsics: PinholeIntrinsics
     public let pose: CameraPose
     public let plane: WaterPlane
@@ -180,11 +180,14 @@ public struct WaterPlaneProjection: PlaneRectifier, Sendable {
         self.plane = plane
     }
 
+    /// Captured-image dimensions, for the in-frame test.
     public var imageWidth: Int { intrinsics.width }
     public var imageHeight: Int { intrinsics.height }
 
+    /// Height of the camera above the water plane, metres.
     public var cameraHeightM: Double { pose.position.y - plane.y }
 
+    /// Where a pixel's ray meets the water plane, or `nil` if it misses.
     public func imageToWorld(_ px: PixelPoint) -> PlanePoint? {
         // Ray direction in the computer-vision convention (x right, y down,
         // z forward), then into ARKit's camera axes (y up, -z forward).
@@ -216,6 +219,8 @@ public struct WaterPlaneProjection: PlaneRectifier, Sendable {
         return PlanePoint(x: origin.x + t * direction.x, z: origin.z + t * direction.z)
     }
 
+    /// Where a point on the water plane lands in the image, or `nil` if it is
+    /// behind the camera.
     public func worldToImage(_ p: PlanePoint) -> PixelPoint? {
         let camera = pose.toCamera((x: p.x, y: plane.y, z: p.z))
         // Forward is -Z in ARKit's camera space.
@@ -227,11 +232,14 @@ public struct WaterPlaneProjection: PlaneRectifier, Sendable {
         )
     }
 
+    /// Horizontal distance from the camera to a point on the plane, metres.
+    /// Drives the range-dependent term of the scale uncertainty.
     public func horizontalRange(to p: PlanePoint) -> Double {
         let c = pose.position
         return ((p.x - c.x) * (p.x - c.x) + (p.z - c.z) * (p.z - c.z)).squareRoot()
     }
 
+    /// Human-readable summary, as `Rectifier.describe`.
     public func describe() -> String {
         plane.describe(cameraHeightM: cameraHeightM)
     }

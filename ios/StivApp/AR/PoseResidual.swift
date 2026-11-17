@@ -424,9 +424,8 @@ final class PoseResidualChecker {
                     intrinsics: intrinsics,
                     pose: pose)
 
-                guard let template = normalisedTemplate(luma: luma, centre: centre) else {
-                    continue
-                }
+                var template = [Float](repeating: 0, count: Self.side * Self.side)
+                guard Self.normalisedPatch(luma, at: centre, into: &template) else { continue }
                 candidates.append((ReferencePatch(world: world, pixel: centre,
                                                   template: template), variance))
             }
@@ -456,30 +455,37 @@ final class PoseResidualChecker {
         status = PoseCheckStatus()
     }
 
-    /// Cut at the patch's exact sub-pixel centre, not the nearest pixel.  The
-    /// world anchor is back-projected from that exact point, so a template
-    /// rounded to whole pixels would sit up to half a pixel from where its
-    /// anchor projects -- a residual in every frame, with a perfect pose.
-    private func normalisedTemplate(luma: LumaPlane, centre: PixelPoint) -> [Float]? {
-        var values = [Float](repeating: 0, count: Self.side * Self.side)
+    /// The `side`-square patch of `luma` centred on `centre`, normalised to
+    /// zero mean and unit variance, written into `values`.  False if the patch
+    /// leaves the image or is too flat to normalise.
+    ///
+    /// One routine for the reference template and for every candidate it is
+    /// aligned against, so the two are normalised alike.  Cut at the exact
+    /// sub-pixel centre, not the nearest pixel: the world anchor is
+    /// back-projected from that exact point, so a template rounded to whole
+    /// pixels would sit up to half a pixel from where its anchor projects -- a
+    /// residual in every frame, with a perfect pose.  Writes into the caller's
+    /// buffer because alignment calls it dozens of times per patch per check.
+    private static func normalisedPatch(_ luma: LumaPlane, at centre: PixelPoint,
+                                        into values: inout [Float]) -> Bool {
         var sum: Float = 0
         var sumSquares: Float = 0
-        for j in 0..<Self.side {
-            for i in 0..<Self.side {
-                guard let value = luma.sample(u: centre.u - Double(Self.half) + Double(i),
-                                              v: centre.v - Double(Self.half) + Double(j))
-                else { return nil }
-                values[j * Self.side + i] = value
+        for j in 0..<side {
+            for i in 0..<side {
+                guard let value = luma.sample(u: centre.u - Double(half) + Double(i),
+                                              v: centre.v - Double(half) + Double(j))
+                else { return false }
+                values[j * side + i] = value
                 sum += value
                 sumSquares += value * value
             }
         }
-        let n = Float(values.count)
+        let n = Float(side * side)
         let mean = sum / n
         let std = max(sumSquares / n - mean * mean, 0).squareRoot()
-        guard std > 1 else { return nil }
-        for k in values.indices { values[k] = (values[k] - mean) / std }
-        return values
+        guard std > 1 else { return false }
+        for k in 0..<side * side { values[k] = (values[k] - mean) / std }
+        return true
     }
 
     // MARK: - per-frame check
@@ -492,8 +498,11 @@ final class PoseResidualChecker {
     /// previous correction towards the newest.
     @discardableResult
     func check(frame: ARFrame, sectionCentreNow: PixelPoint?) -> PoseCorrection {
-        guard report.enabled, !patches.isEmpty else { return .identity }
         let camera = frame.camera
+        // Before the guard: an unarmed check still has to record that
+        // tracking was lost, since the scale uncertainty depends on it.
+        if !camera.trackingState.isNormal { report.trackingDegraded = true }
+        guard report.enabled, !patches.isEmpty else { return .identity }
         return withLumaPlane(of: frame.capturedImage) { luma in
             check(luma: luma, intrinsics: camera.stivIntrinsics, pose: camera.stivPose,
                   trackingNormal: camera.trackingState.isNormal,
@@ -506,9 +515,9 @@ final class PoseResidualChecker {
     @discardableResult
     func check(luma: LumaPlane, intrinsics: PinholeIntrinsics, pose: CameraPose,
                trackingNormal: Bool, sectionCentreNow: PixelPoint?) -> PoseCorrection {
-        guard report.enabled, !patches.isEmpty else { return .identity }
-
+        // Whether or not the check is armed: see `check(frame:)`.
         if !trackingNormal { report.trackingDegraded = true }
+        guard report.enabled, !patches.isEmpty else { return .identity }
 
         seen += 1
         if seen % frameInterval == 0 {
@@ -635,27 +644,10 @@ final class PoseResidualChecker {
     /// normalised patch of `luma` centred on `centre`.
     private func cost(_ centre: PixelPoint, template: [Float], luma: LumaPlane) -> Double? {
         costEvaluations += 1
-        var sum: Float = 0
-        var sumSquares: Float = 0
-        let side = Self.side
-        for j in 0..<side {
-            for i in 0..<side {
-                guard let value = luma.sample(u: centre.u - Double(Self.half) + Double(i),
-                                              v: centre.v - Double(Self.half) + Double(j))
-                else { return nil }
-                scratch[j * side + i] = value
-                sum += value
-                sumSquares += value * value
-            }
-        }
-        let n = Float(side * side)
-        let mean = sum / n
-        let std = max(sumSquares / n - mean * mean, 0).squareRoot()
-        guard std > 1 else { return nil }
-
+        guard Self.normalisedPatch(luma, at: centre, into: &scratch) else { return nil }
         var total: Float = 0
         for k in 0..<template.count {
-            let d = template[k] - (scratch[k] - mean) / std
+            let d = template[k] - scratch[k]
             total += d * d
         }
         return Double(total)
@@ -742,13 +734,9 @@ final class PoseResidualChecker {
         var model: CorrectionModel
         var inliers: [Int]
         var inlierFraction: Double
-        /// Alignment noise, pixels, from the fit's own residuals, floored.
-        var noisePx: Double
         /// One sigma of the fitted correction's shift at `farFieldDepthM`,
         /// pixels: how far the alignment noise alone could move the river.
         var farFieldUncertaintyPx: Double
-        /// The fitted correction's own shift there, pixels.
-        var farFieldShiftPx: Double
         /// Whether the correction is distinguishable from that noise.
         var significant: Bool
     }
@@ -827,8 +815,7 @@ final class PoseResidualChecker {
                                               intrinsics: intrinsics)
         }
 
-        // Significance: chi-square of the parameters against their covariance,
-        // and the far-field shift against its own uncertainty.
+        // Significance: chi-square of the parameters against their covariance.
         let p = chosen.normal.count
         let delta = (0..<p).map { k in
             k < 3 ? chosen.correction.rotation[k] : chosen.correction.translation[k - 3]
@@ -839,12 +826,11 @@ final class PoseResidualChecker {
         }
         chiSquare /= noise * noise
         let critical = p == 6 ? 22.46 : 16.27   // chi-square, 99.9%, 6 and 3 dof
-        let shift = chosen.correction.shiftPx(intrinsics: intrinsics, depthM: farFieldDepthM)
 
         return CorrectionEstimate(
             correction: chosen.correction, model: model, inliers: inliers,
             inlierFraction: Double(inliers.count) / Double(observations.count),
-            noisePx: noise, farFieldUncertaintyPx: uncertainty, farFieldShiftPx: shift,
+            farFieldUncertaintyPx: uncertainty,
             significant: chiSquare >= critical)
     }
 

@@ -98,6 +98,24 @@ struct Golden: Decodable {
     let gaussian_field: Field?
     let window_grids: [Field]?
     let flat_windows: FlatWindows?
+    let peak_estimate: Estimate?
+    let preprocess_missing: PreprocessMissing?
+
+    /// `preprocess` on the fixture STI with NaN at `cells` and down all of
+    /// `column`, once per settings in `runs`.
+    struct PreprocessMissing: Decodable {
+        struct Run: Decodable {
+            let settings: Preprocess.Settings
+            let mean: Double
+            let std: Double
+            let min: Double
+            let max: Double
+            let probes: [Preprocess.Cell]
+        }
+        let cells: [[Int]]
+        let column: Int
+        let runs: [Run]
+    }
 
     struct FlatWindows: Decodable {
         let flat_cols: Int
@@ -417,5 +435,62 @@ final class GoldenFixtureTests: XCTestCase {
         XCTAssertEqual(estimate.meanCoherency, expected.mean_coherency, accuracy: 1e-9)
         XCTAssertEqual(estimate.usedCount, expected.n_used)
         XCTAssertEqual(estimate.histogram, expected.hist)
+    }
+
+    /// The histogram-peak estimator, the app's other "Angle estimator".  Its
+    /// parabolic sub-bin step is a sign away from moving phi by up to two bins
+    /// -- several per cent of the velocity -- which the synthetic-slope
+    /// tolerances in OrientationTests cannot see.
+    func testPeakEstimatorMatchesThePython() throws {
+        let (golden, sti) = try skipUnlessPresent()
+        let want = try Golden.require(golden.peak_estimate, "peak_estimate")
+        let estimate = try meanOrientationAngle(
+            field: try rebuildField(golden, sti),
+            phiMin: golden.parameters.phi_min,
+            phiMax: golden.parameters.phi_max,
+            coherencyLevels: golden.parameters.coherency_levels,
+            binCount: golden.parameters.n_bins,
+            minCoherency: golden.parameters.min_coherency,
+            estimator: .peak)
+        XCTAssertEqual(estimate.phi, want.phi, accuracy: 1e-9)
+        XCTAssertEqual(estimate.tanPhi, want.tan_phi, accuracy: 1e-9)
+        XCTAssertEqual(estimate.phiStd, want.phi_std, accuracy: 1e-9)
+        XCTAssertEqual(estimate.usedCount, want.n_used)
+        XCTAssertEqual(estimate.histogram, want.hist)
+    }
+
+    /// Samples that left the frame: every search line touching the frame edge
+    /// has them.  The first run conditions with every other stage off, so its
+    /// output is the fill itself -- a scattered gap takes its column's mean, an
+    /// all-NaN column the grand mean; the second is the pipeline as run.
+    func testMissingSamplesAreFilledAsInThePython() throws {
+        let (golden, sti) = try skipUnlessPresent()
+        let want = try Golden.require(golden.preprocess_missing, "preprocess_missing")
+        var holed = sti
+        for cell in want.cells { holed[cell[0], cell[1]] = .nan }
+        for r in 0..<sti.rows { holed[r, want.column] = .nan }
+        XCTAssertFalse(want.runs.isEmpty)
+
+        for run in want.runs {
+            XCTAssertFalse(run.settings.clahe, "the Swift port has no CLAHE")
+            var settings = StiSettings()
+            settings.removeStaticBackground = run.settings.remove_static_background
+            settings.normalise = run.settings.normalise
+            settings.smoothSigma = run.settings.smooth_sigma
+            let got = StivKit.preprocess(holed, settings: settings)
+            let label = "background \(run.settings.remove_static_background), "
+                + "sigma \(run.settings.smooth_sigma)"
+
+            XCTAssertFalse(got.data.contains { !$0.isFinite }, label)
+            let (mean, std) = meanAndStd(got.data)
+            XCTAssertEqual(mean, run.mean, accuracy: 1e-9, label)
+            XCTAssertEqual(std, run.std, accuracy: 1e-9, label)
+            XCTAssertEqual(got.data.min() ?? .nan, run.min, accuracy: 1e-9, label)
+            XCTAssertEqual(got.data.max() ?? .nan, run.max, accuracy: 1e-9, label)
+            for cell in run.probes {
+                XCTAssertEqual(got[cell.r, cell.c], cell.value, accuracy: 1e-9,
+                               "\(label): cell (\(cell.r), \(cell.c))")
+            }
+        }
     }
 }

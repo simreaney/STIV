@@ -1,0 +1,3 @@
+# Commit notebooks without run outputs or per-machine metadata.  Needs a
+# one-time `git config` per clone -- see tools/strip_notebooks.py.
+*.ipynb filter=strip-notebook

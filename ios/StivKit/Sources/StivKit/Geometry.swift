@@ -4,11 +4,12 @@
 //  A port of the section-building half of `stiv/geometry.py`.  The rectifiers
 //  themselves do not come across: `ScaleRectifier` assumes a nadir view a
 //  handheld phone never has, and `HomographyRectifier` needs surveyed ground
-//  control points the whole design exists to avoid.  Both are replaced by a
-//  single `PlaneRectifier` protocol -- ray/plane intersection against the
-//  gravity-aligned water surface -- whose ARKit implementation lives in the app
-//  target.  Keeping the protocol here means the section layout can be tested
-//  against a synthetic pinhole camera with a closed-form answer.
+//  control points the whole design exists to avoid.  Both are replaced by
+//  `WaterPlaneProjection` (`PlaneProjection.swift`) -- ray/plane intersection
+//  against the gravity-aligned water surface.  It is plain arithmetic on
+//  pinhole intrinsics and a pose, with no ARKit in it, so the section layout
+//  is tested against a synthetic camera with a closed-form answer; the app
+//  only fills it in from an `ARCamera`.
 //
 //  Two coordinate systems, as in the Python:
 //
@@ -26,46 +27,6 @@ public struct PixelPoint: Sendable, Equatable {
     public var u: Double
     public var v: Double
     public init(u: Double, v: Double) { self.u = u; self.v = v }
-}
-
-/// Bidirectional mapping between captured-image pixels and world metres on the
-/// water plane.
-///
-/// `Sendable` because a rectifier describes one fixed camera pose and plane:
-/// it is a value to be handed to the analysis queue, not shared mutable state.
-public protocol PlaneRectifier: Sendable {
-    /// Where a pixel's ray meets the water plane, or `nil` if it misses (the
-    /// ray points at the sky, or above the horizon).
-    func imageToWorld(_ px: PixelPoint) -> PlanePoint?
-    /// Where a point on the water plane lands in the image, or `nil` if it is
-    /// behind the camera.
-    func worldToImage(_ p: PlanePoint) -> PixelPoint?
-    /// Captured-image dimensions, for the in-frame test.
-    var imageWidth: Int { get }
-    var imageHeight: Int { get }
-    /// Horizontal distance from the camera to a point on the plane, metres.
-    /// Drives the range-dependent term of the scale uncertainty.
-    func horizontalRange(to p: PlanePoint) -> Double
-    /// Height of the camera above the water plane, metres.
-    var cameraHeightM: Double { get }
-    /// Human-readable summary, as `Rectifier.describe`.
-    func describe() -> String
-}
-
-public extension PlaneRectifier {
-    /// Local ground sample distance (metres per pixel) at an image point, by
-    /// finite difference -- the same trick as
-    /// `HomographyRectifier._local_scale`.
-    ///
-    /// Useful for reporting: in an oblique view this varies by an order of
-    /// magnitude between the near and far bank, which is precisely why the
-    /// samples along a search line are spaced in world metres and not pixels.
-    func localScale(at px: PixelPoint) -> Double? {
-        guard let a = imageToWorld(px),
-              let b = imageToWorld(PixelPoint(u: px.u + 1, v: px.v)),
-              let c = imageToWorld(PixelPoint(u: px.u, v: px.v + 1)) else { return nil }
-        return 0.5 * (distance(a, b) + distance(a, c))
-    }
 }
 
 // MARK: - plane vector helpers
@@ -214,7 +175,7 @@ let uniformScaleTolerance = 1e-6
 /// at `scaleProbes` points with a step of a thousandth of the length.
 /// Probes the rectifier cannot project (behind the camera) are skipped; `nil`
 /// if none can be.
-func maxPixelsPerMetre(rectifier: PlaneRectifier, from a: PlanePoint, to b: PlanePoint) -> Double? {
+func maxPixelsPerMetre(rectifier: WaterPlaneProjection, from a: PlanePoint, to b: PlanePoint) -> Double? {
     let length = distance(a, b)
     guard length > 0, length.isFinite else { return nil }
     let u = PlaneVector(x: (b.x - a.x) / length, z: (b.z - a.z) / length)
@@ -250,7 +211,7 @@ func maxPixelsPerMetre(rectifier: PlaneRectifier, from a: PlanePoint, to b: Plan
 /// derivative cannot flip a count that sits on a half.
 ///
 /// `nil` when the endpoints do not project, for the caller to fall back on.
-func defaultSampleCount(rectifier: PlaneRectifier, from a: PlanePoint, to b: PlanePoint) -> Int? {
+func defaultSampleCount(rectifier: WaterPlaneProjection, from a: PlanePoint, to b: PlanePoint) -> Int? {
     guard let pa = rectifier.worldToImage(a), let pb = rectifier.worldToImage(b) else { return nil }
     let spanMean = ((pa.u - pb.u) * (pa.u - pb.u) + (pa.v - pb.v) * (pa.v - pb.v)).squareRoot()
     guard spanMean.isFinite else { return nil }
@@ -271,7 +232,7 @@ func defaultSampleCount(rectifier: PlaneRectifier, from a: PlanePoint, to b: Pla
 /// the image obliqueness"; sampling through the rectifier removes that caveat.
 public func buildSection(
     survey: Survey,
-    rectifier: PlaneRectifier,
+    rectifier: WaterPlaneProjection,
     inFrameMargin: Int = 2
 ) throws -> SectionLayout {
     let section = survey.section

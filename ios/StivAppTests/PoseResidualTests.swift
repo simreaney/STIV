@@ -138,6 +138,21 @@ final class PoseResidualTests: XCTestCase {
                           "a correct pose was 'corrected' by \(report.maxCorrectionPx) px")
     }
 
+    /// Tracking loss is recorded whether or not the check is armed.  It is
+    /// unarmed with no LiDAR, from too high, or over a textureless bank --
+    /// when the pose is least checked, and the scale term most needs to know.
+    func testTrackingLossIsRecordedWhenTheCheckIsUnarmed() throws {
+        let checker = PoseResidualChecker()
+        XCTAssertFalse(checker.report.enabled)
+        let correction = try XCTUnwrap(withLumaPlane(of: greyFrame) { luma in
+            checker.check(luma: luma, intrinsics: intrinsics, pose: sway(0),
+                          trackingNormal: false, sectionCentreNow: nil)
+        })
+        XCTAssertEqual(correction, .identity)
+        XCTAssertTrue(checker.report.trackingDegraded)
+        XCTAssertFalse(checker.report.enabled, "noting the tracking state must not arm the check")
+    }
+
     func testAPoseErrorIsMeasuredAndUndone() throws {
         let result = try replay { yawedInCameraFrame($0, radians: self.twoPixelYaw) }
         let report = result.checker.report

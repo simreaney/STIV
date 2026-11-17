@@ -14,26 +14,13 @@ import Foundation
 import StivKit
 import UIKit
 
-enum SurveyStep: Int, CaseIterable, Comparable {
+enum SurveyStep: CaseIterable {
     case welcome
     case waterPlane
     case section
     case settings
     case record
     case results
-
-    static func < (a: SurveyStep, b: SurveyStep) -> Bool { a.rawValue < b.rawValue }
-
-    var title: String {
-        switch self {
-        case .welcome:    return "Start"
-        case .waterPlane: return "Water level"
-        case .section:    return "Cross-section"
-        case .settings:   return "Settings"
-        case .record:     return "Record"
-        case .results:    return "Results"
-        }
-    }
 
     /// The steps with the camera running and the world frame in use.
     var usesCamera: Bool {
@@ -50,7 +37,6 @@ enum PickTarget: Equatable {
     case sectionEnd
     case downstream
     case waterOutline
-    case done
 
     var prompt: String {
         switch self {
@@ -63,8 +49,6 @@ enum PickTarget: Equatable {
         case .waterOutline:
             return "Optional: tap around the water to outline it. This keeps the "
                  + "camera-motion check off the moving surface."
-        case .done:
-            return "Section set."
         }
     }
 }
@@ -142,6 +126,9 @@ final class SurveyModel: ObservableObject {
     /// retuning `frame_step` means another pass over the video.
     private var recording: CompletedRecording?
     private var bridge: DesktopBridge?
+    /// Where this recording's results are saved: a folder of its own in the
+    /// app's Documents, named for when it started.  See `exportFiles`.
+    private(set) var exportDirectory: URL?
     /// Increments per recording, and when an interruption abandons one, so a
     /// recording handed back after its run was abandoned is dropped.
     private var recordingRun = 0
@@ -171,7 +158,13 @@ final class SurveyModel: ObservableObject {
 
     // MARK: - navigation
 
-    func begin() {
+    func begin() { startCamera() }
+
+    /// Start the camera on a fresh world frame and measure the water level:
+    /// the way into every session -- the first, Results -> New, a retry, the
+    /// end of an interruption.  The rate is re-read each time because the
+    /// next recording is planned at the new session's video format.
+    private func startCamera() {
         capture.start()
         survey.capture.framesPerSecond = capture.nominalFrameRate
         go(to: .waterPlane)
@@ -207,9 +200,7 @@ final class SurveyModel: ObservableObject {
         result = nil
         analysisError = nil
         notice = nil
-        capture.start()
-        survey.capture.framesPerSecond = capture.nominalFrameRate
-        go(to: .waterPlane)
+        startCamera()
     }
 
     /// Back to the water level from a later screen.
@@ -291,8 +282,7 @@ final class SurveyModel: ObservableObject {
         case .interruptionEnded:
             guard awaitingRestart else { return }
             awaitingRestart = false
-            capture.start()
-            go(to: .waterPlane)
+            startCamera()
 
         case .failed(let wasRecording):
             guard step.usesCamera else { return }
@@ -315,9 +305,7 @@ final class SurveyModel: ObservableObject {
     func retryCapture() {
         forgetWorld()
         notice = nil
-        capture.start()
-        survey.capture.framesPerSecond = capture.nominalFrameRate
-        go(to: .waterPlane)
+        startCamera()
     }
 
     func dismissNotice() { notice = nil }
@@ -386,8 +374,6 @@ final class SurveyModel: ObservableObject {
         case .waterOutline:
             // The outline does not touch the layout: nothing to rebuild.
             waterPolygon.append(world)
-        case .done:
-            break
         }
     }
 
@@ -403,7 +389,7 @@ final class SurveyModel: ObservableObject {
             pickTarget = .sectionEnd
         case .waterOutline where !waterPolygon.isEmpty:
             waterPolygon.removeLast()
-        case .waterOutline, .done:
+        case .waterOutline:
             downstream = nil
             waterPolygon.removeAll()
             pickTarget = .downstream
@@ -598,6 +584,11 @@ final class SurveyModel: ObservableObject {
         recording = nil
         result = nil
         analysisError = nil
+        let stamp = DateFormatter()
+        stamp.locale = Locale(identifier: "en_US_POSIX")
+        stamp.dateFormat = "yyyy-MM-dd-HHmmss"
+        exportDirectory = URL.documentsDirectory
+            .appendingPathComponent("stiv-\(stamp.string(from: Date()))", isDirectory: true)
 
         capture.startRecording(plan: plan,
                                waterPolygon: polygon.count >= 3 ? polygon : nil)
@@ -698,6 +689,10 @@ final class SurveyModel: ObservableObject {
                     switch outcome {
                     case .success(let result):
                         self.result = result
+                        // Saved now rather than on Share: until it is on disk
+                        // the measurement lives only in this process, which
+                        // iOS may end whenever the app is in the background.
+                        self.exportFiles()
                     case .failure(let error):
                         // Keep the last good result on screen: it is still a
                         // true answer at its own frame step, and the retune
@@ -752,13 +747,16 @@ final class SurveyModel: ObservableObject {
             controlPoints: projection.controlPoints())
     }
 
-    /// Write the three export artefacts to a temporary directory and return
-    /// their URLs for the share sheet.
+    /// Write the export artefacts for the result on screen into this
+    /// recording's folder in Documents -- in the Files app, under On My
+    /// iPhone > STIV -- and return their URLs for the share sheet.
+    ///
+    /// Run after every successful analysis, so a retune at another frame step
+    /// overwrites this recording's files rather than adding a folder; Share
+    /// runs it again and shares exactly those files.
+    @discardableResult
     func exportFiles() -> [URL] {
-        guard let result else { return [] }
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("stiv-\(Int(Date().timeIntervalSince1970))",
-                                    isDirectory: true)
+        guard let result, let directory = exportDirectory else { return [] }
         var urls: [URL] = []
         do {
             try FileManager.default.createDirectory(at: directory,

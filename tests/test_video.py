@@ -16,7 +16,7 @@ from stiv import video as video_mod
 from stiv.config import ConfigError, VideoConfig
 from stiv.geometry import SearchLine
 from stiv.sti import StiCollector
-from stiv.video import FrameSource, VideoInfo, check_frame_timing, probe
+from stiv.video import FrameSource, VideoInfo, check_frame_timing, probe, read_frame_at
 
 W, H = 64, 48
 FPS = 30.0
@@ -125,6 +125,14 @@ class TestFrameRate:
         src = FrameSource(VideoConfig(path=str(clip), fps_override=25.0))
         assert src.st_s_per_px == pytest.approx(1 / 25.0)
 
+    def test_start_s_is_on_the_files_clock_under_an_override(self, clip):
+        """The pickers show the frame at start_s by the file's own clock, and
+        the stabiliser measures drift from the first analysed frame, so the
+        two must be the same frame whatever rate the analysis assumes."""
+        shown = _index_of(read_frame_at(clip, 0.3))
+        src = FrameSource(VideoConfig(path=str(clip), start_s=0.3, fps_override=60.0))
+        assert _read_all(src)[0] == shown == 9
+
 
 class TestUnknownFrameCount:
     def test_raw_stream_is_read_to_its_end(self, raw_stream):
@@ -133,7 +141,6 @@ class TestUnknownFrameCount:
 
         src = FrameSource(VideoConfig(path=str(raw_stream), fps_override=30.0))
         assert src.n_frames is None
-        assert src.duration_s is None
         assert _read_all(src) == list(range(20))
         assert src.n_frames == 20                      # known once read
         assert src.warnings == []                      # reaching the end is no surprise
@@ -147,9 +154,8 @@ class TestUnknownFrameCount:
         n = 40
         line = SearchLine(
             index=0, station_m=0.0, centre_world=np.zeros(2), centre_px=np.zeros(2),
-            direction_world=np.array([1.0, 0.0]),
             samples_px=np.column_stack([np.arange(n, dtype=float), np.full(n, 5.0)]),
-            samples_world=np.zeros((n, 2)), sx_m_per_px=0.02, length_m=0.78,
+            samples_world=np.zeros((n, 2)), sx_m_per_px=0.02,
         )
         col = StiCollector([line], None, 1 / 30)
         assert col.buffer is None

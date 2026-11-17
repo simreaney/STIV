@@ -58,6 +58,14 @@
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 
+	<!-- Every result is saved to Documents, one folder per recording; these two
+	     make that folder appear in the Files app, under On My iPhone > STIV,
+	     so a measurement can be found again without having been shared. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

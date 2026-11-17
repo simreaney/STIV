@@ -104,19 +104,6 @@ def _write_manifest(out: Path, written: list[Path]) -> None:
     )
 
 
-def reported_velocities(result: StivResult) -> np.ndarray:
-    """The velocity profile as reported: measured and interpolated stations.
-
-    A station that failed quality control and was *not* interpolated (that is,
-    ``quality.interpolate_flagged: false``) is NaN here whatever value it still
-    carries, so no summary statistic is ever taken over a rejected estimate.
-    """
-    return np.array([
-        s.velocity_ms if (not s.failed or "interpolated" in s.flags) else math.nan
-        for s in result.stations
-    ], dtype=float)
-
-
 def _json_safe(obj: Any) -> Any:
     """Make ``obj`` strict JSON: NaN and infinities become null."""
     if isinstance(obj, dict):
@@ -170,7 +157,7 @@ def _write_all(result: StivResult, cfg: Config, out: Path, written: list[Path]) 
     _done(out / "report.txt").write_text(result.summary() + "\n", encoding="utf-8")
     cfg.dump_yaml(_done(out / "config_used.yaml"))
 
-    v = reported_velocities(result)
+    v = result.velocities
     finite = v[np.isfinite(v)]
     summary = {
         "version": __version__,

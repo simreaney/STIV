@@ -54,6 +54,8 @@ class VideoConfig:
     """
 
     path: str = ""
+    #: Seconds into the file by its own clock -- the time the pickers show --
+    #: even when ``fps_override`` sets a different recording rate.
     start_s: float = 0.0
     duration_s: Optional[float] = None
     frame_step: int = 1
@@ -108,8 +110,6 @@ class RectifyConfig:
         if self.altitude_m is None:
             return None
         if self.hfov_deg is not None:
-            import math
-
             ground_width = 2.0 * self.altitude_m * math.tan(math.radians(self.hfov_deg) / 2.0)
             return ground_width / image_width_px
         if self.sensor_width_mm is not None and self.focal_length_mm is not None:

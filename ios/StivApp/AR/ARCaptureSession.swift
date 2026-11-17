@@ -288,6 +288,19 @@ final class ARCaptureSession: NSObject, ObservableObject {
         }
 
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+
+        // The published camera and tracking state describe the world frame
+        // just reset, and a manual water level taken from them would sit in
+        // the wrong one.  Forget them until the new session delivers a frame:
+        // through the frame queue, behind any frame of the old session still
+        // waiting there, so none of those can publish after this.
+        frameQueue.async {
+            self.publish {
+                $0.camera = nil
+                $0.trackingState = .notAvailable
+                $0.depthAvailable = false
+            }
+        }
     }
 
     /// Stop the camera, LiDAR and tracking: nothing needs them while the
@@ -354,7 +367,9 @@ final class ARCaptureSession: NSObject, ObservableObject {
     /// The fallback for devices with no depth sensor: the user's own estimate of
     /// how far the camera is above the water.  Same geometry, worse provenance.
     func acceptManualPlane(cameraHeightAboveWater: Double) -> WaterPlane? {
-        guard let camera else { return nil }
+        // A limited pose's height is not to be trusted with every metre that
+        // follows; the button says the same, but this is the decision.
+        guard let camera, trackingState.isNormal else { return nil }
         let plane = WaterPlaneFitter.manual(
             cameraHeightAboveWater: cameraHeightAboveWater,
             cameraWorldY: Double(camera.transform.columns.3.y))
@@ -512,11 +527,16 @@ extension ARCaptureSession: ARSessionDelegate {
 
         switch queuePhase {
         case .fittingPlane:
-            fitter.add(frame: frame)
+            // Only frames whose pose ARKit vouches for: a limited or
+            // relocalising pose puts every return at the wrong height, and the
+            // fit would keep them.  The tracking banner says why it paused.
+            if trackingState.isNormal { fitter.add(frame: frame) }
             if refreshUI {
                 let progress = fitter.progress
                 let ready = fitter.isReady
-                let guidance = fitter.guidance()
+                let guidance = trackingState.isNormal ? fitter.guidance()
+                    : "Waiting for tracking: the water level is measured only while "
+                    + "ARKit trusts its pose."
                 publish {
                     $0.planeProgress = progress
                     $0.planeReady = ready

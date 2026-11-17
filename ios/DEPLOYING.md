@@ -205,10 +205,11 @@ TestFlight builds expire after 90 days.
 - **Charge the phone, and keep it out of the sun between runs.** The camera,
   LiDAR and world tracking together are hard work, and a hot phone delivers
   fewer frames.
-- **Share every result before moving on.** Nothing is saved on the phone.
-  On the Results screen, tap the share button (□↑) and AirDrop the files to a
-  Mac, save them to *Files*, or email them. Do this before tapping *New*,
-  starting another recording, or leaving the app.
+- **Know where the results go.** Every result is saved on the phone as soon as
+  it appears, one folder per recording, in *Files → On My iPhone → STIV*; a
+  retune overwrites that recording's files. They go if the app is deleted, so
+  copy them off at the end of the day: the share button (□↑) on the Results
+  screen AirDrops or emails the same files.
 - **Do the null test first**, at each new site. The protocol is in
   [TESTING.md](TESTING.md#4-in-the-field).
 

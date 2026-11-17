@@ -174,7 +174,6 @@ public enum AngleEstimator: String, Codable, Sendable {
 /// Raised when an STI cannot support the requested analysis geometry.
 public enum OrientationError: Error, CustomStringConvertible {
     case stiTooSmall(rows: Int, cols: Int, windowPx: Int, order: Int)
-    case noWindowsFit(windowPx: Int)
     case badAngleRange(min: Double, max: Double)
     /// A parameter no analysis can run with -- a window of no pixels, a NaN
     /// overlap, an empty histogram.  Thrown rather than trapped: these reach
@@ -187,8 +186,6 @@ public enum OrientationError: Error, CustomStringConvertible {
             return "STI of shape \(rows)x\(cols) is too small for a \(windowPx)px window "
                  + "with an order-\(order) gradient; use more frames, a longer search "
                  + "line, or a smaller windowPx"
-        case let .noWindowsFit(windowPx):
-            return "no valid local windows fit inside the STI; reduce windowPx (\(windowPx))"
         case let .badAngleRange(min, max):
             return "need finite phiMin < phiMax, got \(min) and \(max)"
         case let .invalidParameter(message):
@@ -293,12 +290,11 @@ public func structureTensorField(
             rows: nt, cols: nx, windowPx: windowPx, order: gradientOrder.rawValue)
     }
 
+    // Neither is empty: the guard above leaves `margin < n - margin`, so the
+    // first window always fits.
     let step = windowStep(windowPx: windowPx, overlap: overlap)
     let rowsIdx = Array(stride(from: margin, to: nt - margin, by: step))
     let colsIdx = Array(stride(from: margin, to: nx - margin, by: step))
-    guard !rowsIdx.isEmpty, !colsIdx.isEmpty else {
-        throw OrientationError.noWindowsFit(windowPx: windowPx)
-    }
 
     // x is the space axis (columns); t is the time axis (rows).
     let gx = centralDifference(sti, axis: .space, order: gradientOrder)

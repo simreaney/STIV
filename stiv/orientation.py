@@ -61,10 +61,6 @@ class OrientationField:
     centres_t: np.ndarray     # STI row index of each window centre
     centres_x: np.ndarray     # STI column index of each window centre
 
-    @property
-    def n_windows(self) -> int:
-        return int(self.phi.size)
-
 
 @dataclass
 class AngleEstimate:

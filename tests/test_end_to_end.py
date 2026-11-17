@@ -118,6 +118,26 @@ class TestFixedCamera:
         measured = sum(1 for st in res.stations if not st.failed)
         assert measured > 0.5 * len(res.stations)
 
+    def test_reversed_flow_reports_the_corrected_direction(self, clean_clip):
+        """Once the stations are mirrored, everything else must follow them:
+        the bearing and the overview arrow pointed upstream, and the stored
+        estimates (the STI detail figure) had the opposite sign to the
+        velocities reported."""
+        river, video, d = clean_clip
+        forward = analyse(river, video, d / "fwd_dir")
+        reversed_ = analyse(river, video, d / "rev_dir", flow={"reverse": True})
+
+        turn = reversed_.geometry.flow_bearing_deg - forward.geometry.flow_bearing_deg
+        assert abs((turn + 180.0) % 360.0 - 180.0) < 1.0
+        assert np.allclose(reversed_.geometry.flow_dir_world, forward.geometry.flow_dir_world)
+        n_checked = 0
+        for st, est in zip(reversed_.stations, reversed_.estimates):
+            if est is not None and np.isfinite(est.phi) and np.isfinite(st.velocity_raw_ms):
+                assert np.sign(est.phi) == np.sign(st.velocity_raw_ms)
+                assert est.phi_min <= est.phi <= est.phi_max
+                n_checked += 1
+        assert n_checked > 0.5 * len(reversed_.stations)
+
     def test_frame_step_does_not_change_the_answer(self, clean_clip):
         """tan(phi) doubles with frame_step, but Sx/St halves, so U is invariant.
 

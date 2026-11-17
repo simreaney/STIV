@@ -143,13 +143,15 @@ layer proves, what it cannot, and the field protocol.
   measurement, in any implementation.
 - **Rolling shutter.** In an oblique view a search line spans image rows, each
   read at a slightly different time, which tilts streaks and biases `φ`. iOS
-  exposes no readout-time API; `CaptureSettings.rollingShutterRowSeconds` is
-  there to be calibrated, and defaults to off.
+  exposes no readout-time API, so it is not corrected; the null test in
+  [TESTING.md](TESTING.md#4-in-the-field) is how to see whether it matters.
 
 ## Exports
 
 `velocity.csv`, `summary.json`, `report.txt` — columns matching the desktop's —
-and `survey.yaml`, which expresses the run as a `stiv.Config`. The phone's
+and `survey.yaml`, which expresses the run as a `stiv.Config`. They are saved
+as soon as each analysis finishes, in a folder per recording that the Files app
+shows under *On My iPhone → STIV*, and the share button sends the same files. The phone's
 ray–plane mapping is a plane-to-plane projective map, which is exactly what
 `stiv.geometry.HomographyRectifier` fits, so it exports losslessly as ground
 control points. Fill in `video.path` with footage of the same section and

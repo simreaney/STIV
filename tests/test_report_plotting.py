@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 from stiv import Config, plotting, run
-from stiv.report import MANIFEST, clear_outputs, reported_velocities, write_outputs
+from stiv.report import MANIFEST, clear_outputs, write_outputs
 from stiv.synthetic import SyntheticRiver, make_config, render
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -143,14 +143,13 @@ class TestSummaryJson:
         raw, result = base
         res = _clean(result)
         # A failed, non-interpolated station: its raw value must not leak into
-        # mean or max, whether or not the analysis has already blanked it.
+        # mean or max.
         _fail(res, 3, interpolated=False, raw_value=99.0)
-        res.stations[3].velocity_ms = 99.0          # the pre-blanking behaviour
         out = tmp_path / "out"
         write_outputs(res, _cfg(raw, out, output={"save_diagnostics": False,
                                                   "save_sti_images": False}))
         s = _strict_json(out / "summary.json")
-        v = reported_velocities(res)
+        v = res.velocities
         assert math.isnan(v[3])
         assert s["max_surface_velocity_ms"] == pytest.approx(np.nanmax(v))
         assert s["max_surface_velocity_ms"] < 99.0

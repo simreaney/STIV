@@ -24,6 +24,7 @@ from .config import (
     FRAME_STEP_SPEEDS_MS,
     Config,
     ConfigError,
+    RectifyConfig,
     SectionConfig,
     default_duration_s,
     path_for_config,
@@ -86,10 +87,9 @@ def cmd_info(args) -> int:
     print(f"  video.duration_s      {default_duration_s(info.duration_s):.1f}   "
           f"(20-40 s of steady hover is plenty; the paper used 30 s)")
     if args.altitude_m and args.hfov_deg:
-        import math
-
-        gw = 2 * args.altitude_m * math.tan(math.radians(args.hfov_deg) / 2)
-        gsd = gw / info.width
+        rect = RectifyConfig(altitude_m=args.altitude_m, hfov_deg=args.hfov_deg)
+        gsd = rect.resolve_m_per_px(info.width)
+        gw = gsd * info.width
         print(f"  rectify.m_per_px      {gsd:.4f}   "
               f"(from {args.altitude_m} m altitude, {args.hfov_deg} deg HFOV; "
               f"ground width {gw:.1f} m)")

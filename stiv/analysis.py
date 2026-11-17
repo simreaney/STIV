@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Sequence
 
 import numpy as np
@@ -303,7 +303,14 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
 
     # Direction first: it can replace every station's estimate, and quality
     # control must judge the estimates that are actually going to be reported.
-    _direction_check(cfg, stations, stis, fields, estimates, warnings)
+    if _direction_check(cfg, stations, stis, fields, estimates, warnings):
+        # The stations now report the flow as running the other way along the
+        # search lines, so the direction reported and drawn follows them.  The
+        # lines themselves are already laid out and sampled, and nothing reads
+        # this back to lay them out again.
+        geom.flow_dir_world = -geom.flow_dir_world
+        bearing = geom.flow_bearing_deg + 180.0
+        geom.flow_bearing_deg = bearing - 360.0 if bearing > 180.0 else bearing
     _quality_control(cfg, stations, warnings)
     _range_advice(cfg, stations, source, warnings)
     warnings.extend(stab_report.warnings())
@@ -367,8 +374,8 @@ def _rectification_warnings(geom: SectionGeometry, warnings: list[str]) -> None:
     tolerance_m = rect.inlier_threshold_m
     if rect.rmse_m > tolerance_m:
         warnings.append(
-            f"the ground control points fit to {rect.rmse_m:.3f} m RMSE, worse "
-            f"than the {tolerance_m:.3f} m expected of {geometry._RANSAC_PX:.0f}-pixel "
+            f"the {rect.n_inliers} inlier ground control points fit to {rect.rmse_m:.3f} m "
+            f"RMSE, worse than the {tolerance_m:.3f} m expected of {geometry._RANSAC_PX:.0f}-pixel "
             f"clicking accuracy; every velocity scales linearly with this error. "
             f"Re-check the survey coordinates and the clicked pixels."
         )
@@ -450,7 +457,6 @@ def _estimate_angle(
 
 
 def _apply_estimate(
-    cfg: Config,
     st: StationResult,
     s: SpaceTimeImage,
     est: Optional[AngleEstimate],
@@ -557,7 +563,7 @@ def _analyse_stis(
             s.data = conditioned.astype(np.float32)
         del conditioned
 
-        _apply_estimate(cfg, st, s, est)
+        _apply_estimate(st, s, est)
 
         if s.out_of_frame_fraction > _MAX_OUT_OF_FRAME_FRACTION:
             st.add_flag("out_of_frame")
@@ -767,8 +773,11 @@ def _direction_check(
     fields: list[Optional[OrientationField]],
     estimates: list[Optional[AngleEstimate]],
     warnings: list[str],
-) -> None:
+) -> bool:
     """Detect and, if allowed, correct search lines that point upstream.
+
+    Returns True when the stations were re-analysed with the range mirrored,
+    i.e. when the flow is now reported as running against the search lines.
 
     Simply negating the velocities would not be enough.  ``velocity_range_ms``
     is nearly always asymmetric -- something like [-0.5, 5] -- so if the lines
@@ -801,13 +810,13 @@ def _direction_check(
                 orientation.velocity_from_angle(est.phi, s.sx_m_per_px, s.st_s_per_px)
             )
     if not probe:
-        return
+        return False
 
     # Upper median for an even count, matching StivKit's `directionCheck` so
     # the two implementations decide identically on the same input.
     med = float(sorted(probe)[len(probe) // 2])
     if med >= 0:
-        return
+        return False
 
     msg = (
         f"the median velocity along the search lines is {med:.3f} m/s, i.e. the "
@@ -816,7 +825,7 @@ def _direction_check(
     advice = _reverse_advice(cfg.flow)
     if not cfg.flow.auto_flip:
         warnings.append(f"{msg}; {advice}.")
-        return
+        return False
 
     v_lo, v_hi = cfg.stiv.velocity_range_ms
     structural = {"sti_too_small", "out_of_frame"}
@@ -829,14 +838,21 @@ def _direction_check(
         # pass.  Drop them so that quality control -- which runs after this,
         # once -- judges only the estimate that will actually be reported.
         st.flags = [f for f in st.flags if f in structural]
-        _apply_estimate(cfg, st, s, est, negate=True)
-        estimates[st.index] = est
+        _apply_estimate(st, s, est, negate=True)
+        # Kept mirrored too, so the STI detail figure draws the angle, the
+        # histogram and the search range of the velocity the station reports.
+        estimates[st.index] = replace(
+            est, phi=-est.phi, tan_phi=-est.tan_phi,
+            hist=est.hist[::-1], bin_centres=-est.bin_centres[::-1],
+            phi_min=-est.phi_max, phi_max=-est.phi_min,
+        )
 
     warnings.append(
         f"{msg}; the search range was mirrored and the stations re-analysed "
         f"(flow.auto_flip). To point the search lines the right way in the "
         f"first place, {advice}."
     )
+    return True
 
 
 def _range_advice(

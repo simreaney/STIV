@@ -50,10 +50,6 @@ class SpaceTimeImage:
     out_of_frame_fraction: float = 0.0
 
     @property
-    def shape(self) -> tuple[int, int]:
-        return self.data.shape
-
-    @property
     def duration_s(self) -> float:
         return self.data.shape[0] * self.st_s_per_px
 

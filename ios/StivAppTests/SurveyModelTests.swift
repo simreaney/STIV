@@ -106,7 +106,24 @@ final class SurveyRecordingTests: XCTestCase {
                        pose: .looking(fromHeight: 3, downDegrees: pitch))
     }
 
+    /// What Documents held before the test.  Every result is saved there;
+    /// only what appeared during the test is removed afterwards, since on a
+    /// phone the folder also holds real measurements.
+    private var documentsBefore: Set<String> = []
+
+    private func documents() -> [String] {
+        (try? FileManager.default.contentsOfDirectory(atPath: URL.documentsDirectory.path)) ?? []
+    }
+
+    override func setUp() {
+        super.setUp()
+        documentsBefore = Set(documents())
+    }
+
     override func tearDown() {
+        for name in documents() where !documentsBefore.contains(name) {
+            try? FileManager.default.removeItem(at: URL.documentsDirectory.appendingPathComponent(name))
+        }
         // The models here move through the camera steps, which switch the
         // idle timer off for the whole app.
         UIApplication.shared.isIdleTimerDisabled = false
@@ -372,6 +389,45 @@ final class SurveyRecordingTests: XCTestCase {
         XCTAssertTrue(model.analysisError?.contains("refused") ?? false, model.analysisError ?? "")
         XCTAssertTrue(model.canRetune)
         XCTAssertEqual(model.maxFrameStep, 1)
+    }
+
+    // MARK: - saving
+
+    /// A result is saved the moment it exists, not when Share is tapped: an
+    /// app in the background can be ended by iOS at any time.  It goes into
+    /// its recording's own folder in Documents, which a retune overwrites, and
+    /// Share shares those same files.
+    func testEveryResultIsSavedInItsRecordingsFolder() throws {
+        let model = surveyed()
+        model.go(to: .record)
+        model.startRecording(from: aimed())
+        try record(model, rows: 150)
+        model.stopRecordingAndAnalyse()
+        waitUntil("result") { model.result != nil }
+
+        let folder = try XCTUnwrap(model.exportDirectory)
+        XCTAssertEqual(folder.deletingLastPathComponent().standardizedFileURL,
+                       URL.documentsDirectory.standardizedFileURL)
+        let names = ["report.txt", "summary.json", "survey.yaml", "velocity.csv"]
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(),
+                       names, "saved without Share being tapped")
+        let saved = documents()
+
+        XCTAssertEqual(model.survey.capture.frameStep, 2)
+        model.setFrameStep(1)
+        waitUntil("retuned") { !model.isAnalysing }
+        XCTAssertEqual(model.result?.survey.capture.frameStep, 1)
+        XCTAssertEqual(Set(documents()), Set(saved), "a retune must not add a folder")
+        let summary = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: folder.appendingPathComponent("summary.json"))) as? [String: Any]
+        XCTAssertEqual((summary?["run"] as? [String: Any])?["frame_step"] as? Int, 1,
+                       "the retune's result replaces the first")
+
+        let shared = model.exportFiles()
+        XCTAssertEqual(shared.map(\.lastPathComponent).sorted(), names)
+        XCTAssertTrue(shared.allSatisfy {
+            $0.deletingLastPathComponent().standardizedFileURL == folder.standardizedFileURL
+        })
     }
 
     // MARK: - starting again

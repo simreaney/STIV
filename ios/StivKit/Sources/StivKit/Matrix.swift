@@ -144,29 +144,29 @@ extension Matrix {
     ///
     /// Same nominal support as the box window but smoothly tapered, which gives
     /// a better-conditioned tensor; `StiSettings.windowType` selects it.
+    ///
+    /// The sampled filter below, at every row and column: one implementation,
+    /// so the two cannot drift apart by a bit.
     public func gaussianMean(sigma: Double, truncate: Double = 4.0) -> Matrix {
-        precondition(sigma > 0, "sigma must be positive, got \(sigma)")
-        guard let (kernel, radius) = Matrix.gaussianKernel(sigma: sigma, truncate: truncate) else {
-            return self
-        }
-        return convolved(kernel: kernel, radius: radius, along: .space)
-            .convolved(kernel: kernel, radius: radius, along: .time)
+        gaussianMean(sigma: sigma, truncate: truncate,
+                     rowIndices: Array(0..<rows), colIndices: Array(0..<cols))
     }
 
     /// The Gaussian mean evaluated only at the grid `rowIndices x colIndices`.
     ///
-    /// Bit-for-bit what `gaussianMean(sigma:truncate:)` returns at those
-    /// points, at a fraction of the cost.  The orientation analysis filters
-    /// three full-resolution tensor components only to read back some seventy
-    /// window centres, and a 63-tap kernel (the default 31 px window) applied
-    /// everywhere made the Gaussian window ten times slower than the box.
+    /// Bit-for-bit what the full filter gives at those points, at a fraction
+    /// of the cost.  The orientation analysis filters three full-resolution
+    /// tensor components only to read back some seventy window centres, and a
+    /// 63-tap kernel (the default 31 px window) applied everywhere made the
+    /// Gaussian window ten times slower than the box.
     ///
     /// The separable structure is what makes this exact rather than an
     /// approximation.  The full filter's space pass is needed only in the
     /// sampled *columns* -- but in every row, because the time pass then reads
     /// a full kernel's height of it -- and the time pass only in the sampled
     /// rows.  Each output is the same sum, of the same products, accumulated in
-    /// the same order as the full filter computes it, so no bit changes.
+    /// the same order -- tap 0 first, space then time -- so no bit changes.
+    /// The interior skips the edge clamp, which changes no index it reads.
     public func gaussianMean(
         sigma: Double,
         truncate: Double = 4.0,
@@ -253,52 +253,6 @@ extension Matrix {
         }
         for i in kernel.indices { kernel[i] /= total }
         return (kernel, radius)
-    }
-
-    /// One separable pass of the Gaussian mean, with scipy's `"nearest"` edges.
-    ///
-    /// The clamp is only needed within `radius` of an edge, so the interior
-    /// runs without it; and the time pass accumulates a whole row of outputs
-    /// tap by tap rather than striding down each column.  Neither changes
-    /// what is summed or in what order, so the result is bit-for-bit that of
-    /// the plain per-pixel loop.
-    func convolved(kernel: [Double], radius: Int, along axis: Axis) -> Matrix {
-        let taps = kernel.count
-        var out = [Double](repeating: 0, count: count)
-        data.withUnsafeBufferPointer { src in
-            kernel.withUnsafeBufferPointer { w in
-                out.withUnsafeMutableBufferPointer { dst in
-                    switch axis {
-                    case .space:
-                        for r in 0..<rows {
-                            let rowBase = r * cols
-                            for c in 0..<cols {
-                                var acc = 0.0
-                                if c >= radius && c + radius < cols {
-                                    let start = rowBase + c - radius
-                                    for k in 0..<taps { acc += w[k] * src[start + k] }
-                                } else {
-                                    for k in 0..<taps {
-                                        acc += w[k] * src[rowBase + Matrix.clampIndex(c + k - radius, cols)]
-                                    }
-                                }
-                                dst[rowBase + c] = acc
-                            }
-                        }
-                    case .time:
-                        for r in 0..<rows {
-                            let o = r * cols
-                            for k in 0..<taps {
-                                let s = Matrix.clampIndex(r + k - radius, rows) * cols
-                                let wk = w[k]
-                                for c in 0..<cols { dst[o + c] += wk * src[s + c] }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return Matrix(rows: rows, cols: cols, data: out)
     }
 
     func at(outer: Int, inner: Int, axis: Axis) -> Double {

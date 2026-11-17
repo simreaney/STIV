@@ -162,6 +162,25 @@ final class JSONExportTests: XCTestCase {
 }
 
 final class YAMLExportTests: XCTestCase {
+    /// `fps_override` replaces the frame rate of whatever footage the desktop
+    /// re-run is given: 30 fps video read at the phone's 60 doubled every
+    /// velocity.  The phone's rate is a comment only, and it is the rate the
+    /// phone measured -- here 30 -- not the format's nominal 60.
+    func testTheYAMLDoesNotImposeThePhonesFrameRate() throws {
+        var s = survey()
+        s.capture.framesPerSecond = 60
+        let layout = try buildSection(survey: s, rectifier: projection())
+        let stis = layout.searchLines.map { line in
+            makeSTI(syntheticSTI(tanPhi: 0.9 / 30 / line.sxMetresPerColumn, rows: 160,
+                                 cols: line.sampleCount, noise: 0.1, seed: UInt64(line.index) + 1),
+                    index: line.index, sx: line.sxMetresPerColumn, st: 1.0 / 30)
+        }
+        let yaml = surveyYAML(result: analyse(survey: s, layout: layout, stis: stis), bridge: nil)
+        let keys = yaml.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        XCTAssertFalse(keys.contains { $0.hasPrefix("fps_override") }, yaml)
+        XCTAssertTrue(yaml.contains("# The phone recorded at 30.0 fps (measured)"), yaml)
+    }
+
     /// The bearing already includes the reversal.  Writing it next to
     /// `reverse: true` made the desktop reverse it again and run the flow
     /// backwards; resolved the way the Python resolves it, the YAML must give

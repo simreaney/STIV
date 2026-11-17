@@ -37,8 +37,9 @@ targets:
     scheme:
       testTargets:
         - StivAppTests
-    info:
-      path: StivApp/Info.plist
+    # No `info:` key: XcodeGen would regenerate Info.plist from it and wipe the
+    # camera usage string, the arkit capability, the launch screen and the
+    # orientations.  INFOPLIST_FILE below uses the checked-in file as it is.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.stiv.app

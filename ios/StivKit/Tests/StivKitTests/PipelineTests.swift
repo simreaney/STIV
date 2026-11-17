@@ -111,6 +111,26 @@ final class PipelineTests: XCTestCase {
         }
     }
 
+    /// Once flipped, the velocities are along the reversed lines, so the
+    /// bearing reported beside them must be reversed too, or it points
+    /// upstream of the flow it describes.  `stiv.analysis` does the same.
+    func testAFlippedRunReportsTheBearingTheWaterWent() throws {
+        let s = survey()
+        let layout = try buildSection(survey: s, rectifier: projection())
+        XCTAssertEqual(layout.flowBearingDegrees, -90, accuracy: 1e-9, "towards the marker, -Z")
+        let st = s.capture.stSecondsPerRow
+
+        let downstream = analyse(survey: s, layout: layout,
+                                 stis: recordedStis(layout: layout, st: st) { _ in 0.9 })
+        XCTAssertEqual(downstream.flowBearingDegrees, layout.flowBearingDegrees)
+
+        let flipped = analyse(survey: s, layout: layout,
+                              stis: recordedStis(layout: layout, st: st) { _ in -0.8 })
+        XCTAssertTrue(flipped.warnings.contains { $0.contains("mirrored") }, "\(flipped.warnings)")
+        XCTAssertEqual(flipped.flowBearingDegrees, 90, accuracy: 1e-9)
+        XCTAssertTrue(flipped.summary().contains("flow direction 90.0 deg"), flipped.summary())
+    }
+
     func testTexturelessWaterIsFlaggedRatherThanInvented() throws {
         let s = survey(stations: 5)
         let layout = try buildSection(survey: s, rectifier: projection())
@@ -206,9 +226,7 @@ final class PipelineTests: XCTestCase {
                        "\(result.stations.map(\.velocityMs))")
     }
 
-    /// The result keeps one single-precision display copy per station, and
-    /// the old `stis` accessor still reads them.
-    @available(*, deprecated, message: "exercises the deprecated StivResult.stis")
+    /// The result keeps one single-precision display copy per station.
     func testConditionedStisAreRetainedAsFloatPreviews() throws {
         let s = survey(stations: 3)
         let layout = try buildSection(survey: s, rectifier: projection())
@@ -217,17 +235,13 @@ final class PipelineTests: XCTestCase {
         let result = analyse(survey: s, layout: layout, stis: stis)
 
         XCTAssertEqual(result.stiPreviews.count, 3)
-        XCTAssertEqual(result.stis.count, 3)
         for (i, preview) in result.stiPreviews.enumerated() {
             let conditioned = preprocess(stis[i].data, settings: s.sti)
             XCTAssertEqual(preview.rows, conditioned.rows)
             XCTAssertEqual(preview.cols, conditioned.cols)
             XCTAssertEqual(preview.pixels, conditioned.data.map { Float($0) })
-            XCTAssertEqual(result.stis[i].data.data, preview.pixels.map { Double($0) })
-            XCTAssertEqual(result.stis[i].stSecondsPerRow, st)
-            XCTAssertEqual(displayBytes(preview), displayBytes(result.stis[i].data))
+            XCTAssertEqual(preview.stSecondsPerRow, st)
         }
-        XCTAssertEqual(Array(result.stis.indices), [0, 1, 2])
     }
 
     func testSuggestsAFrameStepWhenTanPhiIsOutOfRange() throws {

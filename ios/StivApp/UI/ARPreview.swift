@@ -75,13 +75,6 @@ struct OverlayProjector {
                    plane: WaterPlane(y: planeY),
                    orientation: orientation, viewportSize: viewportSize)
     }
-
-    /// Whether a world point is in front of the camera and inside the viewport,
-    /// so an overlay can dim what has drifted out of shot.
-    func isVisible(_ world: PlanePoint) -> Bool {
-        guard let p = point(world) else { return false }
-        return p.x >= 0 && p.y >= 0 && p.x <= viewportSize.width && p.y <= viewportSize.height
-    }
 }
 
 /// Draws the cross-section, the search lines and the flow arrow over the feed.

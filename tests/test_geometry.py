@@ -202,6 +202,15 @@ class TestGcpOutlierRejection:
         r = HomographyRectifier(self.PX, blundered, SHAPE)
         assert r.n_inliers == len(self.PX) - 1
 
+    def test_rmse_is_over_the_inliers_only(self):
+        """The fit is exact on the five good points; counting the rejected
+        blunder gave 0.8 m and a warning that every velocity was that wrong."""
+        blundered = self.world()
+        blundered[4] += (2.0, 0.0)
+        r = HomographyRectifier(self.PX, blundered, SHAPE)
+        assert r.rmse_m < 1e-6
+        assert r.residuals_m[4] == pytest.approx(2.0, rel=1e-3)   # still on show
+
     def test_ordinary_clicking_error_is_kept(self):
         jittered = self.world()
         jittered[4] += (2.0 * self.MPP, 0.0)    # 2 px, i.e. a steady hand

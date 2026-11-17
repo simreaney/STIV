@@ -213,9 +213,11 @@ final class SurveyDecodingTests: XCTestCase {
         XCTAssertEqual(decoded, Survey())
     }
 
+    /// Missing keys take their defaults, and a key this version no longer
+    /// has -- `rollingShutterRowSeconds`, from older exports -- is ignored.
     func testMissingKeysTakeTheirDefaults() throws {
         let json = """
-            {"capture": {"frameStep": 3},
+            {"capture": {"frameStep": 3, "rollingShutterRowSeconds": 1e-5},
              "section": {"stationCount": 12, "start": {"x": 1, "z": 2}},
              "flow": {"direction": "angle", "angleDegrees": 30},
              "scale": {"vioScaleSigma": 0.02},
@@ -234,7 +236,7 @@ final class SurveyDecodingTests: XCTestCase {
 
     func testAFullSurveyStillRoundTrips() throws {
         var s = Survey()
-        s.capture.rollingShutterRowSeconds = 1e-5
+        s.capture.durationSeconds = 12
         s.section.name = "weir"
         s.section.edgeTrim = 0.1
         s.flow.direction = .points
@@ -392,7 +394,7 @@ final class SendableTests: XCTestCase {
         requireSendable(StiPreview.self)
         requireSendable(StivResult.self)
         requireSendable(WaterPlaneProjection.self)
-        let rectifier: any PlaneRectifier = WaterPlaneProjection(
+        let rectifier = WaterPlaneProjection(
             intrinsics: PinholeIntrinsics(horizontalFovDegrees: 60, width: 10, height: 10),
             pose: .looking(fromHeight: 1, downDegrees: 30), plane: WaterPlane(y: 0))
         let send: @Sendable () -> Int = { rectifier.imageWidth }

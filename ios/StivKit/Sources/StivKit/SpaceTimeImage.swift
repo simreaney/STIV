@@ -38,12 +38,6 @@ public struct SpaceTimeImage: Sendable {
 
     public var rows: Int { data.rows }
     public var cols: Int { data.cols }
-    public var durationSeconds: Double { Double(rows) * stSecondsPerRow }
-    public var lengthM: Double { Double(cols - 1) * sxMetresPerColumn }
-
-    /// `Sx / St`: the velocity corresponding to `tan phi = 1`, which is where
-    /// the method is most accurate (Fig. 7).
-    public var velocityPerUnitSlope: Double { sxMetresPerColumn / stSecondsPerRow }
 }
 
 // MARK: - recording
@@ -319,17 +313,6 @@ public struct StiPreview: Sendable {
         sxMetresPerColumn = sti.sxMetresPerColumn
         stSecondsPerRow = sti.stSecondsPerRow
         outOfFrameFraction = sti.outOfFrameFraction
-    }
-
-    /// Widened back to a `Matrix`, allocated on each call.
-    public var matrix: Matrix { Matrix(rows: rows, cols: cols, floats: pixels) }
-
-    /// Widened back to a `SpaceTimeImage`, allocated on each call.
-    public var spaceTimeImage: SpaceTimeImage {
-        SpaceTimeImage(data: matrix, stationIndex: stationIndex,
-                       sxMetresPerColumn: sxMetresPerColumn,
-                       stSecondsPerRow: stSecondsPerRow,
-                       outOfFrameFraction: outOfFrameFraction)
     }
 }
 

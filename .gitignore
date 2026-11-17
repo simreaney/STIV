@@ -1,7 +1,12 @@
 # Large local inputs and run outputs
 examples/DJI_0659.MP4
-/notebooks/stiv_output
-/notebooks/stiv_output2
+# Default output folders -- `<video or survey name>_output` from the wizard and
+# `stiv run`, plus `stiv demo` -- wherever they are run from.  A custom
+# "Save results to" name is not covered.
+*_output/
+stiv_output*/
+stiv_demo_data/
+stiv_demo/
 /results
 /papers
 

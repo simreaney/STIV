@@ -197,6 +197,9 @@ func jsonNumber(_ v: Double) -> Any { v.isFinite ? v : NSNull() }
 /// the section, the flow direction, every analysis parameter -- is exact.
 public func surveyYAML(result: StivResult, bridge: DesktopBridge?) -> String {
     let s = result.survey
+    // What the phone actually delivered: `St` comes from the measured frame
+    // period, not from the video format's nominal `framesPerSecond`.
+    let phoneFps = Double(s.capture.frameStep) / result.stSecondsPerRow
     var out: [String] = [
         "# STIV survey exported from the iPhone app.",
         "#",
@@ -212,7 +215,12 @@ public func surveyYAML(result: StivResult, bridge: DesktopBridge?) -> String {
         "video:",
         "  path: \"\"                     # <- your video of this section",
         "  frame_step: \(s.capture.frameStep)",
-        "  fps_override: \(fmt(s.capture.framesPerSecond))",
+        // No `fps_override`: it would replace the frame rate of whatever
+        // footage the desktop is given, and 30 fps video read at the phone's
+        // 60 doubles every velocity.  The phone's own rate is a note only.
+        "  # The phone recorded at \(fmt(phoneFps)) fps (measured). That is the phone's",
+        "  # rate, not your video's: stiv reads the rate from the video file, so",
+        "  # leave fps_override unset.",
         "",
     ]
 

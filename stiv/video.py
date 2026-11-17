@@ -126,7 +126,10 @@ class FrameSource:
                 f"rather than the recording rate; set video.fps_override"
             )
 
-        self.start_index = max(0, int(round(cfg.start_s * self.fps)))
+        # start_s is a time on the file's own clock, the one the pickers seek
+        # by (read_frame_at), so the analysis starts on the frame they showed
+        # even when fps_override says the footage ran at another rate.
+        self.start_index = max(0, int(round(cfg.start_s * (self.info.fps or self.fps))))
         self.step = max(1, int(cfg.frame_step))
 
         # Frames available after start_s, if the container says.
@@ -179,11 +182,6 @@ class FrameSource:
     def st_s_per_px(self) -> float:
         """``S_t`` of Eq. (16): seconds represented by one STI row."""
         return self.step / self.fps
-
-    @property
-    def duration_s(self) -> Optional[float]:
-        """Seconds of video the selected frames span; ``None`` if not yet known."""
-        return None if self.n_frames is None else self.n_frames * self.st_s_per_px
 
     @property
     def shape(self) -> tuple[int, int]:

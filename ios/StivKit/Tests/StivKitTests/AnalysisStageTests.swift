@@ -160,6 +160,21 @@ final class QualityControlTests: XCTestCase {
     }
 }
 
+final class MotionReportTests: XCTestCase {
+    /// Tracking loss is ARKit's own report, not a finding of the pose
+    /// cross-check, so it is warned about even when the check never armed --
+    /// no LiDAR, or no bank within reach -- which is when it matters most.
+    func testTrackingLossIsWarnedAboutWithoutTheCrossCheck() {
+        var report = MotionReport()
+        report.enabled = false
+        report.trackingDegraded = true
+        let warnings = report.warnings()
+        XCTAssertEqual(warnings.count, 1, "\(warnings)")
+        XCTAssertTrue(warnings[0].contains("world tracking was not in its normal state"),
+                      "\(warnings)")
+    }
+}
+
 final class InterpolationTests: XCTestCase {
     /// `np.interp` clamps beyond the outermost usable stations, and
     /// interpolates linearly in station metres between them.

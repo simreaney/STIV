@@ -199,8 +199,17 @@ public struct MotionReport: Sendable {
     }
 
     public func warnings() -> [String] {
-        guard enabled else { return [] }
         var out: [String] = []
+        // ARKit's own tracking state, not a finding of the cross-check, so it
+        // is reported whether or not the check was armed -- and an unarmed
+        // check (no LiDAR, a bank out of reach) is when it matters most.
+        if trackingDegraded {
+            out.append("""
+                world tracking was not in its normal state for part of the recording, which \
+                degrades the metric scale; the reported uncertainties account for this
+                """)
+        }
+        guard enabled else { return out }
         if patchCount < 12 {
             out.append("""
                 only \(patchCount) trackable patches were found on static ground, so the \
@@ -232,12 +241,6 @@ public struct MotionReport: Sendable {
             out.append("the camera moved up to \(decimals(worst, 0)) px during the "
                      + "recording; check that the search lines stayed over water throughout")
         }
-        if trackingDegraded {
-            out.append("""
-                world tracking was not in its normal state for part of the recording, which \
-                degrades the metric scale; the reported uncertainties account for this
-                """)
-        }
         return out
     }
 }
@@ -260,15 +263,7 @@ public struct StivResult: Sendable {
     public var warnings: [String]
     public var elapsedSeconds: Double = 0
 
-    /// The conditioned STIs as `SpaceTimeImage`s, each widened from its
-    /// `Float` preview when it is read.  Kept so existing callers compile; new
-    /// code should use `stiPreviews` and `displayBytes(_: StiPreview)`, which
-    /// never allocate the `Double` copy.
-    @available(*, deprecated, message: "use stiPreviews and displayBytes(_: StiPreview)")
-    public var stis: ConditionedStis { ConditionedStis(previews: stiPreviews) }
-
     public var velocities: [Double] { stations.map(\.velocityMs) }
-    public var stationsM: [Double] { stations.map(\.stationM) }
 
     /// A `frameStep` that would put the median `tan phi` near 1, where the
     /// method is most accurate -- what the results-screen slider snaps to.
@@ -303,18 +298,6 @@ public struct StivResult: Sendable {
         }
         return lines.joined(separator: "\n")
     }
-}
-
-/// The conditioned STIs of a result, widened to `SpaceTimeImage` one at a
-/// time as they are read; see `StivResult.stis`.
-public struct ConditionedStis: RandomAccessCollection, Sendable {
-    public typealias Index = Int
-    public typealias Indices = Range<Int>
-    public let previews: [StiPreview]
-
-    public var startIndex: Int { previews.startIndex }
-    public var endIndex: Int { previews.endIndex }
-    public subscript(position: Int) -> SpaceTimeImage { previews[position].spaceTimeImage }
 }
 
 /// `numpy.median`: the middle value, or the mean of the two middle values for
@@ -492,8 +475,9 @@ public func analyse(
         fields.append(field)
     }
 
-    directionCheck(survey: survey, stations: &stations, stis: stis, fields: fields,
-                   cameraHeightM: layout.cameraHeightM, motion: motion, warnings: &warnings)
+    let flipped = directionCheck(survey: survey, stations: &stations, stis: stis, fields: fields,
+                                 cameraHeightM: layout.cameraHeightM, motion: motion,
+                                 warnings: &warnings)
     qualityControl(survey: survey, stations: &stations, warnings: &warnings)
     scaleWarning(survey: survey, stations: stations, cameraHeightM: layout.cameraHeightM,
                  warnings: &warnings)
@@ -501,6 +485,14 @@ public func analyse(
 
     let rows = stis.first?.rows ?? 0
     let st = stis.first?.stSecondsPerRow ?? survey.capture.stSecondsPerRow
+    // Once flipped, the stations' velocities are along the reversed lines, so
+    // the flow they describe -- and the bearing to report -- is reversed too.
+    // The same arithmetic as `stiv.analysis.run`, into (-180, 180].
+    var bearing = layout.flowBearingDegrees
+    if flipped {
+        bearing += 180
+        if bearing > 180 { bearing -= 360 }
+    }
 
     var result = StivResult(
         survey: survey,
@@ -511,7 +503,7 @@ public func analyse(
         durationSeconds: Double(rows) * st,
         stSecondsPerRow: st,
         widthM: layout.widthM,
-        flowBearingDegrees: layout.flowBearingDegrees,
+        flowBearingDegrees: bearing,
         cameraHeightM: layout.cameraHeightM,
         rectifierDescription: layout.rectifierDescription,
         warnings: warnings)
@@ -847,6 +839,9 @@ func reverseAdvice(_ flow: FlowSettings) -> String {
 /// cheap: reversing the search line mirrors the STI in space, which negates
 /// `phi` and leaves the structure tensor untouched, so the existing orientation
 /// fields are reused and only the histogram of Eq. (14) is recomputed.
+///
+/// Returns whether the stations were re-analysed along the reversed lines.
+@discardableResult
 func directionCheck(
     survey: Survey,
     stations: inout [StationResult],
@@ -855,7 +850,7 @@ func directionCheck(
     cameraHeightM: Double,
     motion: MotionReport,
     warnings: inout [String]
-) {
+) -> Bool {
     // `velocityRawMs` came from the first pass, which searched only the
     // configured (and nearly always asymmetric) range.  When the lines face
     // upstream the true angle is not just near that range's boundary but can
@@ -878,11 +873,11 @@ func directionCheck(
                         sxMetresPerColumn: stis[i].sxMetresPerColumn,
                         stSecondsPerRow: stis[i].stSecondsPerRow)
     }.sorted()
-    guard !probe.isEmpty else { return }
+    guard !probe.isEmpty else { return false }
     // The upper median for an even count, which `_direction_check` uses too,
     // so the two decide identically on the same input.
     let median = probe[probe.count / 2]
-    guard median < 0 else { return }
+    guard median < 0 else { return false }
 
     let message = "the median velocity along the search lines is \(decimals(median, 3)) m/s, "
                 + "i.e. the flow runs opposite to the assumed downstream direction"
@@ -890,7 +885,7 @@ func directionCheck(
 
     guard survey.flow.autoFlip else {
         warnings.append("\(message); \(advice).")
-        return
+        return false
     }
 
     let vLow = survey.sti.velocityRangeMs.lowerBound
@@ -912,6 +907,7 @@ func directionCheck(
     warnings.append("\(message); the search range was mirrored and the stations re-analysed "
                   + "(flow.autoFlip). To point the search lines the right way in the first "
                   + "place, \(advice).")
+    return true
 }
 
 /// Suggest a `frameStep` that puts `tan phi` in the paper's sweet spot.

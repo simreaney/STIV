@@ -12,7 +12,11 @@ from __future__ import annotations
 import copy
 import datetime
 import math
+import shutil
+import subprocess
+import sys
 import textwrap
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -482,6 +486,53 @@ class TestWizard:
         assert s.frame_t_s == 1.0
         s.picks_t_s = 1.0
         assert wz._picker_frame() is False
+
+    def test_each_video_gets_its_own_results_folder(self, nb, clip, tmp_path):
+        """One shared default folder let each survey wipe the last one's
+        results: writing them first clears what the previous run there wrote."""
+        import ipywidgets as W
+
+        other = tmp_path / f"other{clip.suffix}"
+        shutil.copy(clip, other)
+
+        def out_dir(wz, video):
+            wz._load_video(str(video), is_demo=False, status=W.HTML())
+            s = wz.state
+            s.m_per_px = 0.05
+            s.section_pts, s.downstream_pts = [(10.0, 50.0), (10.0, 150.0)], [(300.0, 100.0)]
+            return wz._build_config().output.out_dir
+
+        wz = nb.Wizard()
+        assert out_dir(wz, clip) != out_dir(wz, other)
+
+        # A folder typed into step 4, or given to Wizard(), still wins.
+        (box,) = [w for w in wz._build_step3().children
+                  if getattr(w, "description", "") == "Save results to"]
+        box.value = "mine"
+        assert out_dir(wz, clip) == "mine"
+        assert out_dir(nb.Wizard(out_dir="given"), other) == "given"
+
+    def test_picker_is_shown_only_inside_the_wizard(self, nb, clip):
+        """ipympl displays every figure made in interactive mode after the
+        cell runs; the picker's canvas must not turn up a second time there."""
+        pytest.importorskip("ipympl")
+        code = textwrap.dedent("""
+            import sys, matplotlib
+            matplotlib.use("module://ipympl.backend_nbagg")
+            import matplotlib.pyplot as plt, ipywidgets as W
+            from ipympl.backend_nbagg import _Backend_ipympl
+            from stiv.notebook_ui import Wizard
+
+            wz = Wizard()
+            wz._ensure_interactive_backend = plt.ion   # what %matplotlib widget leaves
+            wz._load_video(sys.argv[1], is_demo=False, status=W.HTML())
+            box = wz._build_step2()
+            assert wz._fig.canvas in box.children
+            assert wz._fig not in _Backend_ipympl._to_show, "queued for a second display"
+            assert plt.isinteractive()
+        """)
+        subprocess.run([sys.executable, "-c", code, str(clip)],
+                       cwd=Path(__file__).resolve().parents[1], check=True)
 
     def test_demo_runs_the_same_analysis_as_stiv_demo(self, nb, tmp_path, monkeypatch):
         from stiv.video import FrameSource

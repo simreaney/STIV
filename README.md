@@ -377,12 +377,20 @@ analysis on STIs produced by other software.
 ## Tests
 
 ```bash
-pytest                     # 290 tests, ~20 s
+pytest                     # 291 tests, ~20 s
 ```
 
 The end-to-end tests render synthetic footage with a known velocity field and
 assert the pipeline recovers it — with a fixed camera, with drone motion, across
 all three stabilisation models, and at several `frame_step` values.
+
+Notebooks are committed without outputs; CI fails if one still has them. Running
+the wizard embeds a frame of whatever footage was loaded, so set git up once per
+clone to strip notebooks on commit (your working copy keeps its outputs):
+
+```bash
+git config filter.strip-notebook.clean "python3 tools/strip_notebooks.py --filter"
+```
 
 ## Layout
 
@@ -405,6 +413,9 @@ stiv/
 
 notebooks/
   STIV_Interactive.ipynb   launches the notebook_ui wizard
+
+tools/
+  strip_notebooks.py       keeps run outputs out of committed notebooks
 ```
 
 ## Limitations

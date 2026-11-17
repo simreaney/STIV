@@ -19,8 +19,10 @@ It writes, into ios/StivKit/Tests/StivKitTests/Fixtures/ (or DIR):
                        row-major, (rows x cols)
     golden.json        the analysis parameters, what stiv.sti.preprocess makes
                        of that image, and everything stiv.orientation returns:
-                       the box-window field and Eq. (14) estimate, the same
-                       field with the Gaussian window, the window grids of
+                       the box-window field and its Eq. (14) and histogram-peak
+                       estimates, preprocess on a copy of the image with
+                       missing (NaN) samples, the same field with the
+                       Gaussian window, the window grids of
                        sizes whose step lands on a rounding half, an STI
                        with featureless windows Eq. (14) must ignore, and the
                        analysis stage -- quality control, the profile median
@@ -113,6 +115,22 @@ GAUSSIAN_WINDOW_PX = 31
 # (29 * 0.5 = 14.5, 21 * 0.5 = 10.5).  Python's round() takes halves to even;
 # a port that rounds them up gets a different grid.
 GRID_CASES = [(29, "box"), (21, "box"), (29, "gaussian"), (21, "gaussian")]
+
+# Samples that left the frame.  The STI with NaN at a few scattered cells and
+# down one whole column, conditioned twice: with every other stage off, so the
+# output *is* the fill (a scattered NaN takes its column's mean, the all-NaN
+# column the grand mean), and with STI_SETTINGS, the pipeline as run.  The first
+# is what tells column-mean from grand-mean filling: with the static background
+# removed, an all-NaN column comes out zero whatever it was filled with.
+MISSING_CELLS = [(0, 0), (5, 17), (5, 18), (93, 70), (ROWS - 1, COLS - 1), (140, 3)]
+MISSING_COLUMN = 101
+MISSING_FILL_ONLY = dict(
+    remove_static_background=False,
+    normalise=False,
+    clahe=False,
+    smooth_sigma=0.0,
+)
+MISSING_PROBES = MISSING_CELLS + [(0, MISSING_COLUMN), (ROWS // 2, MISSING_COLUMN), (7, 9)]
 
 # Featureless windows.  Columns [0, FLAT_COLS) of the STI are held at a
 # constant, so the windows whose support lies inside that block have exactly
@@ -310,14 +328,13 @@ def analysis_stage(sti: np.ndarray) -> dict:
     # Eq. (16) error propagation.
     cases = []
     for phi, phi_std, sx, st, negate in VELOCITY_STD_CASES:
-        cfg = Config()
-        station = make_station(0, 0.0, NAN, NAN, NAN, 0.0, 0.0, [], sx=sx, st=st)
+        station =make_station(0, 0.0, NAN, NAN, NAN, 0.0, 0.0, [], sx=sx, st=st)
         est = AngleEstimate(
             phi=phi, tan_phi=math.tan(phi), phi_std=phi_std, valid_fraction=0.9,
             mean_coherency=0.7, n_used=12, hist=np.zeros(1), bin_centres=np.zeros(1),
             phi_min=-1.0, phi_max=1.0,
         )
-        analysis._apply_estimate(cfg, station, SimpleNamespace(sx_m_per_px=sx, st_s_per_px=st),
+        analysis._apply_estimate(station, SimpleNamespace(sx_m_per_px=sx, st_s_per_px=st),
                                  est, negate=negate)
         cases.append({
             "phi": phi, "phi_std": phi_std, "sx": sx, "st": st, "negate": negate,
@@ -364,7 +381,7 @@ def analysis_stage(sti: np.ndarray) -> dict:
                 overlap=OVERLAP, gradient_order=GRADIENT_ORDER,
             )
             est = analysis._estimate_angle(cfg, s, field, v_lo, v_hi)
-            analysis._apply_estimate(cfg, station, s, est)
+            analysis._apply_estimate(station, s, est)
             stations.append(station)
             stis.append(s)
             fields.append(field)
@@ -428,6 +445,34 @@ def main() -> int:
     )
 
     conditioned = preprocess(sti.astype(np.float64), StiConfig(**STI_SETTINGS))
+
+    # The histogram-peak estimator, on the same field: its parabolic sub-bin
+    # step is a sign away from moving phi by up to two bins.
+    peak_est = mean_orientation_angle(
+        field,
+        PHI_MIN,
+        PHI_MAX,
+        coherency_levels=COHERENCY_LEVELS,
+        n_bins=N_BINS,
+        min_coherency=MIN_COHERENCY,
+        estimator="peak",
+    )
+
+    missing_sti = sti.astype(np.float64)
+    for r, c in MISSING_CELLS:
+        missing_sti[r, c] = np.nan
+    missing_sti[:, MISSING_COLUMN] = np.nan
+    missing_runs = []
+    for settings in (MISSING_FILL_ONLY, STI_SETTINGS):
+        filled = preprocess(missing_sti, StiConfig(**settings))
+        missing_runs.append({
+            "settings": settings,
+            "mean": float(filled.mean()),
+            "std": float(filled.std()),
+            "min": float(filled.min()),
+            "max": float(filled.max()),
+            "probes": [{"r": r, "c": c, "value": float(filled[r, c])} for r, c in MISSING_PROBES],
+        })
 
     gaussian = structure_tensor_field(
         sti.astype(np.float64),
@@ -509,6 +554,12 @@ def main() -> int:
         },
         "field": field_summary(field),
         "estimate": estimate_summary(est),
+        "peak_estimate": estimate_summary(peak_est),
+        "preprocess_missing": {
+            "cells": [list(rc) for rc in MISSING_CELLS],
+            "column": MISSING_COLUMN,
+            "runs": missing_runs,
+        },
         "gaussian_field": dict(
             {"window_px": GAUSSIAN_WINDOW_PX, "window_type": "gaussian", "overlap": OVERLAP,
              "gradient_order": GRADIENT_ORDER},

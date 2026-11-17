@@ -239,9 +239,8 @@ class TestStiMemory:
             n = 20 + i
             out.append(SearchLine(
                 index=i, station_m=float(i), centre_world=np.zeros(2), centre_px=np.zeros(2),
-                direction_world=np.array([1.0, 0.0]),
                 samples_px=np.column_stack([np.arange(n, dtype=float), np.full(n, 2.0 + i)]),
-                samples_world=np.zeros((n, 2)), sx_m_per_px=0.02, length_m=0.02 * (n - 1),
+                samples_world=np.zeros((n, 2)), sx_m_per_px=0.02,
             ))
         return out
 

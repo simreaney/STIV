@@ -106,7 +106,9 @@ def load_bathymetry(
     path = Path(path)
     if not path.is_file():
         raise ConfigError(f"bathymetry file not found: {path}")
-    df = pd.read_csv(path)
+    # A row of empty cells, as spreadsheets often export at the end, is not a
+    # survey point; a row with only some of its cells empty is refused below.
+    df = pd.read_csv(path).dropna(how="all")
     cols = {c.lower().strip(): c for c in df.columns}
 
     dist_key = next((cols[k] for k in ("distance_m", "distance", "station_m", "station", "chainage_m") if k in cols), None)
@@ -135,6 +137,17 @@ def load_bathymetry(
         depth = float(water_level_m) - df[elev_key].to_numpy(dtype=float)
 
     dist = df[dist_key].to_numpy(dtype=float)
+    # An empty cell reads as NaN, and fails far from here: a missing depth
+    # makes Q NaN, and a missing distance sorts last and leaves every station
+    # with no depth -- Q = 0, blamed on the bed.
+    bad = ~(np.isfinite(dist) & np.isfinite(depth))
+    if bad.any():
+        row = int(df.index[np.argmax(bad)]) + 2      # 1-based, after the header row
+        what = "depth" if depth_key is not None else "bed elevation"
+        raise ConfigError(
+            f"{path.name} row {row} has an empty or non-numeric cell; every row "
+            f"needs a distance and a {what}"
+        )
     order = np.argsort(dist)
     return dist[order], depth[order]
 

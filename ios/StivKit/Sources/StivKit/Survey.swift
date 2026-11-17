@@ -47,20 +47,14 @@ public struct CaptureSettings: Codable, Sendable, Equatable {
     /// does not tilt the streaks.
     public var framesPerSecond: Double = 60.0
 
-    /// Per-image-row readout delay of the rolling shutter, seconds.
-    ///
-    /// In an oblique view a search line spans image rows, and each row is read
-    /// at a slightly different time, which tilts the streaks and biases `phi`.
-    /// iOS exposes no public readout-time API, so this is off by default and
-    /// only useful once calibrated for a specific device and video format.
-    public var rollingShutterRowSeconds: Double = 0.0
-
     public var stSecondsPerRow: Double { Double(frameStep) / framesPerSecond }
 
     public init() {}
 
+    // Keys not listed here -- `rollingShutterRowSeconds`, which earlier
+    // versions wrote and nothing ever read -- are ignored on decoding.
     private enum CodingKeys: String, CodingKey {
-        case durationSeconds, frameStep, framesPerSecond, rollingShutterRowSeconds
+        case durationSeconds, frameStep, framesPerSecond
     }
 
     public init(from decoder: Decoder) throws {
@@ -69,7 +63,6 @@ public struct CaptureSettings: Codable, Sendable, Equatable {
         d.durationSeconds = try c.decodeIfPresent(Double.self, forKey: .durationSeconds) ?? d.durationSeconds
         d.frameStep = try c.decodeIfPresent(Int.self, forKey: .frameStep) ?? d.frameStep
         d.framesPerSecond = try c.decodeIfPresent(Double.self, forKey: .framesPerSecond) ?? d.framesPerSecond
-        d.rollingShutterRowSeconds = try c.decodeIfPresent(Double.self, forKey: .rollingShutterRowSeconds) ?? d.rollingShutterRowSeconds
         self = d
     }
 }

@@ -58,6 +58,26 @@ class TestWaterline:
         assert depth[0] == pytest.approx(-0.5)
 
 
+class TestBathymetryFile:
+    @pytest.mark.parametrize("rows", [
+        "0,0\n2,1.0\n4,\n6,1.0\n8,0\n",       # a depth left blank: Q came out NaN
+        "0,0\n2,1.0\n,1.2\n6,1.0\n8,0\n",     # a distance left blank: Q = 0, "no positive depth"
+    ])
+    def test_an_empty_cell_is_refused_and_its_row_named(self, tmp_path, rows):
+        p = tmp_path / "bathy.csv"
+        p.write_text("distance_m,depth_m\n" + rows)
+        with pytest.raises(ConfigError, match="row 4"):
+            load_bathymetry(p)
+
+    def test_an_empty_row_is_not_a_survey_point(self, tmp_path):
+        """Spreadsheets often export a trailing row of empty cells."""
+        p = tmp_path / "bathy.csv"
+        p.write_text("distance_m,depth_m\n0,0\n4,1.2\n8,0\n,\n")
+        dist, depth = load_bathymetry(p)
+        assert dist.tolist() == [0.0, 4.0, 8.0]
+        assert depth.tolist() == [0.0, 1.2, 0.0]
+
+
 class TestDryBanks:
     def test_bed_elevation_with_dry_banks(self, dry_banked_bed):
         """Was: wetted width 10 m and dry ground given a positive depth."""

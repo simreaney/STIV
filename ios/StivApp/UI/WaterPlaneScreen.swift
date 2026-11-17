@@ -125,8 +125,10 @@ struct WaterPlaneScreen: View {
                    + "shrinks the higher you stand.")
                     .font(.caption2).foregroundStyle(.secondary)
 
+                // Normal tracking too: the camera's world height is what the
+                // typed height is measured down from.
                 PrimaryButton(title: "Use this height", systemImage: "checkmark",
-                              enabled: capture.camera != nil) {
+                              enabled: capture.camera != nil && capture.trackingState.isNormal) {
                     model.acceptManualPlane()
                 }
             }

@@ -83,3 +83,17 @@ func mirrored(_ m: Matrix) -> Matrix {
 func sameOrBothNaN(_ a: Double, _ b: Double, accuracy: Double) -> Bool {
     (a.isNaN && b.isNaN) || abs(a - b) <= accuracy
 }
+
+extension WaterPlaneProjection {
+    /// Local ground sample distance (metres per pixel) at an image point, by
+    /// finite difference -- the same trick as
+    /// `HomographyRectifier._local_scale`.  In an oblique view it varies by an
+    /// order of magnitude between the near and far bank, which is why the
+    /// samples along a search line are spaced in world metres, not pixels.
+    func localScale(at px: PixelPoint) -> Double? {
+        guard let a = imageToWorld(px),
+              let b = imageToWorld(PixelPoint(u: px.u + 1, v: px.v)),
+              let c = imageToWorld(PixelPoint(u: px.u, v: px.v + 1)) else { return nil }
+        return 0.5 * (distance(a, b) + distance(a, c))
+    }
+}

@@ -146,12 +146,16 @@ class HomographyRectifier(Rectifier):
         self.H = H
         self.H_inv = np.linalg.inv(H)
         self.n_gcp = len(src)
-        self.n_inliers = int(mask.sum()) if mask is not None else len(src)
+        inliers = mask.ravel().astype(bool) if mask is not None else np.ones(len(src), bool)
+        self.n_inliers = int(inliers.sum())
 
-        # Residuals tell the user how good the survey/clicking was.
+        # Residuals tell the user how good the survey/clicking was.  Every
+        # point keeps its residual, so a rejected blunder still shows; the RMSE
+        # is over the inliers alone, as the fit is, so the blunder it ignored
+        # does not make a good fit look bad.
         pred = self.image_to_world(np.asarray(gcp_px, dtype=float))
         self.residuals_m = np.linalg.norm(pred - np.asarray(gcp_world, dtype=float), axis=1)
-        self.rmse_m = float(np.sqrt(np.mean(self.residuals_m**2)))
+        self.rmse_m = float(np.sqrt(np.mean(self.residuals_m[inliers] ** 2)))
 
         h, w = image_shape[:2]
         self.nominal_m_per_px = self._local_scale(np.array([[w / 2.0, h / 2.0]]))[0]
@@ -175,7 +179,7 @@ class HomographyRectifier(Rectifier):
     def describe(self) -> str:
         return (
             f"homography from {self.n_gcp} GCPs ({self.n_inliers} inliers), "
-            f"RMSE {self.rmse_m:.3f} m, "
+            f"inlier RMSE {self.rmse_m:.3f} m, "
             f"~{self.nominal_m_per_px * 100:.2f} cm/pixel at frame centre"
         )
 
@@ -223,19 +227,13 @@ class SearchLine:
     station_m: float
     centre_world: np.ndarray
     centre_px: np.ndarray
-    direction_world: np.ndarray
     samples_px: np.ndarray
     samples_world: np.ndarray
     sx_m_per_px: float
-    length_m: float
 
     @property
     def n_samples(self) -> int:
         return len(self.samples_px)
-
-    @property
-    def endpoints_px(self) -> np.ndarray:
-        return np.array([self.samples_px[0], self.samples_px[-1]])
 
 
 @dataclass
@@ -384,11 +382,9 @@ def build_section(cfg: Config, image_shape: tuple[int, int]) -> SectionGeometry:
                 station_m=float(f * width_m),
                 centre_world=centre_w,
                 centre_px=rect.world_to_image([centre_w])[0],
-                direction_world=flow_dir.copy(),
                 samples_px=samples_px,
                 samples_world=samples_w,
                 sx_m_per_px=length_m / (n - 1),
-                length_m=length_m,
             )
         )
 

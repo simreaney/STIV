@@ -73,7 +73,9 @@ class _State:
     same way as one started with ``stiv init`` or ``stiv pick``.
     """
 
-    out_dir: str = OutputConfig.out_dir
+    #: The results folder the user chose, or None for one named after the
+    #: video (see :meth:`Wizard._out_dir`).
+    out_dir: Optional[str] = None
 
     video_path: Optional[str] = None
     is_demo: bool = False
@@ -119,7 +121,7 @@ class _State:
     out_path: Optional[Path] = None
 
     def clear(self) -> None:
-        """Back to a blank survey, keeping only the results folder.
+        """Back to a blank survey, keeping only a results folder the user chose.
 
         Done in place rather than by replacing the object, because widget
         callbacks built earlier hold a reference to it.
@@ -160,7 +162,7 @@ class Wizard:
     )
     _PICK_COLOURS = {"section_pts": ORANGE, "downstream_pts": BLUE, "water_pts": GREEN}
 
-    def __init__(self, out_dir: str = "stiv_output"):
+    def __init__(self, out_dir: Optional[str] = None):
         self.state = _State(out_dir=out_dir)
         self.step = 0
         self._pick_stage = 0
@@ -309,6 +311,22 @@ class Wizard:
             return None
         r = RectifyConfig(method="scale", altitude_m=s.altitude_m, hfov_deg=s.hfov_deg)
         return r.resolve_m_per_px(s.info.width)
+
+    def _out_dir(self) -> str:
+        """The results folder: the one chosen, else one named after the video.
+
+        Named as ``stiv init`` names it after the survey file.  A folder shared
+        by every survey would let each one wipe the last one's results, since
+        writing them first clears what the previous run there wrote.
+        """
+        s = self.state
+        if s.out_dir:
+            return s.out_dir
+        if not s.video_path:
+            return OutputConfig.out_dir
+        from .cli import _default_out_dir
+
+        return _default_out_dir(Path(s.video_path))
 
     def _fps(self) -> Optional[float]:
         """The frame rate the analysis will use: the user's, else the file's."""
@@ -606,7 +624,12 @@ class Wizard:
 
         frame = s.frame_bgr
         h, w = frame.shape[:2]
-        fig, ax = plt.subplots(figsize=(min(9.5, w / 130), min(6.2, h / 130)))
+        # Made with interactive mode off: ipympl would otherwise queue the new
+        # figure and display its canvas again under whichever cell runs next,
+        # a second picker outside the wizard.  The canvas is shown in the
+        # wizard's own panel below.
+        with plt.ioff():
+            fig, ax = plt.subplots(figsize=(min(9.5, w / 130), min(6.2, h / 130)))
         fig.canvas.header_visible = False
         ax.imshow(frame[:, :, ::-1])
         ax.set_axis_off()
@@ -787,7 +810,15 @@ class Wizard:
 
         bathy_fc.register_callback(_on_bathy)
 
-        out_dir_box = W.Text(value=s.out_dir, description="Save results to")
+        out_dir_box = W.Text(value=self._out_dir(), description="Save results to")
+
+        def _on_out_dir(change):
+            # Only an edit here is a choice that outlives this survey; the name
+            # shown until then follows the video, and an emptied box returns
+            # to it.
+            s.out_dir = change["new"].strip() or None
+
+        out_dir_box.observe(_on_out_dir, names="value")
 
         def _sync(*_):
             s.n_stations = n_stations.value
@@ -798,9 +829,8 @@ class Wizard:
             s.edge_trim = edge_trim.value
             s.alpha = alpha.value
             s.bank_coefficient = bank_coeff.value
-            s.out_dir = out_dir_box.value or s.out_dir
 
-        for w_ in (n_stations, vrange, stabilise, frame_step_box, window_px, edge_trim, alpha, bank_coeff, out_dir_box):
+        for w_ in (n_stations, vrange, stabilise, frame_step_box, window_px, edge_trim, alpha, bank_coeff):
             w_.observe(_sync, names="value")
 
         return W.VBox([
@@ -844,7 +874,7 @@ class Wizard:
             bathymetry_csv=s.bathymetry_csv if s.discharge_enabled else None,
             alpha=s.alpha,
             bank_coefficient=s.bank_coefficient,
-            out_dir=s.out_dir,
+            out_dir=self._out_dir(),
         )
         return Config.from_dict(raw)
 
@@ -862,7 +892,7 @@ class Wizard:
             ("Expected velocity range", f"{s.velocity_range[0]:.1f} to {s.velocity_range[1]:.1f} m/s"),
             ("Drone-motion compensation", "on" if s.stabilise else "off"),
             ("Discharge", "on" if s.discharge_enabled else "off"),
-            ("Results folder", s.out_dir),
+            ("Results folder", self._out_dir()),
         ]
         body = "".join(
             f"<tr><td style='color:#888;padding-right:10px'>{k}</td><td><b>{v}</b></td></tr>" for k, v in rows
@@ -969,10 +999,11 @@ class Wizard:
         ])
 
 
-def launch(out_dir: str = "stiv_output") -> Wizard:
+def launch(out_dir: Optional[str] = None) -> Wizard:
     """Build and display the interactive survey wizard.
 
-    Returns the :class:`Wizard` so its state (e.g. ``wizard.state.result``) can
-    be inspected from later cells.
+    Results go to ``out_dir`` if given, else to ``<video name>_output`` in the
+    working directory, one folder per video.  Returns the :class:`Wizard` so
+    its state (e.g. ``wizard.state.result``) can be inspected from later cells.
     """
     return Wizard(out_dir=out_dir).display()
