@@ -12,6 +12,13 @@ additions:
    average of Eq. (14), and convert to velocity by Eq. (16);
 5. quality-control the profile and, if depths are available, integrate it into
    a discharge (:mod:`discharge`).
+
+STIV is one of three velocity methods (``velocimetry.method``).  LS-PIV
+(:mod:`lspiv`) and particle tracking (:mod:`ptv`) collect from the same single
+pass over the video -- ortho-image patches and feature tracks in place of, or
+beside, the STIs -- and their per-station velocity vectors go through the same
+quality control and discharge.  Methods listed in ``velocimetry.compare`` are
+run alongside the reported one and reported next to it.
 """
 
 from __future__ import annotations
@@ -25,13 +32,18 @@ from typing import Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from . import geometry, orientation, sti as sti_mod
-from .config import Config, ConfigError, FlowConfig, StabiliseConfig, is_auto_water_mask
+from . import geometry, lspiv, orientation, ptv, sti as sti_mod
+from .config import (
+    METHOD_LABELS, Config, ConfigError, FlowConfig, StabiliseConfig, is_auto_water_mask,
+)
 from .discharge import DischargeResult, compute_discharge
-from .geometry import SectionGeometry
-from .orientation import AngleEstimate, OrientationField
+from .geometry import SectionGeometry, StationBox
+from .lspiv import CorrelationResult
+from .orientation import AngleEstimate, OrientationField, SpectralProfile
+from .ptv import TrackSet
 from .stabilise import StabilisationReport, Stabiliser, build_mask
 from .sti import SpaceTimeImage
+from .vectors import VectorEstimate, robust_spread
 from .video import FrameSource
 
 log = logging.getLogger(__name__)
@@ -47,6 +59,12 @@ FAILURE_FLAGS = frozenset(
         "low_coherency",
         "high_uncertainty",
         "out_of_frame",
+        # LS-PIV
+        "no_correlation_peak",
+        "low_peak_ratio",
+        "displacement_at_search_edge",
+        # PTV
+        "too_few_tracks",
     }
 )
 
@@ -54,8 +72,17 @@ FAILURE_FLAGS = frozenset(
 #: A genuinely slow station by the bank is the common case, and interpolating
 #: it away from its neighbours would be worse than reporting it.
 ADVISORY_FLAGS = frozenset(
-    {"tan_phi_low", "tan_phi_high", "interpolated", "median_filtered"}
+    {"tan_phi_low", "tan_phi_high", "interpolated", "median_filtered",
+     # LS-PIV and PTV
+     "displacement_low", "cross_flow_high"}
 )
+
+#: LS-PIV: a displacement below this many samples per pair is resolved only
+#: to a few percent by the sub-pixel peak fit.
+_LOW_DISPLACEMENT_SAMPLES = 0.5
+#: LS-PIV and PTV: a vector further than this off the flow direction suggests
+#: the direction is wrong, or the station is in an eddy.
+_CROSS_FLOW_DEG = 30.0
 
 #: A station whose samples left the frame for more than this fraction of the
 #: STI is failed: the gaps are filled with the column mean, and past a few
@@ -114,6 +141,20 @@ class StationResult:
     sx_m_per_px: float
     st_s_per_px: float
     flags: list[str] = field(default_factory=list)
+    #: The method that measured it: ``stiv``, ``lspiv`` or ``ptv``.  The STI
+    #: fields above (``phi_rad``, ``tan_phi``, ``coherency``,
+    #: ``valid_fraction``, ``n_windows``, ``sx_m_per_px``) are NaN or 0 for
+    #: the other two.
+    method: str = "stiv"
+    #: LS-PIV and PTV: the velocity component across the flow direction, m/s,
+    #: positive to the left looking downstream.  NaN for STIV, which measures
+    #: only along its search line.
+    velocity_cross_ms: float = math.nan
+    #: LS-PIV: ratio of the correlation peak to the next highest.
+    peak_ratio: float = math.nan
+    #: LS-PIV: pairs correlated; PTV: tracks counted.  0 for STIV, whose
+    #: count is ``n_windows``.
+    n_measurements: int = 0
 
     @property
     def velocity_spread_ms(self) -> float:
@@ -162,8 +203,39 @@ class StivResult:
     #: What became of ``stabilise.water_mask_px: auto``; empty when the config
     #: gave polygons, or none.
     water_mask_note: str = ""
+    #: The method that measured ``stations``: ``stiv``, ``lspiv`` or ``ptv``.
+    #: ``stis``, ``fields`` and ``estimates`` are STIV's whenever STIV ran,
+    #: whether reported or compared, and empty when it did not.
+    method: str = "stiv"
+    #: The profile of each method in ``velocimetry.compare``, quality-
+    #: controlled the same way, and its discharge (None if not computed).
+    comparisons: dict[str, list[StationResult]] = field(default_factory=dict)
+    comparison_discharge: dict[str, Optional[DischargeResult]] = field(default_factory=dict)
+    #: LS-PIV's ensemble correlation at each station, when it ran.
+    correlations: list[CorrelationResult] = field(default_factory=list)
+    #: PTV's tracks through this section's station boxes, and the boxes.
+    tracks: Optional[TrackSet] = None
+    boxes: list[StationBox] = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
+    @property
+    def methods(self) -> list[str]:
+        """Every method run: the reported one first."""
+        return [self.method, *self.comparisons]
+
+    def stations_for(self, method: str) -> list[StationResult]:
+        """The profile measured by ``method``, reported or compared."""
+        if method == self.method:
+            return self.stations
+        if method in self.comparisons:
+            return self.comparisons[method]
+        raise KeyError(f"{method!r} was not run; this result has {self.methods}")
+
+    def discharge_for(self, method: str) -> Optional[DischargeResult]:
+        if method == self.method:
+            return self.discharge
+        return self.comparison_discharge.get(method)
+
     @property
     def velocities(self) -> np.ndarray:
         """The reported profile, m/s.
@@ -178,9 +250,20 @@ class StivResult:
     def stations_m(self) -> np.ndarray:
         return np.array([s.station_m for s in self.stations])
 
-    def to_frame(self) -> pd.DataFrame:
+    def to_frame(self, method: Optional[str] = None) -> pd.DataFrame:
+        """One row per station of ``method``'s profile (the reported one by default).
+
+        A run that is STIV alone gives exactly the columns it always has.
+        Any other method, or a comparison, adds ``method``,
+        ``velocity_cross_ms``, ``peak_ratio`` and ``n_measurements`` after
+        them, and -- for the reported profile -- a ``velocity_<method>_ms``
+        column for each method compared.
+        """
+        method = self.method if method is None else method
+        stations = self.stations_for(method)
+        extended = self.method != "stiv" or bool(self.comparisons)
         rows = []
-        for s in self.stations:
+        for s in stations:
             rows.append(
                 {
                     "index": s.index,
@@ -204,7 +287,19 @@ class StivResult:
                     "flags": ";".join(s.flags),
                 }
             )
-        return pd.DataFrame(rows)
+            if extended:
+                rows[-1].update({
+                    "method": s.method,
+                    "velocity_cross_ms": s.velocity_cross_ms,
+                    "peak_ratio": s.peak_ratio,
+                    "n_measurements": s.n_measurements,
+                })
+        df = pd.DataFrame(rows)
+        if method == self.method:
+            for m, other in self.comparisons.items():
+                by_index = {s.index: s.velocity_ms for s in other}
+                df[f"velocity_{m}_ms"] = [by_index.get(s.index, np.nan) for s in stations]
+        return df
 
     def summary(self, omit_warnings: Sequence[str] = ()) -> str:
         """The run report.  ``omit_warnings`` are left out of it: a survey's
@@ -226,11 +321,17 @@ class StivResult:
             f"stations       {len(clean)}/{len(self.stations)} clean, "
             f"{len(failed)} failed ({len(filled)} interpolated)",
         ]
+        if self.method != "stiv" or self.comparisons:
+            lines.insert(1, f"method         {METHOD_LABELS[self.method]}"
+                            + (f", compared with {', '.join(METHOD_LABELS[m] for m in self.comparisons)}"
+                               if self.comparisons else ""))
         if finite.size:
             lines += [
                 f"surface U      mean {finite.mean():.3f}  median {np.median(finite):.3f}  "
                 f"max {finite.max():.3f} m/s",
             ]
+        if self.comparisons:
+            lines.append(self.comparison_table())
         if self.discharge is not None:
             lines.append("")
             lines.append(self.discharge.summary())
@@ -239,6 +340,25 @@ class StivResult:
             lines.append("")
             lines += [f"warning: {w}" for w in warnings]
         return "\n".join(lines)
+
+    def comparison_table(self) -> str:
+        """Each method's profile side by side: clean stations, speeds, discharge."""
+        has_q = any(self.discharge_for(m) is not None for m in self.methods)
+        out = [f"{'':14} {'method':<8} {'clean':>7} {'mean U':>7} {'max U':>7}"
+               + (f" {'Q (m3/s)':>9}" if has_q else "")]
+        for m in self.methods:
+            st = self.stations_for(m)
+            v = np.array([s.velocity_ms for s in st], dtype=float)
+            fin = v[np.isfinite(v)]
+            q = self.discharge_for(m)
+            row = (f"{'':14} {METHOD_LABELS[m]:<8} "
+                   f"{sum(1 for s in st if s.ok):>3}/{len(st):<3} "
+                   f"{(f'{fin.mean():.3f}' if fin.size else '-'):>7} "
+                   f"{(f'{fin.max():.3f}' if fin.size else '-'):>7}")
+            if has_q:
+                row += f" {(f'{q.discharge_m3s:.3f}' if q is not None else '-'):>9}"
+            out.append(row)
+        return "\n".join(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -298,6 +418,14 @@ class SurveyResult:
                     "n_warnings": len([w for w in r.warnings if w not in self.shared_warnings]),
                 }
             )
+            if r.method != "stiv" or r.comparisons:
+                rows[-1]["method"] = r.method
+                for m in r.comparisons:
+                    v = np.array([s.velocity_ms for s in r.comparisons[m]], dtype=float)
+                    v = v[np.isfinite(v)]
+                    q = r.comparison_discharge.get(m)
+                    rows[-1][f"mean_surface_velocity_{m}_ms"] = float(v.mean()) if v.size else np.nan
+                    rows[-1][f"discharge_{m}_m3s"] = q.discharge_m3s if q is not None else np.nan
         return pd.DataFrame(rows)
 
     def summary(self) -> str:
@@ -375,6 +503,9 @@ def run_survey(cfg: Config, progress: bool = True) -> SurveyResult:
     t_start = time.perf_counter()
     configs = cfg.section_configs()
     multi = cfg.sections is not None
+    methods = cfg.velocimetry.methods
+    primary = cfg.velocimetry.method
+    use_stiv = "stiv" in methods
 
     def _named(c: Config, text: str) -> str:
         return f"cross-section {c.section.name!r}: {text}" if multi else text
@@ -387,13 +518,14 @@ def run_survey(cfg: Config, progress: bool = True) -> SurveyResult:
     else:
         log.info("using %d frames, step %d (St = %.4f s)",
                  source.n_frames, source.step, source.st_s_per_px)
+    log.info("velocity: %s", ", ".join(METHOD_LABELS[m] for m in methods))
 
     # An STI shorter than the analysis window fails at every station, and
     # used to be reported as a texture or velocity-range problem afterwards.
     need = orientation.min_sti_size(
         cfg.stiv.window_px, cfg.stiv.window_type, cfg.stiv.gradient_order
     )
-    if source.n_frames is not None and source.n_frames < need:
+    if use_stiv and source.n_frames is not None and source.n_frames < need:
         raise ConfigError(
             f"the clip gives only {source.n_frames} STI rows (frames left after "
             f"video.start_s, duration_s and frame_step: {source.step}), but a "
@@ -416,29 +548,33 @@ def run_survey(cfg: Config, progress: bool = True) -> SurveyResult:
             geom.flow_bearing_deg,
         )
         w: list[str] = []
-        narrow = [sl.index for sl in geom.search_lines if sl.n_samples < need]
-        if narrow and len(narrow) == len(geom.search_lines):
-            raise ConfigError(_named(c,
-                f"the search lines have only {min(sl.n_samples for sl in geom.search_lines)} "
-                f"samples, but a {c.stiv.window_px} px {c.stiv.window_type} window "
-                f"needs at least {need}; lengthen stiv.search_line_length_m, raise "
-                f"stiv.n_samples, or use a smaller stiv.window_px"
-            ))
-        if narrow:
-            w.append(
-                f"{len(narrow)} search line(s) have fewer than the {need} samples a "
-                f"{c.stiv.window_px} px window needs (stations {narrow[:5]}"
-                f"{'...' if len(narrow) > 5 else ''}) and will fail; lengthen "
-                f"stiv.search_line_length_m or use a smaller stiv.window_px"
-            )
-        outside = geometry.check_lines_in_frame(geom, source.shape)
-        if outside:
-            w.append(
-                f"{len(outside)} search line(s) extend outside the frame "
-                f"(stations {outside[:5]}{'...' if len(outside) > 5 else ''}); "
-                f"shorten stiv.search_line_length_m or move the section"
-            )
+        if use_stiv:
+            narrow = [sl.index for sl in geom.search_lines if sl.n_samples < need]
+            if narrow and len(narrow) == len(geom.search_lines):
+                raise ConfigError(_named(c,
+                    f"the search lines have only {min(sl.n_samples for sl in geom.search_lines)} "
+                    f"samples, but a {c.stiv.window_px} px {c.stiv.window_type} window "
+                    f"needs at least {need}; lengthen stiv.search_line_length_m, raise "
+                    f"stiv.n_samples, or use a smaller stiv.window_px"
+                ))
+            if narrow:
+                w.append(
+                    f"{len(narrow)} search line(s) have fewer than the {need} samples a "
+                    f"{c.stiv.window_px} px window needs (stations {narrow[:5]}"
+                    f"{'...' if len(narrow) > 5 else ''}) and will fail; lengthen "
+                    f"stiv.search_line_length_m or use a smaller stiv.window_px"
+                )
+            outside = geometry.check_lines_in_frame(geom, source.shape)
+            if outside:
+                w.append(
+                    f"{len(outside)} search line(s) extend outside the frame "
+                    f"(stations {outside[:5]}{'...' if len(outside) > 5 else ''}); "
+                    f"shorten stiv.search_line_length_m or move the section"
+                )
         own.append(w)
+
+    # LS-PIV's patches and PTV's boxes, laid out once the sections are.
+    plans = _plan_vector_methods(cfg, configs, geoms, source, methods, own)
 
     shared: list[str] = []
     # One rectifier serves every section, so its fit is judged once.
@@ -450,18 +586,46 @@ def run_survey(cfg: Config, progress: bool = True) -> SurveyResult:
         # calibrates it, and it then serves them all.
         stab_cfg, water_note = _automatic_water_mask(configs[0], shared)
 
-    groups, stab_report, reference_bgr = _collect_stis(cfg, source, geoms, progress, stab_cfg)
+    got = _collect(cfg, source, geoms, progress, stab_cfg, methods, plans)
+    stab_report, reference_bgr = got.report, got.reference_bgr
     shared.extend(source.warnings)
     shared_after = stab_report.warnings()
 
     results: list[StivResult] = []
-    for c, geom, stis, warnings in zip(configs, geoms, groups, own):
+    for si, (c, geom, warnings) in enumerate(zip(configs, geoms, own)):
         warnings.extend(shared)
-        stations, fields, estimates = _analyse_stis(c, stis, geom)
+        notes: dict[str, list[str]] = {m: [] for m in methods}
+        runs: dict[str, list[StationResult]] = {}
+        stis: list[SpaceTimeImage] = got.stis[si] if got.stis is not None else []
+        fields: list[Optional[OrientationField]] = []
+        estimates: list[Optional[AngleEstimate]] = []
 
-        # Direction first: it can replace every station's estimate, and quality
-        # control must judge the estimates that are actually going to be reported.
-        if _direction_check(c, stations, stis, fields, estimates, warnings):
+        stiv_flipped = False
+        if use_stiv:
+            spectra: list[Optional[SpectralProfile]] = []
+            stations, fields, estimates = _analyse_stis(c, stis, geom, spectra)
+            # Direction first: it can replace every station's estimate, and
+            # quality control must judge the estimates that are actually going
+            # to be reported.
+            stiv_flipped = _direction_check(c, stations, stis, fields, estimates,
+                                            notes["stiv"], spectra)
+            runs["stiv"] = stations
+
+        vector_ests: dict[str, list[VectorEstimate]] = {}
+        if "lspiv" in methods:
+            vector_ests["lspiv"] = [lspiv.estimate(r) for r in got.correlations[si]]
+        if "ptv" in methods:
+            boxes = plans.boxes[si]
+            keep = ptv.accepted(c, got.tracks, boxes[0].along_world) if boxes else None
+            vector_ests["ptv"] = [ptv.estimate(c, got.tracks, b, keep) for b in boxes]
+
+        # The reported method decides which way is downstream.
+        if primary == "stiv":
+            flipped = stiv_flipped
+        else:
+            flipped = _vector_direction(c, vector_ests[primary], geom.flow_dir_world,
+                                        notes[primary])
+        if flipped:
             # The stations now report the flow as running the other way along the
             # search lines, so the direction reported and drawn follows them.  The
             # lines themselves are already laid out and sampled, and nothing reads
@@ -469,42 +633,68 @@ def run_survey(cfg: Config, progress: bool = True) -> SurveyResult:
             geom.flow_dir_world = -geom.flow_dir_world
             bearing = geom.flow_bearing_deg + 180.0
             geom.flow_bearing_deg = bearing - 360.0 if bearing > 180.0 else bearing
-        _quality_control(c, stations, warnings)
-        _range_advice(c, stations, source, warnings)
+
+        for m, ests in vector_ests.items():
+            runs[m] = _vector_stations(c, geom, ests, m, source.st_s_per_px)
+            if m != primary:
+                _direction_agreement(m, runs[m], primary, notes[m])
+        if use_stiv and primary != "stiv" and stiv_flipped != flipped:
+            # STIV settled the direction its own way; report its velocities
+            # along the direction the reported method chose, and say so.
+            for st in runs["stiv"]:
+                for name in ("velocity_ms", "velocity_raw_ms", "phi_rad", "tan_phi"):
+                    setattr(st, name, -getattr(st, name))
+            notes["stiv"].append(
+                f"STIV and {METHOD_LABELS[primary]} disagree about which way the water "
+                f"flows, so STIV's velocities, reported along {METHOD_LABELS[primary]}'s "
+                f"direction, are negative; check the flow direction"
+            )
+
+        for m in methods:
+            _quality_control(c, runs[m], notes[m])
+            if m == "stiv":
+                _range_advice(c, runs[m], source, notes[m])
+            elif m == "lspiv":
+                tip = lspiv.advice(c, vector_ests[m], plans.pair_steps[si])
+                if tip:
+                    notes[m].append(tip)
+
+        warnings.extend(notes[primary])
+        for m in methods[1:]:
+            warnings.extend(f"{METHOD_LABELS[m]}: {w}" for w in notes[m])
         warnings.extend(shared_after)
 
-        disch = None
-        if c.discharge.enabled:
-            # A discharge that cannot be computed -- every station failed, say --
-            # must not take the velocity profile down with it.
-            try:
-                disch = compute_discharge(
-                    c.discharge,
-                    [s.station_m for s in stations],
-                    [s.velocity_ms for s in stations],
-                    geom.width_m,
-                )
-            except ConfigError as exc:
-                warnings.append(f"discharge was not computed: {exc}")
-            else:
-                warnings.extend(disch.warnings)
+        disch = _discharge(c, runs[primary], geom, warnings)
+        comparisons = {m: runs[m] for m in methods[1:]}
+        comparison_q: dict[str, Optional[DischargeResult]] = {}
+        for m in methods[1:]:
+            extra: list[str] = []
+            comparison_q[m] = _discharge(c, runs[m], geom, extra)
+            warnings.extend(f"{METHOD_LABELS[m]}: {w}" for w in extra)
 
+        n_frames = stis[0].data.shape[0] if stis else got.n_rows
         results.append(StivResult(
             config=c,
             geometry=geom,
-            stations=stations,
+            stations=runs[primary],
             stis=stis,
             fields=fields,
             estimates=estimates,
             stabilisation=stab_report,
-            n_frames=stis[0].data.shape[0] if stis else 0,
-            duration_s=(stis[0].data.shape[0] * source.st_s_per_px) if stis else 0.0,
+            n_frames=n_frames,
+            duration_s=n_frames * source.st_s_per_px,
             fps=source.fps,
             st_s_per_px=source.st_s_per_px,
             reference_frame_bgr=reference_bgr,
             discharge=disch,
             warnings=warnings,
             water_mask_note=water_note,
+            method=primary,
+            comparisons=comparisons,
+            comparison_discharge=comparison_q,
+            correlations=got.correlations[si] if got.correlations is not None else [],
+            tracks=_section_tracks(got.tracks, plans.boxes[si]) if plans.boxes else None,
+            boxes=plans.boxes[si] if plans.boxes else [],
         ))
 
     elapsed = time.perf_counter() - t_start
@@ -600,23 +790,142 @@ def _rectification_warnings(geom: SectionGeometry, warnings: list[str]) -> None:
         )
 
 
-def _collect_stis(
+def _section_tracks(tracks: Optional[TrackSet], boxes: Sequence[StationBox]) -> Optional[TrackSet]:
+    """The tracks whose midpoints lie in one section's station boxes."""
+    if tracks is None or not len(tracks) or not boxes:
+        return tracks
+    mid = tracks.mid_world
+    return tracks.subset(np.any([b.contains_world(mid) for b in boxes], axis=0))
+
+
+@dataclass
+class _VectorPlans:
+    """LS-PIV's patches and pair steps, and PTV's boxes, for each section."""
+
+    layouts: list[list[lspiv.PatchLayout]] = field(default_factory=list)
+    pair_steps: list[int] = field(default_factory=list)
+    boxes: list[list[StationBox]] = field(default_factory=list)
+
+
+def _plan_vector_methods(
+    cfg: Config, configs: Sequence[Config], geoms: Sequence[SectionGeometry],
+    source: FrameSource, methods: Sequence[str], own: list[list[str]],
+) -> _VectorPlans:
+    """Lay out LS-PIV's patches and PTV's boxes, and check the clip is long enough."""
+    plans = _VectorPlans()
+    h, w = source.shape
+    multi = cfg.sections is not None
+
+    def _off_frame(corners_px: list[np.ndarray]) -> list[int]:
+        return [i for i, q in enumerate(corners_px)
+                if (q[:, 0] < 0).any() or (q[:, 0] > w - 1).any()
+                or (q[:, 1] < 0).any() or (q[:, 1] > h - 1).any()]
+
+    for c, geom, warnings in zip(configs, geoms, own):
+        rect = geom.rectifier
+        if "lspiv" in methods:
+            layouts, k = lspiv.plan_patches(c, geom, source.st_s_per_px)
+            plans.layouts.append(layouts)
+            plans.pair_steps.append(k)
+            if layouts:
+                lay = layouts[0]
+                log.info("%sLS-PIV: %d-sample interrogation areas (%.2f m) at %.3f m, "
+                         "pair step %d, search +/- %d samples",
+                         f"section {c.section.name!r}: " if multi else "",
+                         lay.ia_n, lay.ia_size_m, lay.gsd_m, k, lay.margin_n)
+                off = _off_frame([rect.world_to_image(la.corners_world()) for la in layouts])
+                if off:
+                    warnings.append(
+                        f"{len(off)} LS-PIV patch(es) extend outside the frame (stations "
+                        f"{off[:5]}{'...' if len(off) > 5 else ''}); their missing samples "
+                        f"weaken the correlation"
+                    )
+        if "ptv" in methods:
+            boxes = geometry.station_boxes(geom, c.stiv.search_line_length_m)
+            plans.boxes.append(boxes)
+            off = _off_frame([rect.world_to_image(b.corners_world()) for b in boxes])
+            if off:
+                warnings.append(
+                    f"{len(off)} PTV station box(es) extend outside the frame (stations "
+                    f"{off[:5]}{'...' if len(off) > 5 else ''}); shorten "
+                    f"stiv.search_line_length_m or move the section"
+                )
+
+    n = source.n_frames
+    if n is not None and "lspiv" in methods and plans.pair_steps:
+        need_lspiv = max(plans.pair_steps) + 2
+        if n < need_lspiv:
+            raise ConfigError(
+                f"the clip gives only {n} frames (after video.start_s, duration_s and "
+                f"frame_step: {source.step}), but LS-PIV with a pair step of "
+                f"{max(plans.pair_steps)} needs at least {need_lspiv}; use a longer "
+                f"video.duration_s or a smaller lspiv.pair_step"
+            )
+    if n is not None and "ptv" in methods and n < cfg.ptv.track_frames + 1:
+        raise ConfigError(
+            f"the clip gives only {n} frames, but PTV tracks each feature for "
+            f"ptv.track_frames: {cfg.ptv.track_frames}; use a longer video.duration_s "
+            f"or fewer ptv.track_frames"
+        )
+    return plans
+
+
+@dataclass
+class _Collected:
+    """What the single pass over the video gathered, per section."""
+
+    stis: Optional[list[list[SpaceTimeImage]]]
+    correlations: Optional[list[list[CorrelationResult]]]
+    tracks: Optional[TrackSet]
+    report: StabilisationReport
+    reference_bgr: np.ndarray
+    n_rows: int
+
+
+def _collect(
     cfg: Config, source: FrameSource, geoms: Sequence[SectionGeometry], progress: bool,
     stabilise_cfg: Optional[StabiliseConfig] = None,
-) -> tuple[list[list[SpaceTimeImage]], StabilisationReport, np.ndarray]:
-    """Single streaming pass over the video, building every STI at once.
+    methods: Sequence[str] = ("stiv",),
+    plans: Optional[_VectorPlans] = None,
+) -> _Collected:
+    """Single streaming pass over the video, feeding every method at once.
 
-    Every section's search lines are sampled from each frame together.
-    ``stabilise_cfg`` is ``cfg.stabilise`` with an automatic water mask
-    resolved; ``cfg.stabilise`` itself when omitted.  Returns each section's
-    STIs, the stabilisation diagnostics, and the reference frame (kept for the
-    overview plot).
+    Each frame is read and registered against the reference once, then handed
+    to a collector per method: the STIs of every section's search lines, the
+    LS-PIV patches of every station, the PTV tracks through every station box.
+    Only the collectors the methods need are built.  ``stabilise_cfg`` is
+    ``cfg.stabilise`` with an automatic water mask resolved; ``cfg.stabilise``
+    itself when omitted.
     """
+    plans = plans or _VectorPlans()
     stab_cfg = stabilise_cfg if stabilise_cfg is not None else cfg.stabilise
-    lines = [sl for g in geoms for sl in g.search_lines]
-    collector = sti_mod.StiCollector(lines, source.n_frames, source.st_s_per_px)
-    probe = np.vstack([np.vstack([g.start_px, g.end_px]) for g in geoms])
+    collectors: list = []
+    exclude: list[np.ndarray] = []
 
+    sti_collector = None
+    if "stiv" in methods:
+        lines = [sl for g in geoms for sl in g.search_lines]
+        sti_collector = sti_mod.StiCollector(lines, source.n_frames, source.st_s_per_px)
+        collectors.append(sti_collector)
+        exclude.append(sti_collector.all_pts)
+    patch_collector = None
+    if "lspiv" in methods:
+        layouts = [lay for group in plans.layouts for lay in group]
+        steps = [k for group, k in zip(plans.layouts, plans.pair_steps) for _ in group]
+        patch_collector = lspiv.PatchCollector(layouts, steps, source.st_s_per_px, cfg.lspiv)
+        collectors.append(patch_collector)
+        exclude.append(patch_collector.all_pts)
+    track_collector = None
+    if "ptv" in methods:
+        boxes = [b for group in plans.boxes for b in group]
+        track_collector = ptv.TrackCollector(boxes, geoms[0].rectifier, source.st_s_per_px,
+                                             cfg.ptv, source.shape)
+        collectors.append(track_collector)
+        exclude.append(track_collector.all_pts)
+    # The water the methods watch is kept out of the stabiliser's features.
+    exclude_px = exclude[0] if len(exclude) == 1 else np.vstack(exclude)
+
+    probe = np.vstack([np.vstack([g.start_px, g.end_px]) for g in geoms])
     stabiliser: Optional[Stabiliser] = None
     reference_bgr = np.zeros((*source.shape, 3), np.uint8)
 
@@ -626,23 +935,27 @@ def _collect_stis(
             # tqdm.auto: a progress widget in a notebook, a text bar elsewhere.
             from tqdm.auto import tqdm
 
-            bar = tqdm(total=source.n_frames, unit="frame", desc="STI", leave=False)
+            bar = tqdm(total=source.n_frames, unit="frame",
+                       desc="STI" if sti_collector is not None else "frames", leave=False)
         except ImportError:
             bar = None
 
+    n_rows = 0
     try:
         for i, frame_bgr in enumerate(source.frames(colour=True)):
             grey = source.to_grey(frame_bgr)
             if i == 0:
                 reference_bgr = frame_bgr.copy()
-                mask = build_mask(stab_cfg, source.shape, exclude_px=collector.all_pts)
+                mask = build_mask(stab_cfg, source.shape, exclude_px=exclude_px)
                 stabiliser = Stabiliser(stab_cfg, grey, mask)
                 if stabiliser.enabled:
                     log.info("stabilisation: tracking %d static features", stabiliser.report.n_features)
-                collector.add_frame(grey, None)
+                M = None
             else:
                 M = stabiliser.update(grey, probe_px=probe) if stabiliser.enabled else None
-                collector.add_frame(grey, M)
+            for col in collectors:
+                col.add_frame(grey, M)
+            n_rows += 1
             if bar is not None:
                 bar.update(1)
     finally:
@@ -650,12 +963,33 @@ def _collect_stis(
             bar.close()
 
     report = stabiliser.report if stabiliser else StabilisationReport(enabled=False)
-    stis = collector.finish()
-    groups, k = [], 0
-    for g in geoms:
-        groups.append(stis[k:k + len(g.search_lines)])
-        k += len(g.search_lines)
-    return groups, report, reference_bgr
+
+    def _split(items: list, groups: Sequence[Sequence]) -> list[list]:
+        out, k = [], 0
+        for g in groups:
+            out.append(items[k:k + len(g)])
+            k += len(g)
+        return out
+
+    return _Collected(
+        stis=(_split(sti_collector.finish(), [g.search_lines for g in geoms])
+              if sti_collector is not None else None),
+        correlations=(_split(patch_collector.finish(), plans.layouts)
+                      if patch_collector is not None else None),
+        tracks=track_collector.finish() if track_collector is not None else None,
+        report=report,
+        reference_bgr=reference_bgr,
+        n_rows=sti_collector.n_rows if sti_collector is not None else n_rows,
+    )
+
+
+def _collect_stis(
+    cfg: Config, source: FrameSource, geoms: Sequence[SectionGeometry], progress: bool,
+    stabilise_cfg: Optional[StabiliseConfig] = None,
+) -> tuple[list[list[SpaceTimeImage]], StabilisationReport, np.ndarray]:
+    """The STIs alone, as :func:`_collect` gathers them for STIV."""
+    got = _collect(cfg, source, geoms, progress, stabilise_cfg)
+    return got.stis, got.report, got.reference_bgr
 
 
 def _eq14(cfg: Config, field_: OrientationField, phi_min: float, phi_max: float) -> AngleEstimate:
@@ -671,14 +1005,26 @@ def _eq14(cfg: Config, field_: OrientationField, phi_min: float, phi_max: float)
     )
 
 
-def _estimate_angle(
-    cfg: Config, s: SpaceTimeImage, field_: OrientationField, v_lo: float, v_hi: float
+def _angle(
+    cfg: Config, field_: Optional[OrientationField], spectrum: Optional[SpectralProfile],
+    phi_min: float, phi_max: float,
 ) -> AngleEstimate:
-    """Run Eq. (14) over one orientation field for a given velocity range."""
+    """One STI's angle over a range: from its spectrum for ``stiv.estimator:
+    fft``, from its orientation field by Eq. (14) otherwise."""
+    if spectrum is not None:
+        return orientation.spectral_estimate(spectrum, phi_min, phi_max)
+    return _eq14(cfg, field_, phi_min, phi_max)
+
+
+def _estimate_angle(
+    cfg: Config, s: SpaceTimeImage, field_: Optional[OrientationField], v_lo: float,
+    v_hi: float, spectrum: Optional[SpectralProfile] = None,
+) -> AngleEstimate:
+    """Estimate one STI's angle for a given velocity range."""
     phi_min, phi_max = orientation.angle_range_from_velocity(
         v_lo, v_hi, s.sx_m_per_px, s.st_s_per_px
     )
-    return _eq14(cfg, field_, phi_min, phi_max)
+    return _angle(cfg, field_, spectrum, phi_min, phi_max)
 
 
 def _apply_estimate(
@@ -723,12 +1069,19 @@ def _apply_estimate(
 
 
 def _analyse_stis(
-    cfg: Config, stis: Sequence[SpaceTimeImage], geom: SectionGeometry
+    cfg: Config, stis: Sequence[SpaceTimeImage], geom: SectionGeometry,
+    spectra: Optional[list[Optional[SpectralProfile]]] = None,
 ) -> tuple[list[StationResult], list[Optional[OrientationField]], list[Optional[AngleEstimate]]]:
-    """Run the orientation analysis on every STI and convert to velocity."""
+    """Run the orientation analysis on every STI and convert to velocity.
+
+    With ``stiv.estimator: fft`` each STI's spectrum stands in for its
+    orientation field, whose entry is then None; the spectra are appended to
+    ``spectra`` when it is given (None elsewhere), for the direction check.
+    """
     stations: list[StationResult] = []
     fields: list[Optional[OrientationField]] = []
     estimates: list[Optional[AngleEstimate]] = []
+    use_fft = cfg.stiv.estimator == "fft"
 
     v_lo, v_hi = cfg.stiv.velocity_range_ms
 
@@ -759,16 +1112,20 @@ def _analyse_stis(
         conditioned = sti_mod.preprocess(s.data, cfg.stiv)
 
         field_ = None
+        spectrum = None
         est = None
         try:
-            field_ = orientation.structure_tensor_field(
-                conditioned,
-                window_px=cfg.stiv.window_px,
-                window_type=cfg.stiv.window_type,
-                overlap=cfg.stiv.window_overlap,
-                gradient_order=cfg.stiv.gradient_order,
-            )
-            est = _estimate_angle(cfg, s, field_, v_lo, v_hi)
+            if use_fft:
+                spectrum = orientation.spectral_profile(conditioned)
+            else:
+                field_ = orientation.structure_tensor_field(
+                    conditioned,
+                    window_px=cfg.stiv.window_px,
+                    window_type=cfg.stiv.window_type,
+                    overlap=cfg.stiv.window_overlap,
+                    gradient_order=cfg.stiv.gradient_order,
+                )
+            est = _estimate_angle(cfg, s, field_, v_lo, v_hi, spectrum)
         except ValueError as exc:
             st.add_flag("sti_too_small")
             log.warning("station %d: %s", sl.index, exc)
@@ -796,6 +1153,8 @@ def _analyse_stis(
         stations.append(st)
         fields.append(field_)
         estimates.append(est)
+        if spectra is not None:
+            spectra.append(spectrum)
 
     return stations, fields, estimates
 
@@ -815,7 +1174,10 @@ def _report_velocity(st: StationResult, velocity_ms: float) -> None:
     it was replaced (coherency, valid fraction) are left alone.
     """
     st.velocity_ms = float(velocity_ms)
-    if np.isfinite(velocity_ms) and st.sx_m_per_px > 0:
+    if st.method != "stiv":
+        # LS-PIV and PTV have no STI angle to keep in step.
+        pass
+    elif np.isfinite(velocity_ms) and st.sx_m_per_px > 0:
         st.tan_phi = float(velocity_ms) * st.st_s_per_px / st.sx_m_per_px
         st.phi_rad = math.atan(st.tan_phi)
     else:
@@ -850,6 +1212,12 @@ def _quality_control(cfg: Config, stations: list[StationResult], warnings: list[
     v_scale = _UNCERTAINTY_SCALE_FRACTION * float(np.median(finite)) if finite.size else 0.0
 
     for s in stations:
+        # The STI tests below skip LS-PIV and PTV stations by themselves:
+        # their valid fraction, coherency and tan(phi) are NaN.
+        if s.method == "lspiv" and np.isfinite(s.peak_ratio) and s.peak_ratio < q.min_peak_ratio:
+            s.add_flag("low_peak_ratio")
+        if s.method == "ptv" and s.n_measurements < q.min_tracks:
+            s.add_flag("too_few_tracks")
         if np.isfinite(s.valid_fraction) and s.valid_fraction < q.min_valid_fraction:
             s.add_flag("low_valid_fraction")
         if np.isfinite(s.coherency) and s.coherency < q.min_mean_coherency:
@@ -901,11 +1269,21 @@ def _quality_control(cfg: Config, stations: list[StationResult], warnings: list[
 
     n_bad = sum(1 for s in stations if s.failed and "sti_too_small" not in s.flags)
     if n_bad > _FAILED_FRACTION_WARNING * max(1, len(stations)):
+        method = stations[0].method if stations else "stiv"
+        if method == "ptv":
+            check = ("that the water carries trackable features (foam, debris, boils), "
+                     "that stiv.velocity_range_ms brackets the true velocity, and that "
+                     "the flow direction is right")
+        elif method == "lspiv":
+            check = ("that the water surface has visible texture, that "
+                     "stiv.velocity_range_ms brackets the true velocity, and that "
+                     "glare is not hiding the surface")
+        else:
+            check = ("that the water surface has visible texture, that "
+                     "stiv.velocity_range_ms brackets the true velocity, and that the "
+                     "search lines are parallel to the flow")
         warnings.append(
-            f"{n_bad} of {len(stations)} stations failed quality control; "
-            f"check that the water surface has visible texture, that "
-            f"stiv.velocity_range_ms brackets the true velocity, and that the "
-            f"search lines are parallel to the flow"
+            f"{n_bad} of {len(stations)} stations failed quality control; check {check}"
         )
 
 
@@ -998,6 +1376,7 @@ def _direction_check(
     fields: list[Optional[OrientationField]],
     estimates: list[Optional[AngleEstimate]],
     warnings: list[str],
+    spectra: Optional[Sequence[Optional[SpectralProfile]]] = None,
 ) -> bool:
     """Detect and, if allowed, correct search lines that point upstream.
 
@@ -1025,11 +1404,13 @@ def _direction_check(
     instead, which has no assumed direction to be wrong about.
     """
     limit = 0.5 * math.pi - 1e-3
+    if spectra is None:
+        spectra = [None] * len(stis)
     probe: list[float] = []
-    for s, field_ in zip(stis, fields):
-        if field_ is None:
+    for s, field_, spec in zip(stis, fields, spectra):
+        if field_ is None and spec is None:
             continue
-        est = _eq14(cfg, field_, -limit, limit)
+        est = _angle(cfg, field_, spec, -limit, limit)
         if np.isfinite(est.phi):
             probe.append(
                 orientation.velocity_from_angle(est.phi, s.sx_m_per_px, s.st_s_per_px)
@@ -1054,11 +1435,11 @@ def _direction_check(
 
     v_lo, v_hi = cfg.stiv.velocity_range_ms
     structural = {"sti_too_small", "out_of_frame"}
-    for st, s, field_ in zip(stations, stis, fields):
-        if field_ is None:
+    for st, s, field_, spec in zip(stations, stis, fields, spectra):
+        if field_ is None and spec is None:
             continue
         # Mirror the search range about zero and re-run Eq. (14).
-        est = _estimate_angle(cfg, s, field_, -v_hi, -v_lo)
+        est = _estimate_angle(cfg, s, field_, -v_hi, -v_lo, spec)
         # Every flag but the structural ones came from the now-discarded first
         # pass.  Drop them so that quality control -- which runs after this,
         # once -- judges only the estimate that will actually be reported.
@@ -1078,6 +1459,134 @@ def _direction_check(
         f"first place, {advice}."
     )
     return True
+
+
+def _vector_direction(
+    cfg: Config, ests: Sequence[VectorEstimate], flow_dir: np.ndarray, warnings: list[str]
+) -> bool:
+    """Whether LS-PIV or PTV found the water running against ``flow_dir``.
+
+    A 2-D method needs none of the STI's mirrored re-analysis: its vectors
+    carry their own sign, so the stations are simply projected onto the
+    reversed direction.  Returns True when the direction should be reversed,
+    which ``flow.auto_flip: false`` forbids (the warning is still given).
+    """
+    along = [float(e.velocity_world @ flow_dir) for e in ests if e.ok]
+    if not along:
+        return False
+    # Upper median for an even count, as _direction_check takes it.
+    med = float(sorted(along)[len(along) // 2])
+    if med >= 0:
+        return False
+    msg = (
+        f"the median velocity along the flow direction is {med:.3f} m/s, i.e. the "
+        f"flow runs opposite to the assumed downstream direction"
+    )
+    advice = _reverse_advice(cfg.flow)
+    if not cfg.flow.auto_flip:
+        warnings.append(f"{msg}; {advice}.")
+        return False
+    warnings.append(
+        f"{msg}; the velocities are reported along the reversed direction "
+        f"(flow.auto_flip). To set the direction the right way in the first place, "
+        f"{advice}."
+    )
+    return True
+
+
+def _direction_agreement(method: str, stations: Sequence[StationResult], primary: str,
+                         warnings: list[str]) -> None:
+    """Warn when a compared 2-D method sees the water run the other way."""
+    v = sorted(s.velocity_ms for s in stations if np.isfinite(s.velocity_ms))
+    if v and v[len(v) // 2] < 0:
+        warnings.append(
+            f"the median velocity is {v[len(v) // 2]:.3f} m/s: {METHOD_LABELS[method]} "
+            f"sees the water flow the opposite way to {METHOD_LABELS[primary]}; check "
+            f"the flow direction"
+        )
+
+
+def _vector_stations(
+    cfg: Config, geom: SectionGeometry, ests: Sequence[VectorEstimate], method: str,
+    st_s_per_px: float,
+) -> list[StationResult]:
+    """LS-PIV or PTV estimates as stations, along the section's final flow direction.
+
+    The reported velocity is the component along ``geom.flow_dir_world`` --
+    the one the discharge needs -- and the component across it is kept in
+    ``velocity_cross_ms``.  The spread is that of the individual pairs or
+    tracks along the flow, as STIV's is the spread of its windows.
+    """
+    along = np.asarray(geom.flow_dir_world, dtype=float)
+    across = np.array([-along[1], along[0]])
+    stations: list[StationResult] = []
+    for sl, e in zip(geom.search_lines, ests):
+        st = StationResult(
+            index=sl.index,
+            station_m=sl.station_m,
+            x_world=float(sl.centre_world[0]),
+            y_world=float(sl.centre_world[1]),
+            u_px=float(sl.centre_px[0]),
+            v_px=float(sl.centre_px[1]),
+            phi_rad=math.nan,
+            tan_phi=math.nan,
+            velocity_ms=math.nan,
+            velocity_raw_ms=math.nan,
+            coherency=math.nan,
+            valid_fraction=math.nan,
+            n_windows=0,
+            phi_std_rad=math.nan,
+            velocity_std_ms=math.nan,
+            sx_m_per_px=math.nan,
+            st_s_per_px=st_s_per_px,
+            flags=list(e.flags),
+            method=method,
+            peak_ratio=e.peak_ratio,
+            n_measurements=e.n_used,
+        )
+        if e.ok:
+            st.velocity_ms = st.velocity_raw_ms = float(e.velocity_world @ along)
+            st.velocity_cross_ms = float(e.velocity_world @ across)
+            st.velocity_spread_ms = robust_spread(e.samples_world @ along)
+            if (method == "lspiv" and np.isfinite(e.displacement_px)
+                    and e.displacement_px < _LOW_DISPLACEMENT_SAMPLES):
+                st.add_flag("displacement_low")
+        if e.out_of_frame_fraction > _MAX_OUT_OF_FRAME_FRACTION:
+            st.add_flag("out_of_frame")
+        stations.append(st)
+
+    # Cross-flow is judged only on stations moving fast enough for their
+    # direction to mean something: at a near-still bank it is noise.
+    speeds = [math.hypot(s.velocity_ms, s.velocity_cross_ms) for s in stations
+              if np.isfinite(s.velocity_ms)]
+    floor = _UNCERTAINTY_SCALE_FRACTION * float(np.median(speeds)) if speeds else math.inf
+    limit = math.tan(math.radians(_CROSS_FLOW_DEG))
+    for s in stations:
+        if (np.isfinite(s.velocity_ms) and math.hypot(s.velocity_ms, s.velocity_cross_ms) >= floor
+                and abs(s.velocity_cross_ms) > limit * abs(s.velocity_ms)):
+            s.add_flag("cross_flow_high")
+    return stations
+
+
+def _discharge(cfg: Config, stations: Sequence[StationResult], geom: SectionGeometry,
+               warnings: list[str]) -> Optional[DischargeResult]:
+    """Integrate a profile into a discharge, if the config asks for one."""
+    if not cfg.discharge.enabled:
+        return None
+    # A discharge that cannot be computed -- every station failed, say --
+    # must not take the velocity profile down with it.
+    try:
+        disch = compute_discharge(
+            cfg.discharge,
+            [s.station_m for s in stations],
+            [s.velocity_ms for s in stations],
+            geom.width_m,
+        )
+    except ConfigError as exc:
+        warnings.append(f"discharge was not computed: {exc}")
+        return None
+    warnings.extend(disch.warnings)
+    return disch
 
 
 def _range_advice(

@@ -1,0 +1,80 @@
+# -------------------------------------------------------------------------- #
+# STIV survey: the same hover measured three ways, STIV, LS-PIV and particle
+# tracking, in one pass over the video
+#
+# The nadir survey of nadir_drone.yaml, run with every velocity method so they
+# can be checked against each other.  STIV's profile is the one reported and
+# integrated into the discharge; LS-PIV's and the tracker's are reported beside
+# it -- in velocity.csv, velocity_lspiv.csv, velocity_ptv.csv, the profile
+# plot, report.txt and summary.json, each with a discharge of its own.
+#
+# Swap `method` and a `compare` entry to report another method instead.  The
+# same from the command line, on any survey:
+#
+#   stiv run examples/compare_methods.yaml
+#   stiv run examples/nadir_drone.yaml --method lspiv --compare stiv,ptv
+# -------------------------------------------------------------------------- #
+
+video:
+  path: ../footage/hover_30m.mp4
+  start_s: 4.0
+  duration_s: 30.0
+  frame_step: 1
+
+rectify:
+  method: scale
+  altitude_m: 30.0
+  hfov_deg: 71.5
+
+section:
+  start_px: [330, 880]
+  end_px:   [1608, 830]
+  n_stations: 40
+  edge_trim: 0.02
+  name: dee_upstream_gauge
+
+flow:
+  direction: auto
+  downstream_px: [980, 1300]
+
+stabilise:
+  enabled: true
+  water_mask_px:
+    - [[266, 0], [1606, 0], [1690, 2160], [350, 2160]]
+
+velocimetry:
+  method: stiv              # stiv | lspiv | ptv: reported, and the discharge
+  compare: [lspiv, ptv]     # also run these, and report them alongside
+
+stiv:
+  # Shared by every method: STIV's search lines; PTV's boxes are as long, down
+  # the flow; and the velocity range bounds LS-PIV's search and the tracks
+  # PTV accepts.  Set its upper end to a little above the fastest water you
+  # expect -- 8 m/s by default -- since LS-PIV's search area and pair step
+  # are sized from it.
+  search_line_length_m: 4.0
+  velocity_range_ms: [-0.5, 3.0]
+  estimator: eq14           # eq14 | peak | fft (the STIs' Fourier spectrum)
+
+lspiv:
+  ia_size_m: null           # interrogation area; null = the station spacing (0.45 m here)
+  pair_step: null           # frames between the two images of a pair; null = automatic
+  background: mean          # subtract the clip's mean patch: removes glare and rocks
+
+ptv:
+  track_frames: 5           # each track's length, in frames
+  max_features: 400
+  fb_error_px: 0.5          # forward-backward consistency
+  max_angle_deg: 45         # drop tracks further than this off the flow axis
+
+quality:
+  min_peak_ratio: 1.2       # LS-PIV
+  min_tracks: 5             # PTV
+
+discharge:
+  enabled: true
+  bathymetry_csv: bathymetry_example.csv
+  alpha: 0.85
+
+output:
+  out_dir: ../results/dee_upstream_compare

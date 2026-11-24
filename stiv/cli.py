@@ -32,6 +32,8 @@ import numpy as np
 from . import __version__
 from .config import (
     FRAME_STEP_SPEEDS_MS,
+    METHOD_LABELS,
+    METHODS,
     Config,
     ConfigError,
     RectifyConfig,
@@ -452,6 +454,7 @@ def cmd_init(args) -> int:
         sections=[{} for _ in range(args.sections)] if args.sections > 1 else None,
     )
     _apply_scale(raw, sc)
+    _apply_methods(raw, args)
     multi = args.sections > 1
     wording = {
         "section_help": _SECTIONS_HELP.format(n=args.sections) if multi else _SECTION_HELP,
@@ -505,6 +508,7 @@ def cmd_pick(args) -> int:
         n_sections=args.sections,
     )
     _apply_scale(raw, sc)
+    _apply_methods(raw, args)
     header = "# STIV survey configuration (written by `stiv pick`)\n#\n" + _header_notes(sc)
     if args.sections > 1:
         header += ("# The cross-sections are analysed together; rename them in `sections`\n"
@@ -559,6 +563,7 @@ def cmd_run(args) -> int:
         cfg.output.save_sti_images = False
     if args.pdf:
         cfg.output.pdf_report = True
+    _override_methods(cfg, args)
     cfg.validate()
 
     survey = run_survey(cfg, progress=not args.quiet)
@@ -650,19 +655,29 @@ def cmd_demo(args) -> int:
     cfg = Config.from_dict(make_config(river, video, out_dir / "analysis",
                                        n_stations=args.n_stations))
     cfg.output.pdf_report = bool(args.pdf)
+    _override_methods(cfg, args)
+    cfg.validate()
     result = run_analysis(cfg, progress=not args.quiet)
     _write_outputs(result, cfg)
 
     _, truth = river.truth_profile(args.n_stations)
-    lines, rmse = demo_validation(result.velocities, truth)
 
     print()
     print(result.summary())
     print()
-    print("Validation against the known velocity field")
-    print("-------------------------------------------")
-    print("\n".join(lines))
-    print()
+    rmse = None
+    # Each method is held to the truth on its own, so a comparison shows how
+    # they fare on the same river; the exit status follows the reported one.
+    for m in result.methods:
+        lines, r = demo_validation([s.velocity_ms for s in result.stations_for(m)], truth)
+        if m == result.method:
+            rmse = r
+        title = "Validation against the known velocity field" + (
+            f"  -  {METHOD_LABELS[m]}" if len(result.methods) > 1 else "")
+        print(title)
+        print("-" * len(title))
+        print("\n".join(lines))
+        print()
     print(f"outputs written to {out_dir / 'analysis'}")
 
     return 0 if rmse is not None and rmse < 0.1 else 1
@@ -697,6 +712,61 @@ def _add_scale_options(parser: argparse.ArgumentParser, m_per_px: bool = True) -
                         "the video names in its metadata is used, if it names one")
 
 
+def _method_list(text: str) -> list[str]:
+    """``--compare lspiv,ptv`` as a list; ``none`` or an empty string for none."""
+    names = [t.strip().lower() for t in text.split(",") if t.strip()]
+    if names == ["none"]:
+        return []
+    bad = [n for n in names if n not in METHODS]
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"unknown method(s) {', '.join(bad)}: choose from {', '.join(METHODS)}")
+    return names
+
+
+def _add_method_options(parser: argparse.ArgumentParser) -> None:
+    g = parser.add_argument_group(
+        "velocity method",
+        "stiv: space-time images (streamwise only, robust); lspiv: patch "
+        "cross-correlation (2-D, needs dense texture); ptv: feature tracking "
+        "(2-D, best with foam or debris)")
+    g.add_argument("--method", choices=METHODS,
+                   help="the method whose velocities are reported and integrated "
+                        "(velocimetry.method; default stiv)")
+    g.add_argument("--compare", type=_method_list, metavar="M[,M]",
+                   help="also run these methods in the same pass and report them "
+                        "alongside, e.g. lspiv,ptv; `none` for none (velocimetry.compare)")
+    g.add_argument("--estimator", choices=("eq14", "peak", "fft"),
+                   help="how STIV reads the streak angle: eq14 (the paper's weighted mean), "
+                        "peak, or fft (the STI's Fourier spectrum) (stiv.estimator)")
+
+
+def _apply_methods(raw: dict, args) -> None:
+    """Write ``--method``, ``--compare`` and ``--estimator`` into a new survey's raw config."""
+    vm = raw.setdefault("velocimetry", {"method": "stiv", "compare": []})
+    if args.method is not None:
+        vm["method"] = args.method
+        vm["compare"] = [m for m in vm.get("compare", []) if m != args.method]
+    if args.compare is not None:
+        vm["compare"] = [m for m in args.compare if m != vm["method"]]
+    if args.estimator is not None:
+        raw.setdefault("stiv", {})["estimator"] = args.estimator
+    if "lspiv" in [vm["method"], *vm["compare"]]:
+        raw.setdefault("lspiv", {"ia_size_m": None})
+
+
+def _override_methods(cfg: Config, args) -> None:
+    """``--method``, ``--compare`` and ``--estimator`` over a loaded config."""
+    vm = cfg.velocimetry
+    if args.method is not None:
+        vm.method = args.method
+        vm.compare = [m for m in vm.compare if m != args.method]
+    if args.compare is not None:
+        vm.compare = [m for m in args.compare if m != vm.method]
+    if args.estimator is not None:
+        cfg.stiv.estimator = args.estimator
+
+
 def build_parser() -> argparse.ArgumentParser:
     # -q/-v work either side of the subcommand.  The subcommand's copies
     # default to SUPPRESS: a subparser writes its defaults over the parent's
@@ -728,6 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="lay out N cross-sections, analysed together (default 1)")
     s.add_argument("--force", action="store_true", help="overwrite an existing config file")
     _add_scale_options(s)
+    _add_method_options(s)
     s.set_defaults(func=cmd_init)
 
     s = sub.add_parser("pick", parents=[common],
@@ -747,6 +818,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-auto-water", action="store_true",
                    help="do not outline the water automatically; click it (or skip it) by hand")
     _add_scale_options(s)
+    _add_method_options(s)
     s.set_defaults(func=cmd_pick)
 
     s = sub.add_parser("run", parents=[common],
@@ -763,6 +835,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--pdf", action="store_true",
                    help="also write report.pdf: the summary, figures, station table and config "
                         "(output.pdf_report)")
+    _add_method_options(s)
     s.set_defaults(func=cmd_run)
 
     s = sub.add_parser("cameras", parents=[common],
@@ -778,6 +851,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="simulated drone drift in pixels (0 for a fixed camera)")
     s.add_argument("-n", "--n-stations", type=int, default=DEMO_N_STATIONS)
     s.add_argument("--pdf", action="store_true", help="also write report.pdf")
+    _add_method_options(s)
     s.set_defaults(func=cmd_demo)
 
     return p

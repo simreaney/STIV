@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import cv2
 import numpy as np
@@ -254,6 +254,72 @@ class SectionGeometry:
     @property
     def stations_m(self) -> np.ndarray:
         return np.array([sl.station_m for sl in self.search_lines])
+
+    @property
+    def station_spacing_m(self) -> float:
+        """Distance between neighbouring stations; the width for a lone one."""
+        x = self.stations_m
+        return float(np.median(np.diff(x))) if len(x) > 1 else float(self.width_m)
+
+
+@dataclass
+class StationBox:
+    """A flow-aligned rectangle of water surface centred on one station.
+
+    LS-PIV samples a grid in it and PTV counts the tracks that pass through
+    it.  ``along_world`` is the downstream direction the section was laid out
+    with and ``across_world`` is perpendicular to it, so the box is square to
+    the flow even where the flow crosses the section at an angle.
+    """
+
+    index: int
+    centre_world: np.ndarray
+    along_world: np.ndarray
+    across_world: np.ndarray
+    half_length_m: float
+    half_width_m: float
+
+    def corners_world(self) -> np.ndarray:
+        """``(4, 2)`` corners, in order round the box."""
+        a = self.along_world * self.half_length_m
+        c = self.across_world * self.half_width_m
+        return np.array([self.centre_world + s * a + t * c
+                         for s, t in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
+
+    def contains_world(self, pts_world: ArrayLike) -> np.ndarray:
+        """Which of ``(n, 2)`` world points lie inside the box."""
+        d = np.asarray(pts_world, dtype=float).reshape(-1, 2) - self.centre_world
+        return ((np.abs(d @ self.along_world) <= self.half_length_m)
+                & (np.abs(d @ self.across_world) <= self.half_width_m))
+
+
+def station_boxes(geom: SectionGeometry, length_m: float,
+                  width_m: Optional[float] = None) -> list[StationBox]:
+    """One :class:`StationBox` per station, ``length_m`` long down the flow.
+
+    ``width_m`` defaults to the station spacing, so neighbouring boxes tile the
+    section without overlapping.
+    """
+    along = _unit(np.asarray(geom.flow_dir_world, dtype=float))
+    across = np.array([-along[1], along[0]])
+    w = geom.station_spacing_m if width_m is None else float(width_m)
+    return [
+        StationBox(index=sl.index, centre_world=np.asarray(sl.centre_world, dtype=float),
+                   along_world=along, across_world=across,
+                   half_length_m=0.5 * float(length_m), half_width_m=0.5 * w)
+        for sl in geom.search_lines
+    ]
+
+
+def finest_m_per_px(rect: Rectifier, centre_w: np.ndarray, along: np.ndarray,
+                    across: np.ndarray, half_m: float) -> float:
+    """Smallest metres-per-pixel anywhere along the two axes of a box."""
+    c = np.asarray(centre_w, dtype=float)
+    px_per_m = max(
+        _max_px_per_m(rect, c - along * half_m, c + along * half_m),
+        _max_px_per_m(rect, c - across * half_m, c + across * half_m),
+    )
+    return 1.0 / px_per_m if px_per_m > 0 else math.inf
 
 
 def _unit(v: np.ndarray) -> np.ndarray:

@@ -46,6 +46,13 @@ OUTPUT_FILES = (
     "sti_panel.png",
     "discharge.png",
     "report.pdf",
+    # A method compared with the reported one writes its own profile.
+    "velocity_stiv.csv",
+    "velocity_lspiv.csv",
+    "velocity_ptv.csv",
+    # LS-PIV's and PTV's diagnostics.
+    "correlation_panel.png",
+    "tracks.png",
 )
 
 #: Sub-folders this module writes, and the only files it ever puts in them.
@@ -295,6 +302,8 @@ def _write_all(result: StivResult, cfg: Config, out: Path, written: list[Path]) 
 
     df = result.to_frame()
     df.to_csv(_done(out / "velocity.csv"), index=False)
+    for m in result.comparisons:
+        result.to_frame(m).to_csv(_done(out / f"velocity_{m}.csv"), index=False)
 
     if result.discharge is not None:
         result.discharge.to_frame().to_csv(_done(out / "discharge_panels.csv"), index=False)
@@ -368,4 +377,18 @@ def _summary_dict(result: StivResult, cfg: Config) -> dict[str, Any]:
         summary["discharge_m3s"] = result.discharge.discharge_m3s
         summary["area_m2"] = result.discharge.area_m2
         summary["mean_velocity_ms"] = result.discharge.mean_velocity_ms
+    if result.method != "stiv" or result.comparisons:
+        summary["method"] = result.method
+        summary["comparisons"] = {}
+        for m in result.comparisons:
+            st = result.comparisons[m]
+            v = np.array([s.velocity_ms for s in st], dtype=float)
+            v = v[np.isfinite(v)]
+            q = result.comparison_discharge.get(m)
+            summary["comparisons"][m] = {
+                "n_failed": int(sum(1 for s in st if s.failed)),
+                "mean_surface_velocity_ms": float(v.mean()) if v.size else None,
+                "max_surface_velocity_ms": float(v.max()) if v.size else None,
+                **({"discharge_m3s": q.discharge_m3s} if q is not None else {}),
+            }
     return summary

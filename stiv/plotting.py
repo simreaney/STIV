@@ -9,6 +9,13 @@ Six outputs, each answering a question an operator actually asks:
 ``sti_detail_*.png``        why did *this* station give *that* number?
 ``discharge.png``           how does velocity combine with depth into flow?
 
+and, when LS-PIV or particle tracking ran,
+
+``correlation_panel.png``   does each station's correlation have one clear peak?
+``tracks.png``              what did the tracker follow, and how fast?
+
+When methods were compared, the profile carries each of them.
+
 These are report figures written to disk, so they deliberately commit to a
 single light appearance rather than adapting to a viewer theme.  Colours are
 the validated reference palette; magnitude uses a single-hue blue ramp and the
@@ -38,6 +45,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
 from .analysis import StivResult
+from .config import METHOD_LABELS
 from .sti import to_display
 
 # --- palette ---------------------------------------------------------------- #
@@ -53,6 +61,10 @@ SERIES_2 = "#eb6834"   # orange  - overlays on greyscale, depth/area
 SERIES_3 = "#1baf7a"   # aqua
 CRITICAL = "#d03b3b"   # flagged / failed stations
 WARNING = "#fab219"
+
+#: The reported profile is always drawn in SERIES_1; the methods compared with
+#: it take these, in the order the config lists them.
+COMPARE_COLOURS = (SERIES_2, SERIES_3)
 
 #: Single-hue sequential ramp for coherency (0 -> 1).
 COHERENCY_CMAP = LinearSegmentedColormap.from_list(
@@ -132,20 +144,38 @@ def _velocity_label(st, digits: int = 2) -> str:
 
 
 # --------------------------------------------------------------------------- #
+def _what_measures(result: StivResult) -> str:
+    """What each station was measured in, for a title."""
+    if result.method == "lspiv" and result.correlations:
+        return f"{result.correlations[0].layout.ia_size_m:.2f} m LS-PIV interrogation areas"
+    if result.method == "ptv":
+        return f"{result.config.stiv.search_line_length_m:.1f} m particle-tracking boxes"
+    return f"{result.config.stiv.search_line_length_m:.1f} m search lines"
+
+
+def _station_outlines(result: StivResult) -> list[np.ndarray]:
+    """Image outline of each station's interrogation area (LS-PIV) or box (PTV)."""
+    rect = result.geometry.rectifier
+    if result.method == "lspiv":
+        return [rect.world_to_image(c.layout.corners_world(ia_only=True))
+                for c in result.correlations]
+    if result.method == "ptv":
+        return [rect.world_to_image(b.corners_world()) for b in result.boxes]
+    return []
+
+
 def plot_overview(result: StivResult, path: Path, dpi: int = 150) -> Path:
     """First frame with the cross-section, search lines and station numbering."""
     geom = result.geometry
     title = (f"{result.config.section.name}  -  {geom.width_m:.1f} m, "
-             f"{len(geom.search_lines)} stations, "
-             f"{result.config.stiv.search_line_length_m:.1f} m search lines")
+             f"{len(geom.search_lines)} stations, {_what_measures(result)}")
     return _overview([result], path, dpi, title)
 
 
 def plot_survey_overview(results: Sequence[StivResult], path: Path, dpi: int = 150) -> Path:
     """:func:`plot_overview` of every cross-section of a survey, on one frame."""
     n = sum(len(r.stations) for r in results)
-    title = (f"{len(results)} cross-sections  -  {n} stations, "
-             f"{results[0].config.stiv.search_line_length_m:.1f} m search lines")
+    title = f"{len(results)} cross-sections  -  {n} stations, {_what_measures(results[0])}"
     return _overview(results, path, dpi, title, names=True)
 
 
@@ -169,11 +199,18 @@ def _overview(results: Sequence[StivResult], path: Path, dpi: int, title: str,
 
         for result in results:
             geom = result.geometry
-            for sl, st in zip(geom.search_lines, result.stations):
-                pts = sl.samples_px
-                colour = SERIES_2 if st.failed else SERIES_3
-                ax.plot(pts[:, 0], pts[:, 1], color=colour, lw=1.6, alpha=0.95,
-                        solid_capstyle="round")
+            outlines = _station_outlines(result)
+            if outlines:
+                for poly, st in zip(outlines, result.stations):
+                    q = np.vstack([poly, poly[:1]])
+                    ax.plot(q[:, 0], q[:, 1], color=SERIES_2 if st.failed else SERIES_3,
+                            lw=1.3, alpha=0.95)
+            else:
+                for sl, st in zip(geom.search_lines, result.stations):
+                    pts = sl.samples_px
+                    colour = SERIES_2 if st.failed else SERIES_3
+                    ax.plot(pts[:, 0], pts[:, 1], color=colour, lw=1.6, alpha=0.95,
+                            solid_capstyle="round")
 
             ax.plot([geom.start_px[0], geom.end_px[0]], [geom.start_px[1], geom.end_px[1]],
                     color=SERIES_1, lw=2.4, alpha=0.95, solid_capstyle="round")
@@ -199,14 +236,23 @@ def _overview(results: Sequence[StivResult], path: Path, dpi: int, title: str,
                         arrowprops=dict(arrowstyle="-|>", color=SERIES_1, lw=2.2,
                                         shrinkA=0, shrinkB=0))
 
+        what = {"lspiv": "interrogation area", "ptv": "tracking box"}.get(
+            results[0].method, "search line")
         handles = [
             Line2D([], [], color=SERIES_1, lw=2.4, label="cross-section / flow direction"),
-            Line2D([], [], color=SERIES_3, lw=1.8, label="search line (measured)"),
+            Line2D([], [], color=SERIES_3, lw=1.8, label=f"{what} (measured)"),
         ]
         if any(s.failed for r in results for s in r.stations):
-            handles.append(Line2D([], [], color=SERIES_2, lw=1.8, label="search line (failed QC)"))
-        ax.legend(handles=handles, loc="lower center", ncol=len(handles),
-                  bbox_to_anchor=(0.5, -0.06), labelcolor=INK_2)
+            handles.append(Line2D([], [], color=SERIES_2, lw=1.8, label=f"{what} (failed QC)"))
+        if what == "search line":
+            ax.legend(handles=handles, loc="lower center", ncol=len(handles),
+                      bbox_to_anchor=(0.5, -0.06), labelcolor=INK_2)
+        else:
+            # The longer names of LS-PIV's and PTV's outlines do not fit three
+            # abreast under a small frame, so they take two rows, hung from
+            # the image's lower edge rather than standing on it.
+            ax.legend(handles=handles, loc="upper center", ncol=min(2, len(handles)),
+                      bbox_to_anchor=(0.5, -0.01), labelcolor=INK_2)
 
         ax.set_title(title, loc="left")
         _save(fig, path, dpi, bbox_inches="tight")
@@ -277,11 +323,19 @@ def _velocity_map(results: Sequence[StivResult], path: Path, dpi: int) -> Path:
         v = np.array([st.velocity_ms for _, st in pairs], float)
         failed = np.array([st.failed for _, st in pairs], bool)
         shown = np.isfinite(v)
+        # LS-PIV and PTV measured the component across the flow too, so their
+        # arrows point where the water went; an interpolated station has no
+        # direction of its own and points down the flow.
+        cross = np.array([st.velocity_cross_ms for _, st in pairs], float)
+        cross = np.where(np.isfinite(cross) & ~failed, cross, 0.0)
+        flow_dir = np.asarray(geom.flow_dir_world, float)
         secs.append({
             "result": result,
             "geom": geom,
             "rect": geom.rectifier,
-            "flow_dir": np.asarray(geom.flow_dir_world, float),
+            "flow_dir": flow_dir,
+            "across": np.array([-flow_dir[1], flow_dir[0]]),
+            "cross": cross,
             "v": v,
             "shown": shown,
             "measured": shown & ~failed,
@@ -292,14 +346,17 @@ def _velocity_map(results: Sequence[StivResult], path: Path, dpi: int) -> Path:
         })
 
     all_v = np.concatenate([sec["v"][sec["shown"]] for sec in secs])
-    vmax = float(np.max(np.abs(all_v))) if all_v.size else 0.0
+    all_speed = np.concatenate([np.hypot(sec["v"], sec["cross"])[sec["shown"]] for sec in secs])
+    vmax = float(np.max(all_speed)) if all_speed.size else 0.0
     width_m = min(sec["geom"].width_m for sec in secs)
     k = _ARROW_FRACTION * width_m / vmax if vmax > 0 else 0.0
 
     def _tips(sec: dict, scale: float) -> np.ndarray:
         vv = np.where(sec["shown"], sec["v"], 0.0)
+        cc = np.where(sec["shown"], sec["cross"], 0.0)
         return sec["rect"].world_to_image(
-            sec["base_w"] + (vv * scale)[:, None] * sec["flow_dir"][None, :])
+            sec["base_w"] + (vv * scale)[:, None] * sec["flow_dir"][None, :]
+            + (cc * scale)[:, None] * sec["across"][None, :])
 
     def _inside(sec: dict) -> bool:
         t = sec["tips"][sec["shown"]]
@@ -464,6 +521,13 @@ def plot_velocity_profile(result: StivResult, path: Path, dpi: int = 150) -> Pat
         ax.plot(x, v_line, color=SERIES_1, lw=2.0, solid_capstyle="round", zorder=3)
         ax.scatter(x[~failed], v[~failed], s=30, color=SERIES_1, zorder=4,
                    edgecolor=SURFACE, linewidth=1.2)
+        # Each compared method as a thinner line of its own colour; only the
+        # reported profile carries the quality-control marks.
+        for colour, other in zip(COMPARE_COLOURS, result.comparisons.values()):
+            xo = np.array([s.station_m for s in other], float)
+            vo = np.array([s.velocity_ms for s in other], float)
+            ax.plot(xo, vo, color=colour, lw=1.4, ls=(0, (5, 2)), marker="o",
+                    markersize=3.5, zorder=2)
         if interp.any():
             ax.scatter(x[interp], v[interp], s=46, marker="X", color=CRITICAL, zorder=5,
                        edgecolor=SURFACE, linewidth=1.2)
@@ -495,10 +559,20 @@ def plot_velocity_profile(result: StivResult, path: Path, dpi: int = 150) -> Pat
         )
         ax.margins(x=0.02)
 
+        spread = {
+            "stiv": ("±1σ from the spectral peak" if result.config.stiv.estimator == "fft"
+                     else "±1σ from the angle histogram"),
+            "lspiv": "±1σ of the one-second sub-ensembles",
+            "ptv": "±1σ of the tracks",
+        }[result.method]
         handles = [Line2D([], [], color=SERIES_1, lw=2.0, marker="o", markersize=5,
-                          markeredgecolor=SURFACE, label="STIV surface velocity"),
-                   Line2D([], [], color=SERIES_1, lw=6, alpha=0.25,
-                          label="±1σ from the angle histogram")]
+                          markeredgecolor=SURFACE,
+                          label=f"{METHOD_LABELS[result.method]} surface velocity"),
+                   Line2D([], [], color=SERIES_1, lw=6, alpha=0.25, label=spread)]
+        for colour, m in zip(COMPARE_COLOURS, result.comparisons):
+            handles.append(Line2D([], [], color=colour, lw=1.4, ls=(0, (5, 2)),
+                                  marker="o", markersize=3.5,
+                                  label=f"{METHOD_LABELS[m]} (compared)"))
         if interp.any():
             handles.append(Line2D([], [], color=CRITICAL, lw=0, marker="X", markersize=7,
                                   label="failed QC (interpolated)"))
@@ -511,15 +585,26 @@ def plot_velocity_profile(result: StivResult, path: Path, dpi: int = 150) -> Pat
                                   label="failed QC (excluded; no value)"))
         ax.legend(handles=handles, loc="best", labelcolor=INK_2, fontsize=8.5)
 
-        # Coherency shares the x-axis in its own panel rather than a second
-        # y-scale on the same one.
-        axc.bar(x, coh, width=_bar_width(x), color=SERIES_1, alpha=0.55, linewidth=0)
-        axc.axhline(result.config.quality.min_mean_coherency, color=CRITICAL,
-                    lw=1.2, ls=(0, (4, 3)))
-        axc.annotate("QC threshold", (x[0], result.config.quality.min_mean_coherency),
+        # The method's own quality measure shares the x-axis in its own panel
+        # rather than a second y-scale on the same one: coherency for STIV,
+        # the correlation peak ratio for LS-PIV, the track count for PTV.
+        q = result.config.quality
+        if result.method == "lspiv":
+            quality = np.array([s.peak_ratio for s in result.stations], float)
+            threshold, label, top = q.min_peak_ratio, "peak ratio", None
+        elif result.method == "ptv":
+            quality = np.array([s.n_measurements for s in result.stations], float)
+            threshold, label, top = q.min_tracks, "tracks", None
+        else:
+            quality, threshold, label, top = coh, q.min_mean_coherency, "coherency", 1.05
+        quality = np.where(np.isfinite(quality), quality, 0.0)
+        axc.bar(x, quality, width=_bar_width(x), color=SERIES_1, alpha=0.55, linewidth=0)
+        axc.axhline(threshold, color=CRITICAL, lw=1.2, ls=(0, (4, 3)))
+        axc.annotate("QC threshold", (x[0], threshold),
                      xytext=(2, 4), textcoords="offset points", color=CRITICAL, fontsize=8)
-        axc.set_ylim(0, 1.05)
-        axc.set_ylabel("coherency")
+        axc.set_ylim(0, top if top is not None else max(1.15 * float(quality.max(initial=0.0)),
+                                                         1.5 * threshold))
+        axc.set_ylabel(label)
         axc.set_xlabel(f"distance along cross-section  (m)   -   "
                        f"0 m at image point ({result.geometry.start_px[0]:.0f}, "
                        f"{result.geometry.start_px[1]:.0f})")
@@ -555,9 +640,10 @@ def plot_sti_panel(result: StivResult, path: Path, max_panels: int = 24,
             ax.set_axis_off()
             ax.grid(False)
 
+        stations = result.stations_for("stiv")
         for ax, i in zip(axes, idx):
             s = result.stis[i]
-            st = result.stations[i]
+            st = stations[i]
             ax.imshow(to_display(s.data), cmap="gray", aspect="auto",
                       extent=[0, s.length_m, s.duration_s, 0])
             ax.set_axis_on()
@@ -584,9 +670,10 @@ def plot_sti_panel(result: StivResult, path: Path, max_panels: int = 24,
 def plot_sti_detail(result: StivResult, index: int, path: Path, dpi: int = 150) -> Path:
     """Full orientation diagnosis of one station: Figs. 8, 9 and 11 together."""
     s = result.stis[index]
-    st = result.stations[index]
+    st = result.stations_for("stiv")[index]
     field = result.fields[index]
     est = result.estimates[index]
+    spectral = result.config.stiv.estimator == "fft"
 
     with _style():
         fig = _figure(figsize=(13.5, 4.4))
@@ -643,9 +730,13 @@ def plot_sti_detail(result: StivResult, index: int, path: Path, dpi: int = 150) 
                     (math.degrees(st.phi_rad), ax2.get_ylim()[1]),
                     va="top", color=INK, fontsize=9,
                 )
-            ax2.set_title("Orientation-angle histogram  (Eq. 14)", loc="left")
+            if spectral:
+                ax2.set_title("Spectral power by streak angle  (FFT)", loc="left")
+                ax2.set_ylabel("mean spectral power")
+            else:
+                ax2.set_title("Orientation-angle histogram  (Eq. 14)", loc="left")
+                ax2.set_ylabel("summed frequency")
             ax2.set_xlabel("orientation angle φ  (degrees from time axis)")
-            ax2.set_ylabel("summed frequency")
             ax2.annotate(
                 f"search range {math.degrees(est.phi_min):.0f}° to "
                 f"{math.degrees(est.phi_max):.0f}°  "
@@ -680,7 +771,7 @@ def plot_discharge(result: StivResult, path: Path, dpi: int = 150) -> Path:
 
         ax0.plot(d.stations_m, d.surface_velocity_ms, color=SERIES_1, lw=2.0,
                  marker="o", markersize=4, markeredgecolor=SURFACE, markeredgewidth=1.0,
-                 label="surface (STIV)")
+                 label=f"surface ({METHOD_LABELS[result.method]})")
         ax0.plot(d.stations_m, d.depth_averaged_ms, color=SERIES_3, lw=2.0,
                  ls=(0, (5, 2)), label=f"depth-averaged (α = {d.alpha:g})")
         ax0.set_ylabel("velocity  (m/s)")
@@ -711,9 +802,131 @@ def plot_discharge(result: StivResult, path: Path, dpi: int = 150) -> Path:
 
 
 # --------------------------------------------------------------------------- #
+def plot_correlation_panel(result: StivResult, path: Path, max_panels: int = 24,
+                           dpi: int = 150) -> Path:
+    """Contact sheet of LS-PIV's ensemble correlation planes, one per station.
+
+    Each plane is drawn on velocity axes -- downstream across, cross-stream up
+    -- so the peak sits at the station's velocity; one clear, round peak is a
+    good measurement, a ridge or several peaks a doubtful one.
+    """
+    corrs = result.correlations
+    if not corrs:
+        raise ValueError("no LS-PIV correlations to plot")
+    stations = result.stations_for("lspiv")
+    n = len(corrs)
+    idx = np.unique(np.linspace(0, n - 1, min(n, max_panels)).round().astype(int))
+    ncols = int(min(6, len(idx)))
+    nrows = int(math.ceil(len(idx) / ncols))
+    # The planes are in the patch's own along/across axes, laid out with the
+    # flow direction the section started with.  If the direction was reversed
+    # since, both axes are -- across being square to along.
+    flipped = float(np.dot(corrs[0].layout.along_world, result.geometry.flow_dir_world)) < 0
+
+    with _style():
+        fig = _figure(figsize=(2.05 * ncols, 2.3 * nrows))
+        axes = np.atleast_1d(fig.subplots(nrows, ncols, squeeze=False)).ravel()
+        for ax in axes:
+            ax.set_axis_off()
+            ax.grid(False)
+        for ax, i in zip(axes, idx):
+            c, st = corrs[i], stations[i]
+            m = c.layout.margin_n
+            per = c.layout.gsd_m / (c.pair_step * c.st_s_per_px)     # m/s per sample
+            lim = (m + 0.5) * per
+            # Row 0 is the most negative cross-stream offset, column 0 the
+            # most negative downstream one: origin "lower" puts them right.
+            ax.imshow(c.plane[::-1, ::-1] if flipped else c.plane, cmap=COHERENCY_CMAP, vmin=0.0,
+                      vmax=max(float(c.plane.max()), 1e-6), origin="lower",
+                      extent=[-lim, lim, -lim, lim], interpolation="nearest")
+            ax.axhline(0, color=SURFACE, lw=0.5, alpha=0.7)
+            ax.axvline(0, color=SURFACE, lw=0.5, alpha=0.7)
+            if np.isfinite(st.velocity_raw_ms):
+                ax.scatter([st.velocity_raw_ms],
+                           [st.velocity_cross_ms if np.isfinite(st.velocity_cross_ms) else 0.0],
+                           s=26, marker="+", color=SERIES_2, linewidth=1.4, zorder=3)
+            ax.set_axis_on()
+            ax.grid(False)
+            ax.tick_params(labelsize=7, length=2)
+            ax.set_title(f"{st.station_m:.1f} m\n{_velocity_label(st)}   R={st.peak_ratio:.1f}",
+                         fontsize=8, color=CRITICAL if st.failed else INK)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(AXIS)
+        fig.suptitle(
+            "LS-PIV ensemble correlation at each station  (horizontal: downstream "
+            "velocity, vertical: cross-stream velocity, m/s; + the peak; R the peak ratio)",
+            fontsize=10, color=INK, x=0.01, ha="left",
+        )
+        _save(fig, path, dpi)
+    return path
+
+
+#: Most tracks drawn on the tracks figure; a random subset beyond that.
+_MAX_TRACKS_DRAWN = 4000
+
+
+def plot_tracks(result: StivResult, path: Path, dpi: int = 150) -> Path:
+    """The reference frame with every PTV track that counted, coloured by speed.
+
+    Tracks are drawn where they ran in the reference frame -- the camera's
+    own motion removed -- over the stations' boxes.
+    """
+    from matplotlib.collections import LineCollection
+
+    tracks = result.tracks
+    if tracks is None:
+        raise ValueError("no PTV tracks to plot")
+    frame = result.reference_frame_bgr
+    rgb = frame[:, :, ::-1] if frame.ndim == 3 else frame
+    h, w = rgb.shape[:2]
+    rect = result.geometry.rectifier
+
+    keep = np.arange(len(tracks))
+    if len(keep) > _MAX_TRACKS_DRAWN:
+        keep = np.sort(np.random.default_rng(0).choice(keep, _MAX_TRACKS_DRAWN, replace=False))
+    seg = np.stack([tracks.start_px[keep], tracks.end_px[keep]], axis=1) if len(keep) else \
+        np.empty((0, 2, 2))
+    speed = np.linalg.norm(tracks.velocity_world[keep], axis=1) if len(keep) else np.empty(0)
+
+    scale = max(1.0 / 110.0, _MIN_OVERVIEW_WIDTH_IN / w)
+    with _style():
+        fig = _figure(figsize=(min(13, w * scale), min(9, h * scale)))
+        ax = fig.subplots()
+        ax.imshow(rgb)
+        ax.set_xlim(-0.5, w - 0.5)
+        ax.set_ylim(h - 0.5, -0.5)
+        ax.set_axis_off()
+        ax.grid(False)
+        for b in result.boxes:
+            q = rect.world_to_image(b.corners_world())
+            q = np.vstack([q, q[:1]])
+            ax.plot(q[:, 0], q[:, 1], color=SURFACE, lw=0.8, alpha=0.6)
+        if len(seg):
+            vmax = float(np.percentile(speed, 98)) or 1.0
+            lc = LineCollection(seg, array=speed, cmap=COHERENCY_CMAP, norm=None,
+                                linewidths=1.2, alpha=0.95)
+            lc.set_clim(0.0, vmax)
+            ax.add_collection(lc)
+            cb = fig.colorbar(lc, ax=ax, pad=0.01, shrink=0.8)
+            cb.set_label("track speed  (m/s)")
+            cb.outline.set_visible(False)
+        ax.set_title(
+            f"Particle tracks  -  {result.config.section.name}   ({len(tracks)} tracks of "
+            f"{tracks.duration_s:.2f} s{', a sample drawn' if len(keep) < len(tracks) else ''})",
+            loc="left",
+        )
+        _save(fig, path, dpi, bbox_inches="tight")
+    return path
+
+
+# --------------------------------------------------------------------------- #
 def save_all(result: StivResult, out_dir: Path, dpi: int = 150,
              detail_stations: Optional[Sequence[int]] = None) -> list[Path]:
-    """Write the full figure set; returns the paths written."""
+    """Write the full figure set; returns the paths written.
+
+    The STI figures are drawn whenever STIV ran, reported or compared; the
+    correlation panel when LS-PIV did, and the tracks when PTV did.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -721,20 +934,27 @@ def save_all(result: StivResult, out_dir: Path, dpi: int = 150,
     written.append(plot_overview(result, out_dir / "overview.png", dpi))
     written.append(plot_velocity_map(result, out_dir / "velocity_map.png", dpi))
     written.append(plot_velocity_profile(result, out_dir / "velocity_profile.png", dpi))
-    written.append(plot_sti_panel(result, out_dir / "sti_panel.png", dpi=dpi))
+    if result.stis:
+        written.append(plot_sti_panel(result, out_dir / "sti_panel.png", dpi=dpi))
+    if result.correlations:
+        written.append(plot_correlation_panel(result, out_dir / "correlation_panel.png", dpi=dpi))
+    if result.tracks is not None:
+        written.append(plot_tracks(result, out_dir / "tracks.png", dpi))
 
     if result.discharge is not None:
         written.append(plot_discharge(result, out_dir / "discharge.png", dpi))
 
-    if detail_stations is None:
-        n = len(result.stations)
-        detail_stations = sorted({0, n // 2, n - 1}) if n else []
-    detail_dir = out_dir / "sti_detail"
-    detail_dir.mkdir(exist_ok=True)
-    for i in detail_stations:
-        if 0 <= i < len(result.stis) and result.fields[i] is not None:
-            written.append(
-                plot_sti_detail(result, i, detail_dir / f"station_{i:03d}.png", dpi)
-            )
+    if result.stis:
+        if detail_stations is None:
+            n = len(result.stis)
+            detail_stations = sorted({0, n // 2, n - 1}) if n else []
+        detail_dir = out_dir / "sti_detail"
+        detail_dir.mkdir(exist_ok=True)
+        for i in detail_stations:
+            if 0 <= i < len(result.stis) and (result.fields[i] is not None
+                                              or result.estimates[i] is not None):
+                written.append(
+                    plot_sti_detail(result, i, detail_dir / f"station_{i:03d}.png", dpi)
+                )
 
     return written

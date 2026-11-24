@@ -42,9 +42,12 @@ import numpy as np
 from .cameras import DJI_CAMERAS, camera, preset_for_focal_length
 from .config import (
     FRAME_STEP_SPEEDS_MS,
+    METHOD_LABELS,
+    METHODS,
     Config,
     ConfigError,
     DischargeConfig,
+    LspivConfig,
     OutputConfig,
     RectifyConfig,
     SectionConfig,
@@ -434,6 +437,12 @@ class _State:
     window_px: int = StiConfig.window_px
     edge_trim: float = SectionConfig.edge_trim
     search_line_length_m: float = StiConfig.search_line_length_m
+    #: The velocity method reported, those run beside it, STIV's angle
+    #: estimator and LS-PIV's interrogation area (None: automatic).
+    method: str = "stiv"
+    compare: list = field(default_factory=list)
+    estimator: str = StiConfig.estimator
+    ia_size_m: Optional[float] = LspivConfig.ia_size_m
     section_name: Optional[str] = None
     #: The first section's entry keys the wizard leaves alone, from a reopened
     #: multi-section survey (see ``more_sections``).
@@ -841,6 +850,8 @@ class Wizard:
 
         row(None, "Stations", f"{s.n_stations}",
             f"expected {s.velocity_range[0]:g} to {s.velocity_range[1]:g} m/s")
+        row(None, "Velocity method", METHOD_LABELS[s.method],
+            ("compared with " + ", ".join(METHOD_LABELS[m] for m in s.compare)) if s.compare else "")
         row(None, "Drone motion", "compensated" if s.stabilise else "not compensated")
         if s.more_sections and s.discharge_enabled:
             with_depths = sum(1 for sec in self._sections() if sec["bathymetry_csv"])
@@ -1167,6 +1178,9 @@ class Wizard:
         s.n_stations, s.edge_trim = sec.n_stations, sec.edge_trim
         s.velocity_range = tuple(cfg.stiv.velocity_range_ms)
         s.window_px, s.search_line_length_m = cfg.stiv.window_px, cfg.stiv.search_line_length_m
+        s.method = cfg.velocimetry.method
+        s.compare = [m for m in cfg.velocimetry.compare if m != s.method]
+        s.estimator, s.ia_size_m = cfg.stiv.estimator, cfg.lspiv.ia_size_m
         s.stabilise = cfg.stabilise.enabled
         if cfg.sections:
             s.discharge_enabled = any(x["bathymetry_csv"] for x in self._sections())
@@ -1972,14 +1986,70 @@ class Wizard:
                                 style=_DESC, layout=_field("520px"))
         edge_trim = W.FloatSlider(value=s.edge_trim, min=0.0, max=0.4, step=0.01, description="Edge trim",
                                   style=_DESC, layout=_field("520px"))
+        estimator_dd = W.Dropdown(options=[("Eq. 14 weighted mean (the paper)", "eq14"),
+                                           ("Histogram peak", "peak"),
+                                           ("Fourier spectrum (FFT)", "fft")],
+                                  value=s.estimator, description="STIV angle from", style=_DESC,
+                                  layout=_field("520px"))
+        ia_box = W.Text(value=f"{s.ia_size_m:g}" if s.ia_size_m else "",
+                        placeholder="auto (the station spacing)",
+                        description="LS-PIV area (m)", style=_DESC, layout=_field())
         advanced = W.Accordion(children=[W.VBox([
             _help("Frame step: analyse every n-th frame (step 2 suggested values for your scale). "
                   "Window size: the patch the streak angle is measured over. Edge trim: the fraction of "
-                  "the section skipped at each bank."),
-            frame_step_box, window_px, edge_trim,
+                  "the section skipped at each bank. STIV angle: how the streak angle is read from each "
+                  "space-time image; the Fourier spectrum copes better with noisy images. LS-PIV area: "
+                  "the side of the square of water each LS-PIV station correlates."),
+            frame_step_box, window_px, edge_trim, estimator_dd, ia_box,
         ])])
         advanced.set_title(0, "Advanced (optional)")
         advanced.selected_index = None
+
+        # The velocity method: one reported, the others optionally run beside
+        # it.  The reported one cannot also be compared, so its box is off.
+        method_dd = W.Dropdown(
+            options=[("STIV: space-time images (default)", "stiv"),
+                     ("LS-PIV: patch correlation", "lspiv"),
+                     ("Particle tracking (PTV)", "ptv")],
+            value=s.method, description="Report", style=_DESC, layout=_field("520px"))
+        compare_boxes = {m: W.Checkbox(value=m in s.compare, indent=False,
+                                       description=METHOD_LABELS[m], layout=W.Layout(width="auto"))
+                         for m in METHODS}
+        method_note = W.HTML()
+        _method_notes = {
+            "stiv": "Reads the slope of streaks in a space-time image along a line down the flow at "
+                    "each station: streamwise velocity only. Robust to sparse or patchy texture.",
+            "lspiv": "Correlates a small square of water at each station between frames: a 2-D "
+                     "velocity, so the arrows show where the water went. Needs dense, lasting texture "
+                     "(ripples, boils).",
+            "ptv": "Follows corners on the water (foam, leaves, debris) from frame to frame: a 2-D "
+                   "velocity. Best with distinct floating tracers; weak on smooth water.",
+        }
+
+        def _sync_methods(change=None):
+            for m, box in compare_boxes.items():
+                box.disabled = m == method_dd.value
+                if box.disabled and box.value:
+                    box.value = False
+            s.method = method_dd.value
+            s.compare = [m for m in METHODS if compare_boxes[m].value and m != s.method]
+            method_note.value = f"<div class='stiv-help'>{_method_notes[s.method]}</div>"
+            if change is not None:          # not while the step is still being built
+                self._refresh_summary()
+
+        _sync_methods()
+        method_dd.observe(_sync_methods, names="value")
+        for box in compare_boxes.values():
+            box.observe(_sync_methods, names="value")
+        method_card = _card(
+            "Velocity method",
+            method_dd, method_note,
+            W.HBox([W.HTML("<span class='stiv-help'>Also run, to compare:&nbsp;</span>"),
+                    *compare_boxes.values()], layout=W.Layout(flex_flow="row wrap",
+                                                              align_items="center")),
+            _help("Methods run to compare are measured in the same pass over the video and shown "
+                  "beside the reported one, each with its own discharge; only the reported one is "
+                  "in the headline numbers."))
 
         discharge_chk = W.Checkbox(value=s.discharge_enabled, indent=False,
                                    description="Also compute discharge (needs a depth / bathymetry file)",
@@ -2096,11 +2166,18 @@ class Wizard:
             s.frame_step = int(frame_step_box.value) if frame_step_box.value.strip().isdigit() else None
             s.window_px = window_px.value
             s.edge_trim = edge_trim.value
+            s.estimator = estimator_dd.value
+            try:
+                ia = float(ia_box.value.strip()) if ia_box.value.strip() else None
+            except ValueError:
+                ia = None
+            s.ia_size_m = ia if ia is not None and ia > 0 else None
             s.alpha = alpha.value
             s.bank_coefficient = bank_coeff.value
             self._refresh_summary()
 
-        for w_ in (n_stations, vrange, stabilise, frame_step_box, window_px, edge_trim, alpha, bank_coeff):
+        for w_ in (n_stations, vrange, stabilise, frame_step_box, window_px, edge_trim, estimator_dd,
+                   ia_box, alpha, bank_coeff):
             w_.observe(_sync, names="value")
 
         names_card = []
@@ -2138,6 +2215,7 @@ class Wizard:
                         + ". The expected velocity range bounds the search: make it generous, but "
                           "not absurd."),
                   n_stations, vrange, advanced),
+            method_card,
             _card("Camera motion", stabilise),
             _card("Discharge", discharge_chk, discharge_box),
             _card("Output", out_dir_box, pdf_chk,
@@ -2192,6 +2270,10 @@ class Wizard:
             bank_coefficient=s.bank_coefficient,
             out_dir=self._out_dir(),
             sections=sections,
+            method=s.method,
+            compare=s.compare,
+            estimator=s.estimator,
+            ia_size_m=s.ia_size_m,
         )
         raw["output"]["pdf_report"] = bool(s.pdf_report)
         for entry, sec in zip(raw.get("sections", []), secs):
@@ -2241,6 +2323,10 @@ class Wizard:
             section_row,
             ("Stations", str(s.n_stations) + (" at each" if len(secs) > 1 else "")),
             ("Expected velocity range", f"{s.velocity_range[0]:.1f} to {s.velocity_range[1]:.1f} m/s"),
+            ("Velocity method", METHOD_LABELS[s.method]
+             + (" (FFT angle)" if s.method == "stiv" and s.estimator == "fft" else "")
+             + (f" <span class='stiv-help'>compared with "
+                f"{', '.join(METHOD_LABELS[m] for m in s.compare)}</span>" if s.compare else "")),
             ("Drone-motion compensation", "on" if s.stabilise else "off"),
             ("Water outline", water if len(s.water_pts) >= 3 or s.extra_water_polys
              else "found when the analysis runs (auto, from the survey file)"
@@ -2507,6 +2593,7 @@ class Wizard:
         panes, titles = [], []
         for name, title in (("velocity_map.png", "Flow map"), ("velocity_profile.png", "Velocity profile"),
                             ("overview.png", "Section check"), ("sti_panel.png", "Space-time"),
+                            ("correlation_panel.png", "LS-PIV correlation"), ("tracks.png", "Tracks"),
                             ("discharge.png", "Discharge")):
             img = self._image(out / name)
             if img is not None:
@@ -2515,7 +2602,10 @@ class Wizard:
         table_out = W.Output()
         with table_out:
             df = result.to_frame()
-            cols = ["station_m", "velocity_ms", "velocity_std_ms", "coherency", "flags"]
+            quality = {"stiv": ["coherency"], "lspiv": ["velocity_cross_ms", "peak_ratio"],
+                       "ptv": ["velocity_cross_ms", "n_measurements"]}[result.method]
+            cols = (["station_m", "velocity_ms", "velocity_std_ms"] + quality
+                    + [f"velocity_{m}_ms" for m in result.comparisons] + ["flags"])
             display(df[cols].round(3))
         panes.append(table_out)
         titles.append("Table")
@@ -2523,7 +2613,29 @@ class Wizard:
         titles.append("Run report")
         head = ([W.HTML(f"<div class='stiv-help'>{_esc(result.config.section.name)} &middot; "
                         f"{result.geometry.width_m:.1f} m wide</div>")] if survey is not None else [])
-        return W.VBox(head + [W.HTML(_tiles(tiles) + warn_html), self._tabs(panes, titles)])
+        compared = []
+        if result.comparisons:
+            # Each method side by side; the headline numbers above are the
+            # reported method's alone.
+            rows = []
+            has_q = any(result.discharge_for(m) is not None for m in result.methods)
+            for m in result.methods:
+                st = result.stations_for(m)
+                vm = np.array([x.velocity_ms for x in st], dtype=float)
+                fin = vm[np.isfinite(vm)]
+                q = result.discharge_for(m)
+                rows.append(
+                    f"<tr><td><b>{METHOD_LABELS[m]}</b>{' (reported)' if m == result.method else ''}</td>"
+                    f"<td>{sum(1 for x in st if not x.failed)} / {len(st)}</td>"
+                    f"<td>{f'{fin.mean():.2f}' if fin.size else '–'}</td>"
+                    f"<td>{f'{fin.max():.2f}' if fin.size else '–'}</td>"
+                    + (f"<td>{q.discharge_m3s:.3f}</td>" if q is not None else ("<td>–</td>" if has_q else ""))
+                    + "</tr>")
+            compared = [_card("Methods compared", W.HTML(
+                "<table class='stiv-table'><tr><th>method</th><th>passing QC</th><th>mean U (m/s)</th>"
+                "<th>max U (m/s)</th>" + ("<th>Q (m³/s)</th>" if has_q else "") + "</tr>"
+                + "".join(rows) + "</table>"))]
+        return W.VBox(head + [W.HTML(_tiles(tiles) + warn_html), *compared, self._tabs(panes, titles)])
 
     def _survey_view(self, survey, out: Path) -> W.VBox:
         """Every cross-section side by side: the table, and the figures with all of them."""

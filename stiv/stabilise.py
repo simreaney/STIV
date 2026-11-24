@@ -249,6 +249,41 @@ def _fit_transform(src: np.ndarray, dst: np.ndarray, model: str, threshold_px: f
     return M, (inl.ravel().astype(bool) if inl is not None else None)
 
 
+def track_forward_backward(
+    prev: np.ndarray, cur: np.ndarray, pts: np.ndarray, guess: np.ndarray, max_fb_px: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pyramidal Lucas-Kanade from ``prev`` to ``cur``, checked by tracking back.
+
+    ``pts`` are float32 ``(n, 2)`` positions in ``prev`` and ``guess`` the
+    starting estimate of where they are in ``cur``.  Returns their positions in
+    ``cur`` and which of them to trust: tracked both ways, and landing within
+    ``max_fb_px`` of where they started when tracked back.
+    """
+    nxt, status, _ = cv2.calcOpticalFlowPyrLK(
+        prev, cur,
+        pts.reshape(-1, 1, 2),
+        guess.reshape(-1, 1, 2).copy(),
+        flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+        **_LK_PARAMS,
+    )
+    nxt = nxt.reshape(-1, 2)
+    ok = status.ravel().astype(bool)
+
+    # Forward-backward consistency: track back and keep only the features
+    # that land where they started.
+    if ok.any():
+        back, status_b, _ = cv2.calcOpticalFlowPyrLK(
+            cur, prev,
+            nxt.reshape(-1, 1, 2).astype(np.float32),
+            pts.reshape(-1, 1, 2).copy(),
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+            **_LK_PARAMS,
+        )
+        fb_err = np.linalg.norm(back.reshape(-1, 2) - pts, axis=1)
+        ok &= status_b.ravel().astype(bool) & (fb_err < max_fb_px)
+    return nxt, ok
+
+
 def transform_points(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
     """Apply a 3x3 image transform to ``(n, 2)`` points."""
     p = np.asarray(pts, dtype=np.float64)
@@ -345,28 +380,7 @@ class Stabiliser:
         guess = transform_points(self.M, self.ref_pts).astype(np.float32)
         guess = np.where(self.alive[:, None], self.cur_pts, guess).astype(np.float32)
 
-        nxt, status, _ = cv2.calcOpticalFlowPyrLK(
-            self.ref, cur,
-            self.ref_pts.reshape(-1, 1, 2),
-            guess.reshape(-1, 1, 2).copy(),
-            flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
-            **_LK_PARAMS,
-        )
-        nxt = nxt.reshape(-1, 2)
-        ok = status.ravel().astype(bool)
-
-        # Forward-backward consistency: track back and keep only the features
-        # that land where they started.
-        if ok.any():
-            back, status_b, _ = cv2.calcOpticalFlowPyrLK(
-                cur, self.ref,
-                nxt.reshape(-1, 1, 2).astype(np.float32),
-                self.ref_pts.reshape(-1, 1, 2).copy(),
-                flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
-                **_LK_PARAMS,
-            )
-            fb_err = np.linalg.norm(back.reshape(-1, 2) - self.ref_pts, axis=1)
-            ok &= status_b.ravel().astype(bool) & (fb_err < _MAX_FB_ERROR_PX)
+        nxt, ok = track_forward_backward(self.ref, cur, self.ref_pts, guess, _MAX_FB_ERROR_PX)
 
         M, inliers = (None, None)
         if ok.sum() >= _MIN_INLIERS:

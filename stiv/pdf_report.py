@@ -36,7 +36,7 @@ from matplotlib.patches import FancyBboxPatch
 
 from . import __version__, plotting
 from .analysis import StivResult, SurveyResult
-from .config import Config, yaml_text
+from .config import METHOD_LABELS, Config, yaml_text
 
 #: A4 portrait, inches.
 A4 = (8.27, 11.69)
@@ -112,11 +112,15 @@ def _section_pages(pdf: PdfPages, result: StivResult, cfg: Config, created: date
     if result.discharge is not None:
         plotting.plot_discharge(result, pdf, dpi)
     plotting.plot_overview(result, pdf, dpi)
+    if result.correlations:
+        plotting.plot_correlation_panel(result, pdf, dpi=dpi)
+    if result.tracks is not None:
+        plotting.plot_tracks(result, pdf, dpi)
     if result.stis:
         plotting.plot_sti_panel(result, pdf, dpi=dpi)
-    n = len(result.stations)
+    n = len(result.stis)
     for i in sorted({0, n // 2, n - 1}) if n else []:
-        if 0 <= i < len(result.stis) and result.fields[i] is not None:
+        if result.fields[i] is not None or result.estimates[i] is not None:
             plotting.plot_sti_detail(result, i, pdf, dpi)
 
     _stations(pdf, result)
@@ -298,7 +302,11 @@ def _summary(pdf: PdfPages, result: StivResult, cfg: Config, created: datetime,
                            f"(frame step {cfg.video.frame_step})")
     pages.pair("Scale", geom.rectifier.describe())
     pages.pair("Cross-section", f"{geom.width_m:.2f} m wide, {len(result.stations)} stations, "
-                                f"{cfg.stiv.search_line_length_m:g} m search lines")
+                                f"{plotting._what_measures(result)}")
+    if result.method != "stiv" or result.comparisons:
+        pages.pair("Method", METHOD_LABELS[result.method]
+                   + (f", compared with {', '.join(METHOD_LABELS[m] for m in result.comparisons)}"
+                      if result.comparisons else ""))
     pages.pair("Expected velocity", f"{cfg.stiv.velocity_range_ms[0]:g} to "
                                     f"{cfg.stiv.velocity_range_ms[1]:g} m/s")
     pages.pair("Camera motion", result.stabilisation.summary())
@@ -341,11 +349,16 @@ def _figure_guide(pages: _Pages, survey: bool = False) -> None:
         "a cross is a station with no velocity."
         + (" The survey's flow map draws every section at one scale, so arrows compare "
            "between sections." if survey else ""),
-        "Velocity profile: the surface velocity across the section with its spread, and the "
-        "coherency of each station below -- 1 for a clean streak pattern, 0 for none.",
-        "Section check: where the cross-section and the search lines were laid on the frame.",
+        "Velocity profile: the surface velocity across the section with its spread, and each "
+        "station's quality below -- for STIV the coherency, 1 for a clean streak pattern and 0 "
+        "for none; for LS-PIV the correlation peak ratio; for particle tracking the number of "
+        "tracks. Methods run for comparison are drawn as dashed lines.",
+        "Section check: where the cross-section and the search lines (or LS-PIV interrogation "
+        "areas, or tracking boxes) were laid on the frame.",
         "Space-time images: the streaks the velocities were measured from. Their angle is the "
         "speed; no streaks, no measurement.",
+        "LS-PIV correlation: one plane per station on velocity axes; one clear, round peak is "
+        "a good measurement. Particle tracks: every track that counted, coloured by speed.",
     ):
         pages.wrapped(text, bullet=True, colour=plotting.INK_2)
         pages.gap(2)
@@ -417,20 +430,36 @@ def _survey_summary(pdf: PdfPages, survey: SurveyResult, cfg: Config, created: d
 def _stations(pdf: PdfPages, result: StivResult) -> None:
     pages = _Pages(pdf, "Velocity by station",
                    f"STIV report  -  {result.config.section.name}  -  stiv {__version__}")
-    pages.wrapped("Distance is measured along the cross-section from its start. ± is the "
-                  "spread of the station's angle estimate. Flags explain a station that failed "
-                  "or was changed by quality control.", colour=plotting.INK_2)
+    spread = {
+        "stiv": "the spread of the station's angle estimate",
+        "lspiv": "the scatter of its one-second LS-PIV sub-ensembles",
+        "ptv": "the scatter of the tracks through its box",
+    }[result.method]
+    pages.wrapped(f"Distance is measured along the cross-section from its start. ± is "
+                  f"{spread}. Flags explain a station that failed or was changed by quality "
+                  f"control.", colour=plotting.INK_2)
     pages.gap(6)
-    header = f"{'station':>8} {'velocity':>9} {'±':>7} {'coherency':>9} {'tan phi':>8}  flags"
+    if result.method == "stiv":
+        header = f"{'station':>8} {'velocity':>9} {'±':>7} {'coherency':>9} {'tan phi':>8}  flags"
+        units = f"{'(m)':>8} {'(m/s)':>9} {'(m/s)':>7}"
+    else:
+        second = "peak ratio" if result.method == "lspiv" else "tracks"
+        header = f"{'station':>8} {'velocity':>9} {'±':>7} {'across':>7} {second:>10}  flags"
+        units = f"{'(m)':>8} {'(m/s)':>9} {'(m/s)':>7} {'(m/s)':>7}"
     pages.text(header, size=8, mono=True, weight="bold")
-    pages.text(f"{'(m)':>8} {'(m/s)':>9} {'(m/s)':>7}", size=8, mono=True, colour=plotting.MUTED,
-               gap=2)
+    pages.text(units, size=8, mono=True, colour=plotting.MUTED, gap=2)
     for s in result.stations:
         flags = ", ".join(s.flags)
         colour = plotting.CRITICAL if s.failed else plotting.INK
-        pages.text(f"{s.station_m:8.2f} {_fmt(s.velocity_ms):>9} {_fmt(s.velocity_std_ms):>7} "
-                   f"{_fmt(s.coherency, 2):>9} {_fmt(s.tan_phi, 2):>8}  {flags}",
-                   size=8, mono=True, colour=colour)
+        if result.method == "stiv":
+            row = (f"{s.station_m:8.2f} {_fmt(s.velocity_ms):>9} {_fmt(s.velocity_std_ms):>7} "
+                   f"{_fmt(s.coherency, 2):>9} {_fmt(s.tan_phi, 2):>8}  {flags}")
+        else:
+            second = (_fmt(s.peak_ratio, 2) if result.method == "lspiv"
+                      else str(s.n_measurements))
+            row = (f"{s.station_m:8.2f} {_fmt(s.velocity_ms):>9} {_fmt(s.velocity_std_ms):>7} "
+                   f"{_fmt(s.velocity_cross_ms):>7} {second:>10}  {flags}")
+        pages.text(row, size=8, mono=True, colour=colour)
     pages.close_page()
 
 

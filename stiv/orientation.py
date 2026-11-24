@@ -391,6 +391,147 @@ def _parabolic_peak(centres: np.ndarray, hist: np.ndarray) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# the Fourier alternative to the structure tensor (stiv.estimator: fft)
+# --------------------------------------------------------------------------- #
+#: Directions the spectrum is sampled along, over the half-turn.
+_SPECTRAL_ANGLES = 720
+#: Spatial frequencies, cycles per sample, between which the spectrum is read:
+#: below, the window's own leakage round zero frequency; above, little but
+#: noise survives the STI's smoothing.
+_SPECTRAL_R_MAX = 0.45
+_SPECTRAL_R_MIN_BINS = 3.0
+#: Fewest rows and columns an STI needs for its spectrum to mean anything.
+MIN_SPECTRAL_SIZE = 16
+
+
+@dataclass
+class SpectralProfile:
+    """Mean power of an STI's 2-D spectrum along each direction.
+
+    Streaks ``g(x, t) = f(x - c t)`` put all of their energy on the line
+    ``k_t = -c k_x`` through the origin of the spectrum, so the direction that
+    holds most power gives ``tan phi = c``.  ``phi`` here is that streak angle,
+    in the convention of :class:`OrientationField`.
+    """
+
+    phi: np.ndarray        # (n,) radians, ascending over (-pi/2, pi/2)
+    power: np.ndarray      # (n,) mean spectral power along that direction
+
+
+def spectral_profile(sti: np.ndarray, n_angles: int = _SPECTRAL_ANGLES) -> SpectralProfile:
+    """The power of ``sti``'s spectrum along each streak direction.
+
+    The spectrum is Welch's: the average over square, half-overlapping tiles
+    as tall and wide as the STI's shorter side, each tapered by a 2-D Hann
+    window so its edges do not draw a cross through the spectrum.  Square
+    tiles matter: the taper smears the spectrum by about a bin in each
+    direction, and on a rectangle those bins differ in size, which skews the
+    line towards one axis and the velocity by a few percent.  The power is then
+    read along a ray at each angle by bilinear interpolation, and averaged.
+    """
+    from scipy.ndimage import map_coordinates
+
+    a = np.nan_to_num(np.asarray(sti, dtype=np.float64))
+    n_t, n_x = a.shape
+    if min(n_t, n_x) < MIN_SPECTRAL_SIZE:
+        raise ValueError(
+            f"STI of {n_t} x {n_x} is too small for its spectrum: need at least "
+            f"{MIN_SPECTRAL_SIZE} rows and columns"
+        )
+    n = min(n_t, n_x)
+    taper = np.outer(np.hanning(n), np.hanning(n))
+    long_axis = 0 if n_t >= n_x else 1
+    length = a.shape[long_axis]
+    n_tiles = max(1, int(math.ceil((length - n) / (0.5 * n))) + 1)
+    starts = np.unique(np.round(np.linspace(0, length - n, n_tiles)).astype(int))
+    power = np.zeros((n, n))
+    for s in starts:
+        tile = a[s:s + n, :] if long_axis == 0 else a[:, s:s + n]
+        tile = (tile - tile.mean()) * taper
+        power += np.abs(np.fft.fft2(tile)) ** 2
+    power = np.fft.fftshift(power / len(starts))
+
+    step = math.pi / n_angles
+    phi = -0.5 * math.pi + step * (np.arange(n_angles) + 0.5)
+    r = np.arange(_SPECTRAL_R_MIN_BINS / n, _SPECTRAL_R_MAX, 0.5 / n)
+    kx = r[None, :] * np.cos(phi)[:, None]
+    kt = -r[None, :] * np.sin(phi)[:, None]
+    rows = n // 2 + kt * n
+    cols = n // 2 + kx * n
+    vals = map_coordinates(power, [rows.ravel(), cols.ravel()], order=1, mode="nearest")
+    return SpectralProfile(phi=phi, power=vals.reshape(rows.shape).mean(axis=1))
+
+
+def spectral_estimate(profile: SpectralProfile, phi_min: float, phi_max: float) -> AngleEstimate:
+    """The streak angle within ``[phi_min, phi_max]``, from a :func:`spectral_profile`.
+
+    The angle is the parabolically refined peak of the profile.  The fields
+    that the Eq. (14) estimate fills from its windows are filled to the same
+    purpose:
+
+    * ``phi_std`` is the peak's half-width at half its height above the
+      profile's median, as a Gaussian standard deviation;
+    * ``mean_coherency`` is how far the peak stands above that median, as a
+      fraction of its height -- 1 for a clean line, 0 for none -- so the
+      coherency test of quality control still means "is there a pattern";
+    * ``hist`` and ``bin_centres`` hold the profile over the range.
+    """
+    if phi_min >= phi_max:
+        raise ValueError(f"need phi_min < phi_max, got {phi_min} and {phi_max}")
+    sel = (profile.phi >= phi_min) & (profile.phi <= phi_max)
+    centres = profile.phi[sel]
+    p = profile.power[sel]
+    base = float(np.median(profile.power))
+
+    def _none() -> AngleEstimate:
+        return AngleEstimate(
+            phi=math.nan, tan_phi=math.nan, phi_std=math.nan, valid_fraction=0.0,
+            mean_coherency=0.0, n_used=0, hist=p, bin_centres=centres,
+            phi_min=phi_min, phi_max=phi_max,
+        )
+
+    if p.size < 3 or not np.isfinite(p).all():
+        return _none()
+    i = int(np.argmax(p))
+    peak = float(p[i])
+    if not peak > base:
+        return _none()
+    phi_hat = _parabolic_peak(centres, p)
+
+    # Half-width at half height, walked out on the full profile so that a
+    # peak near the edge of the range is not cut short by it.
+    full = profile.power
+    j = int(np.flatnonzero(sel)[i])
+    half = base + 0.5 * (peak - base)
+    step = float(profile.phi[1] - profile.phi[0])
+    widths = []
+    for direction in (-1, 1):
+        k = j
+        while 0 <= k + direction < len(full) and full[k + direction] > half:
+            k += direction
+        if 0 <= k + direction < len(full):
+            a0, a1 = float(full[k]), float(full[k + direction])
+            frac = (a0 - half) / (a0 - a1) if a0 != a1 else 0.0
+            widths.append((abs(k - j) + frac) * step)
+        else:
+            widths.append(abs(k - j) * step)
+    hwhm = max(0.5 * (widths[0] + widths[1]), 0.5 * step)
+
+    return AngleEstimate(
+        phi=phi_hat,
+        tan_phi=float(math.tan(phi_hat)),
+        phi_std=hwhm / math.sqrt(2.0 * math.log(2.0)),
+        valid_fraction=1.0,
+        mean_coherency=(peak - base) / peak,
+        n_used=int(sel.sum()),
+        hist=p,
+        bin_centres=centres,
+        phi_min=phi_min,
+        phi_max=phi_max,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # velocity conversion
 # --------------------------------------------------------------------------- #
 def velocity_from_angle(phi: float, sx_m_per_px: float, st_s_per_px: float) -> float:

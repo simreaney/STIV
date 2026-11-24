@@ -324,7 +324,96 @@ class StiConfig:
     #: "eq14" is the paper's weighted mean.  "peak" instead takes the
     #: parabolically interpolated mode of the summed histogram, which is more
     #: robust when a strong secondary peak (wind waves, glare) is present.
+    #: "fft" skips the structure tensor and reads the streak angle from the
+    #: STI's 2-D Fourier spectrum, whose energy lies along a line at right
+    #: angles to the streaks; it copes better with noisy, low-contrast STIs.
     estimator: str = "eq14"
+
+
+#: The velocity methods, by the name the config gives them.
+METHODS = ("stiv", "lspiv", "ptv")
+#: How the report names each method.
+METHOD_LABELS = {"stiv": "STIV", "lspiv": "LS-PIV", "ptv": "PTV"}
+
+
+@dataclass
+class VelocimetryConfig:
+    """Which methods measure the surface velocity.
+
+    ``method`` gives the profile that is reported, quality-controlled and
+    integrated into the discharge.  Each method in ``compare`` is run in the
+    same pass over the video and reported alongside it, with a discharge of its
+    own, so the methods can be checked against each other.
+
+    * ``stiv``  -- space-time image velocimetry along streamwise search lines
+      (the ``stiv`` block): streamwise velocity only, robust to sparse texture.
+    * ``lspiv`` -- large-scale particle image velocimetry (the ``lspiv`` block):
+      a small ortho-image patch at each station is cross-correlated between
+      frames, giving a 2-D surface velocity.  Needs dense, lasting texture.
+    * ``ptv``   -- particle tracking (the ``ptv`` block): corners on the water
+      are followed by Lucas-Kanade optical flow, as in KLT-IV.  Best with
+      sparse, distinct tracers such as foam or debris.
+
+    LS-PIV and PTV share ``stiv.velocity_range_ms`` (their search range and
+    outlier test) and ``stiv.search_line_length_m`` (the streamwise extent of
+    the box each station's tracks are counted in).
+    """
+
+    method: str = "stiv"
+    compare: Sequence[str] = field(default_factory=list)
+
+    @property
+    def methods(self) -> list[str]:
+        """Every method to run: the reported one first, then those compared."""
+        return [self.method] + [m for m in self.compare if m != self.method]
+
+
+@dataclass
+class LspivConfig:
+    """Large-scale PIV: patch cross-correlation at each station."""
+
+    #: Side of the square interrogation area, metres.  ``None`` uses the
+    #: spacing of the stations, but no less than 17 samples and no more than
+    #: ``stiv.search_line_length_m``.
+    ia_size_m: Optional[float] = None
+    #: Spacing of the ortho-image samples, metres.  ``None`` takes the finest
+    #: image pixel over the patch, coarsened if the interrogation area would
+    #: otherwise exceed 64 samples.
+    gsd_m: Optional[float] = None
+    #: Frames (after ``video.frame_step``) between the two images of each
+    #: correlated pair.  ``None`` picks the largest step for which the fastest
+    #: speed of ``stiv.velocity_range_ms`` still moves the texture no more than
+    #: the interrogation area's width.
+    pair_step: Optional[int] = None
+    #: "mean" subtracts the clip's mean patch from every patch, which removes
+    #: static texture -- glare, the bank, rocks -- that would otherwise
+    #: correlate at zero displacement and drag the velocity towards zero;
+    #: "none" leaves the patches as sampled.
+    background: str = "mean"
+
+
+@dataclass
+class PtvConfig:
+    """Particle tracking: Lucas-Kanade tracks of features on the water."""
+
+    #: Frames (after ``video.frame_step``) each track is followed for before
+    #: its velocity is taken and new features are detected.
+    track_frames: int = 5
+    #: Most features detected at a time, across every station's box.
+    max_features: int = 400
+    #: Corner quality relative to the best corner (``cv2.goodFeaturesToTrack``).
+    quality_level: float = 0.01
+    #: Least distance between two features, image pixels.
+    min_distance_px: int = 5
+    #: A track whose backward track misses its start by more than this many
+    #: pixels is dropped.
+    fb_error_px: float = 0.5
+    #: A track whose direction is more than this many degrees off the flow
+    #: axis is dropped.
+    max_angle_deg: float = 45.0
+    #: A track that moves less than this many pixels over its frames is taken
+    #: for static texture (glare, a rock) and dropped.
+    min_displacement_px: float = 0.5
 
 
 @dataclass
@@ -348,6 +437,10 @@ class QualityConfig:
     interpolate_flagged: bool = True
     #: Median-filter window (stations) applied across the profile; 0 disables.
     median_filter_stations: int = 0
+    #: LS-PIV: least ratio of the correlation peak to the next highest peak.
+    min_peak_ratio: float = 1.2
+    #: PTV: fewest tracks a station needs.
+    min_tracks: int = 5
 
 
 @dataclass
@@ -398,6 +491,9 @@ class Config:
     flow: FlowConfig = field(default_factory=FlowConfig)
     stabilise: StabiliseConfig = field(default_factory=StabiliseConfig)
     stiv: StiConfig = field(default_factory=StiConfig)
+    velocimetry: VelocimetryConfig = field(default_factory=VelocimetryConfig)
+    lspiv: LspivConfig = field(default_factory=LspivConfig)
+    ptv: PtvConfig = field(default_factory=PtvConfig)
     quality: QualityConfig = field(default_factory=QualityConfig)
     discharge: DischargeConfig = field(default_factory=DischargeConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -614,8 +710,8 @@ class Config:
             raise ConfigError("stiv.window_overlap must be in [0, 1)")
         if st.gradient_order not in {2, 4, 6}:
             raise ConfigError("stiv.gradient_order must be 2, 4 or 6")
-        if st.estimator not in {"eq14", "peak"}:
-            raise ConfigError("stiv.estimator must be 'eq14' or 'peak'")
+        if st.estimator not in {"eq14", "peak", "fft"}:
+            raise ConfigError("stiv.estimator must be 'eq14', 'peak' or 'fft'")
         _check_len(st.velocity_range_ms, 2, "stiv.velocity_range_ms", "[min, max]")
         lo, hi = st.velocity_range_ms
         if lo >= hi:
@@ -680,8 +776,56 @@ class Config:
         if any(not 0.0 <= c <= 1.0 for c in st.coherency_levels):
             raise ConfigError("stiv.coherency_levels must all be in [0, 1]")
 
+        self._validate_methods()
+
         if self.output.dpi < 1:
             raise ConfigError("output.dpi must be >= 1")
+
+    def _validate_methods(self) -> None:
+        """The ``velocimetry``, ``lspiv`` and ``ptv`` blocks, and their thresholds."""
+        vm, lp, pt, q = self.velocimetry, self.lspiv, self.ptv, self.quality
+        names = ", ".join(repr(m) for m in METHODS)
+        if vm.method not in METHODS:
+            raise ConfigError(f"velocimetry.method must be one of {names}; got {vm.method!r}")
+        for m in vm.compare:
+            if m not in METHODS:
+                raise ConfigError(f"velocimetry.compare may list only {names}; got {m!r}")
+        if vm.method in vm.compare:
+            raise ConfigError(
+                f"velocimetry.compare lists {vm.method!r}, which is already velocimetry.method: "
+                f"compare names the methods to run *alongside* the reported one"
+            )
+        if len(set(vm.compare)) != len(vm.compare):
+            raise ConfigError("velocimetry.compare lists a method more than once")
+
+        if lp.ia_size_m is not None and not lp.ia_size_m > 0:
+            raise ConfigError("lspiv.ia_size_m must be > 0, or null to follow the station spacing")
+        if lp.gsd_m is not None and not lp.gsd_m > 0:
+            raise ConfigError("lspiv.gsd_m must be > 0, or null for the image's own resolution")
+        if lp.pair_step is not None and lp.pair_step < 1:
+            raise ConfigError("lspiv.pair_step must be >= 1, or null to choose it automatically")
+        if lp.background not in {"mean", "none"}:
+            raise ConfigError("lspiv.background must be 'mean' or 'none'")
+
+        if pt.track_frames < 1:
+            raise ConfigError("ptv.track_frames must be >= 1")
+        if pt.max_features < 1:
+            raise ConfigError("ptv.max_features must be >= 1")
+        if not 0.0 < pt.quality_level < 1.0:
+            raise ConfigError("ptv.quality_level must be in (0, 1)")
+        if pt.min_distance_px < 1:
+            raise ConfigError("ptv.min_distance_px must be >= 1")
+        if not pt.fb_error_px > 0:
+            raise ConfigError("ptv.fb_error_px must be > 0")
+        if not 0.0 < pt.max_angle_deg <= 90.0:
+            raise ConfigError("ptv.max_angle_deg must be in (0, 90]")
+        if pt.min_displacement_px < 0:
+            raise ConfigError("ptv.min_displacement_px must be >= 0")
+
+        if not q.min_peak_ratio >= 1.0:
+            raise ConfigError("quality.min_peak_ratio must be >= 1 (a peak is never below itself)")
+        if q.min_tracks < 1:
+            raise ConfigError("quality.min_tracks must be >= 1")
 
     def _validate_sections(self) -> None:
         """Validate a multi-section survey: each section as the run will see it."""
@@ -1073,6 +1217,10 @@ def survey_dict(
     bank_coefficient: float = DischargeConfig.bank_coefficient,
     out_dir: str = OutputConfig.out_dir,
     sections: Optional[Sequence[dict[str, Any]]] = None,
+    method: str = VelocimetryConfig.method,
+    compare: Sequence[str] = (),
+    estimator: str = StiConfig.estimator,
+    ia_size_m: Optional[float] = LspivConfig.ia_size_m,
 ) -> dict[str, Any]:
     """The raw config of a new survey, with every default taken from the schema.
 
@@ -1093,6 +1241,10 @@ def survey_dict(
     ``start_px``, ``end_px``, ``name`` and ``bathymetry_csv`` above.  A list
     of one is written as the usual single ``section``, so a survey of one
     cross-section reads the same whichever way it was built.
+
+    ``method`` and ``compare`` choose the velocity methods (see
+    :class:`VelocimetryConfig`); ``ia_size_m`` is written only when LS-PIV is
+    one of them.
     """
     if sections is not None and len(sections) == 1:
         (only,) = sections
@@ -1167,7 +1319,11 @@ def survey_dict(
             "search_line_length_m": float(search_line_length_m),
             "window_px": int(window_px),
             "velocity_range_ms": [float(v) for v in velocity_range_ms],
+            "estimator": str(estimator),
         },
+        "velocimetry": {"method": str(method), "compare": [str(m) for m in compare]},
+        **({"lspiv": {"ia_size_m": None if ia_size_m is None else float(ia_size_m)}}
+           if "lspiv" in [method, *compare] else {}),
         "discharge": {
             "enabled": bathymetry_csv is not None,
             "bathymetry_csv": bathymetry_csv,
