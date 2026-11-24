@@ -744,3 +744,48 @@ class TestWizard:
         """)
         subprocess.run([sys.executable, "-c", code, str(clip)],
                        cwd=Path(__file__).resolve().parents[1], check=True)
+
+    def test_upload_offers_videos_and_loads_one_with_its_flight_log(self, nb, clip, tmp_path,
+                                                                    monkeypatch):
+        """The accept list was built as "..mp4", so a browser offered only the
+        .srt files; and an uploaded video was not recognised as one."""
+        import ipywidgets as W
+
+        assert ".mp4" in nb._UPLOAD_ACCEPT.split(",") and ".srt" in nb._UPLOAD_ACCEPT.split(",")
+        assert not any(a.startswith("..") for a in nb._UPLOAD_ACCEPT.split(","))
+
+        monkeypatch.chdir(tmp_path)
+        srt = "1\n00:00:00,000 --> 00:00:00,033\n[rel_alt: 30.000 abs_alt: 99.0]\n"
+
+        class Upload:                                # ipywidgets 8's FileUpload.value
+            value = ({"name": "flight.SRT", "content": memoryview(srt.encode())},
+                     {"name": "FLIGHT.MP4", "content": memoryview(clip.read_bytes())})
+
+        wz = nb.Wizard()
+        status = W.HTML()
+        wz._on_upload(Upload(), status)
+        assert "Loaded" in status.value, status.value
+        assert Path(wz.state.video_path).name == "FLIGHT.MP4"
+        assert len(wz.state.srt_records) == 1
+
+    def test_a_late_ipympl_install_is_made_visible_to_matplotlib(self, nb, monkeypatch):
+        """Colab starts matplotlib before the setup cell installs ipympl;
+        matplotlib then refuses it until its list of backends is re-read."""
+        from matplotlib.backends import backend_registry
+
+        cleared = []
+        monkeypatch.setattr(backend_registry, "is_valid_backend", lambda name: False)
+        monkeypatch.setattr(backend_registry, "_clear", lambda: cleared.append(True))
+        nb._refresh_matplotlib_backends()
+        assert cleared == [True]
+
+        monkeypatch.setattr(backend_registry, "is_valid_backend", lambda name: True)
+        nb._refresh_matplotlib_backends()
+        assert cleared == [True], "a backend matplotlib already accepts is left alone"
+
+    def test_the_picker_error_says_why(self, nb, monkeypatch):
+        import IPython
+
+        monkeypatch.setattr(IPython, "get_ipython", lambda: None)
+        with pytest.raises(RuntimeError, match="not running inside an IPython"):
+            nb.Wizard()._ensure_interactive_backend()

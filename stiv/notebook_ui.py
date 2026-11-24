@@ -82,7 +82,12 @@ WARNING = "#fab219"
 MUTED = "#898781"
 
 _VIDEO_PATTERNS = ["*.mp4", "*.MP4", "*.mov", "*.MOV", "*.avi", "*.AVI", "*.mkv", "*.m4v"]
-_VIDEO_SUFFIXES = {p[1:].lower() for p in _VIDEO_PATTERNS}
+#: The same, as bare suffixes: "mp4", "mov", ...
+_VIDEO_SUFFIXES = {p.split(".")[-1].lower() for p in _VIDEO_PATTERNS}
+#: What the upload button lets the browser offer: the videos and their flight
+#: logs.  ``video/*`` as well as the suffixes, since some browsers filter by
+#: type rather than by name.
+_UPLOAD_ACCEPT = ",".join(["video/*"] + sorted("." + x for x in _VIDEO_SUFFIXES) + [".srt"])
 #: Label width shared by every form field, so the boxes line up.
 _DESC = {"description_width": "190px"}
 
@@ -93,16 +98,22 @@ def _field(width: str = "440px") -> W.Layout:
     return W.Layout(width=width)
 
 
-# Colours come from JupyterLab's theme variables, with light fallbacks for
-# Colab and classic Notebook, so the panel reads in light and dark themes.
+# Two colours come from the host -- the text and the background, from
+# JupyterLab's theme or VS Code's, else plain light ones for Colab -- and every
+# other shade is mixed from that pair.  So the panel follows a light or dark
+# theme, and its quieter text stays readable in both: JupyterLab's own
+# secondary text colours are 54% and 38% black, too faint for instructions, and
+# a tile or panel shaded independently of the text can end up light-on-light.
 _CSS = """<style>
 .stiv-wiz {
-  --stiv-bg: var(--jp-layout-color1, #ffffff);
-  --stiv-bg2: var(--jp-layout-color2, #f4f4f1);
-  --stiv-fg: var(--jp-ui-font-color1, #1d1d1b);
-  --stiv-fg2: var(--jp-ui-font-color2, #5e5d59);
-  --stiv-fg3: var(--jp-ui-font-color3, #8a8984);
-  --stiv-line: var(--jp-border-color2, #e3e2dc);
+  --stiv-bg: var(--jp-layout-color1, var(--vscode-editor-background, #ffffff));
+  --stiv-fg: var(--jp-ui-font-color1, var(--vscode-editor-foreground, #1d1d1b));
+  --stiv-fg2: color-mix(in srgb, var(--stiv-fg) 88%, var(--stiv-bg));
+  --stiv-fg3: color-mix(in srgb, var(--stiv-fg) 74%, var(--stiv-bg));
+  --stiv-bg2: color-mix(in srgb, var(--stiv-fg) 5%, var(--stiv-bg));
+  --stiv-line: color-mix(in srgb, var(--stiv-fg) 18%, var(--stiv-bg));
+  /* The palette's green, as text: darkened on a light page, lightened on a dark. */
+  --stiv-green-text: color-mix(in srgb, #1baf7a 62%, var(--stiv-fg));
   background: var(--stiv-bg); color: var(--stiv-fg);
   border: 1px solid var(--stiv-line); border-radius: 12px; overflow: hidden;
   max-width: 1180px;
@@ -118,9 +129,9 @@ _CSS = """<style>
   height: 30px; font-weight: 500; }
 .stiv-wiz button.stiv-step.stiv-current { background: #eb6834 !important; color: #fff !important;
   font-weight: 650; opacity: 1 !important; }
-.stiv-wiz button.stiv-step.stiv-done { color: #1baf7a !important; font-weight: 600; }
+.stiv-wiz button.stiv-step.stiv-done { color: var(--stiv-green-text) !important; font-weight: 600; }
 .stiv-wiz button.stiv-step.stiv-done:hover { background: var(--stiv-bg2) !important; }
-.stiv-wiz button.stiv-step:disabled { cursor: default; opacity: .75; }
+.stiv-wiz button.stiv-step:disabled { cursor: default; opacity: 1; }
 .stiv-wiz .stiv-main { gap: 18px; padding: 16px 20px 18px; flex-flow: row wrap;
   align-items: flex-start; }
 .stiv-wiz .stiv-content { flex: 1 1 560px; min-width: 0; }
@@ -131,7 +142,7 @@ _CSS = """<style>
 .stiv-wiz .stiv-card { border: 1px solid var(--stiv-line); border-radius: 10px;
   padding: 10px 14px 12px; margin: 0 0 12px; }
 .stiv-wiz .stiv-card-title { font-weight: 650; margin: 0 0 4px; color: var(--stiv-fg); }
-.stiv-wiz .stiv-help { color: var(--stiv-fg2); font-size: .9em; margin: 4px 0; line-height: 1.45; }
+.stiv-wiz .stiv-help { color: var(--stiv-fg2); font-size: .92em; margin: 4px 0; line-height: 1.45; }
 .stiv-wiz .stiv-callout { border-radius: 8px; padding: 8px 12px; margin: 4px 0 10px;
   line-height: 1.45; border: 1px solid; border-left-width: 4px; color: var(--stiv-fg); }
 .stiv-wiz .stiv-info { background: rgba(42,120,214,.08); border-color: rgba(42,120,214,.5); }
@@ -150,7 +161,7 @@ _CSS = """<style>
 .stiv-wiz .stiv-summary .row { display: flex; gap: 8px; padding: 5px 0;
   border-top: 1px solid var(--stiv-line); font-size: .87em; line-height: 1.35; }
 .stiv-wiz .stiv-summary .mark { width: 14px; flex: none; text-align: center; color: var(--stiv-fg3); }
-.stiv-wiz .stiv-summary .mark.ok { color: #1baf7a; font-weight: 700; }
+.stiv-wiz .stiv-summary .mark.ok { color: var(--stiv-green-text); font-weight: 700; }
 .stiv-wiz .stiv-summary .lbl { color: var(--stiv-fg2); }
 .stiv-wiz .stiv-summary .val { color: var(--stiv-fg); font-weight: 600; word-break: break-word; }
 .stiv-wiz .stiv-summary .sub { color: var(--stiv-fg3); font-size: .92em; }
@@ -161,7 +172,7 @@ _CSS = """<style>
   border: 1px solid var(--stiv-line); border-radius: 999px; padding: 1px 10px;
   margin: 0 4px 4px 0; font-size: .85em; color: var(--stiv-fg2); }
 .stiv-wiz .stiv-chips span.now { border-color: #eb6834; color: var(--stiv-fg); font-weight: 600; }
-.stiv-wiz .stiv-chips span.done { color: #1baf7a; }
+.stiv-wiz .stiv-chips span.done { color: var(--stiv-green-text); }
 .stiv-wiz table.stiv-table { border-collapse: collapse; font-size: .92em; margin: 4px 0; }
 .stiv-wiz table.stiv-table td, .stiv-wiz table.stiv-table th { padding: 3px 14px 3px 0;
   text-align: left; vertical-align: top; }
@@ -261,6 +272,31 @@ def _drive_dir() -> Optional[Path]:
 def _browse_root() -> str:
     d = _drive_dir()
     return str(d) if d else str(Path.cwd())
+
+
+def _refresh_matplotlib_backends() -> None:
+    """Let matplotlib see the ipympl backend when it was installed after start-up.
+
+    Matplotlib 3.9 and later read the list of installed backends once per
+    session.  In Colab the notebook's setup cell installs ipympl after that --
+    Colab starts matplotlib before any cell runs -- and from then on ipympl is
+    refused ("not a valid value for backend"), even as it is imported, until
+    the session restarts.  Clearing the list makes matplotlib read it afresh.
+    ``_clear`` is matplotlib's own reset, private; if it ever goes, the picker
+    says to restart the session instead.
+    """
+    try:
+        from matplotlib.backends import backend_registry
+    except ImportError:              # matplotlib < 3.9 keeps no such list
+        return
+    try:
+        if backend_registry.is_valid_backend("module://ipympl.backend_nbagg"):
+            return
+        reset = getattr(backend_registry, "_clear", None)
+        if callable(reset):
+            reset()
+    except Exception:                # a refresh is a courtesy; never the failure itself
+        pass
 
 
 def _read_survey(path: str | Path) -> Config:
@@ -766,7 +802,7 @@ class Wizard:
         fc.title = "<b>Browse to a drone video</b>"
         fc.register_callback(lambda chooser: self._load_video(chooser.selected, is_demo=False,
                                                               status=own_status))
-        upload = W.FileUpload(accept=",".join(sorted("." + x for x in _VIDEO_SUFFIXES)) + ",.srt,.SRT",
+        upload = W.FileUpload(accept=_UPLOAD_ACCEPT,
                               multiple=True, description="Upload files", icon="upload")
         upload.observe(lambda _c: self._on_upload(upload, own_status), names="value")
         where = (
@@ -1287,13 +1323,19 @@ class Wizard:
             ip = get_ipython()
             if ip is None:
                 raise RuntimeError("not running inside an IPython/Jupyter kernel")
+            _refresh_matplotlib_backends()
             ip.run_line_magic("matplotlib", "widget")
         except Exception as exc:
+            if _in_colab():
+                fix = ("Run the notebook's setup cell first (it turns on the widget support ipympl "
+                       "needs). If it has run, use Runtime > Restart session, then run the cells "
+                       "again: the setup cell installed ipympl after matplotlib had started.")
+            else:
+                fix = (f"Install it with `{INSTALL_COMMAND}`, then restart the kernel and re-run "
+                       f"this cell.")
             raise RuntimeError(
-                "the interactive picker needs the ipympl backend and a running Jupyter kernel. "
-                f"Install it with `{INSTALL_COMMAND}`, then restart the kernel and re-run this cell"
-                + (" (in Colab, run the notebook's setup cell first: it turns on the widget manager "
-                   "ipympl needs)." if _in_colab() else ".")
+                f"the interactive picker needs the ipympl backend and a running Jupyter kernel "
+                f"({exc}). {fix}"
             ) from exc
 
     def _picker_frame(self) -> bool:
@@ -1722,8 +1764,7 @@ class Wizard:
         out_dir_box.observe(_on_out_dir, names="value")
 
         pdf_chk = W.Checkbox(value=s.pdf_report, indent=False,
-                             description="Also write a PDF report (report.pdf): the summary, every "
-                                         "figure, the station table and these settings in one document",
+                             description="Also write a PDF report (report.pdf)",
                              layout=W.Layout(width="auto"))
 
         def _on_pdf(change):
@@ -1754,7 +1795,9 @@ class Wizard:
             _card("Camera motion", stabilise),
             _card("Discharge", discharge_chk, discharge_box),
             _card("Output", out_dir_box, pdf_chk,
-                  _help("Running again into the same folder replaces the results already there.")),
+                  _help("The PDF holds the summary, every figure, the station table and these "
+                        "settings in one document, to keep or hand in. Running again into the same "
+                        "folder replaces the results already there.")),
         ])
 
     # ------------------------------------------------------------------ #
