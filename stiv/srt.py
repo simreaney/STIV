@@ -131,6 +131,18 @@ def parse_srt_text(text: str) -> list[SrtRecord]:
     return records
 
 
+def shortest_focal_len(records: Sequence[SrtRecord]) -> Optional[float]:
+    """The shortest 35 mm-equivalent focal length the log records, mm; None if none.
+
+    Over the whole log, not an analysis window: it is the lens's own focal
+    length unless the zoom was on throughout, and so says which lens it was
+    (:func:`stiv.cameras.preset_for_focal_length`).
+    """
+    focal = [r.focal_len_mm for r in records
+             if r.focal_len_mm is not None and math.isfinite(r.focal_len_mm) and r.focal_len_mm > 0]
+    return min(focal) if focal else None
+
+
 def altitude_stats(records: Sequence[SrtRecord], start_s: float = 0.0,
                    duration_s: Optional[float] = None) -> Optional[AltitudeStats]:
     """Height above take-off over the analysis window; None if not logged.

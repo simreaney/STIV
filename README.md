@@ -111,9 +111,13 @@ jupyter lab notebooks/STIV_Interactive.ipynb
 2. **Scale** -- enter a ground resolution directly, or let it derive from
    flight altitude and camera field of view: pick a DJI drone from the list
    (Mini 3/4/5 Pro, Air 2S/3/3S, Mavic Pro, Mavic 2 Pro, Mavic 3, ...) and its
-   horizontal FOV is filled in. If the drone saved a flight log (`.SRT`, same
+   horizontal FOV is filled in. When the video names its drone in its own
+   metadata, as the Mini 4/5 Pro, Air 3/3S and Mavic 3 do, it is chosen for
+   you (older DJIs mostly do not). If the drone saved a flight log (`.SRT`, same
    name as the video) its altitude is offered too, once you say how far the
-   take-off point was above the water. Nothing here is assumed: every velocity
+   take-off point was above the water, and the focal length it records is
+   checked against the drone chosen: a log reading about 22 mm can only be an
+   Air 2S, so it is suggested. Nothing here is assumed: every velocity
    is proportional to the scale. Also sets which part of the clip to analyse.
 3. **Cross-section** -- click the section and a downstream point on the frame
    at the analysis start time (the frame the drone-motion correction measures
@@ -189,6 +193,11 @@ sample distance, and suggests a `frame_step` for the velocity you expect.
 Mavic Pro, Mavic 2 Pro, Mavic 3, Phantom 4 Pro). For any other camera give
 `--hfov-deg` -- the horizontal field of view, not the diagonal one most spec
 sheets quote (see [About the field of view](#interactive-notebook-ui)).
+Give neither and the drone is read from the video file when it names one:
+the Mini 4 Pro, Mini 5 Pro, Air 3, Air 3S and Mavic 3 record it in a metadata
+track, though older DJIs (the Air 2S among them) mostly do not, and editing
+software usually strips it. The output says which drone was found and where;
+a `--camera` that disagrees with the file is warned about.
 
 If the drone saved its flight log beside the video (`.SRT`, same name --
 "video captions" in the DJI app), `stiv info` reports the height it recorded.
@@ -201,6 +210,11 @@ stiv info flight.mp4 --camera mini-4-pro --takeoff-height 1.5
 
 (`0` if you took off at water level.) When the log shows the camera was
 zoomed, you are told the narrower field of view to use instead of the preset.
+The log's focal length also says which lenses could have recorded it, since
+zoom only ever lengthens it. The Air 2S's 22 mm lens is the widest of the
+presets (all the others are 24 mm or longer), so a log reading about 22 mm
+suggests `--camera air-2s`, and a `--camera` whose lens is longer than the log
+shows is warned about.
 `--altitude-m` and `--takeoff-height` are alternatives, as are `--camera` and
 `--hfov-deg`; `stiv init` and `stiv pick` take the same options, and write the
 scale into the survey, with a comment saying where each number came from.
@@ -321,6 +335,11 @@ is `StationResult.velocity_spread_ms` (`velocity_std_ms` still works).
 ---
 
 ## Getting good numbers
+
+Much of this is decided before take-off. For which drone to use and how to set it
+up, see [`droneRecommendations.md`](droneRecommendations.md): frame rate and
+resolution against the speeds you expect, codec and bit rate (with tests on
+compressed footage), hover precision, and a field checklist.
 
 **The water must have visible texture.** STIV measures the motion of a *pattern*.
 Ripples, boils, foam, floating debris and suspended sediment all work; a glassy
@@ -549,6 +568,7 @@ stiv/
   notebook_ui.py  interactive point selection + full workflow (Jupyter wizard)
   cameras.py      field-of-view presets for DJI drones (diagonal -> horizontal)
   srt.py          reads DJI flight logs (.SRT) for the altitude
+  videometa.py    reads which drone recorded a video from its own metadata
   watermask.py    automatic water outline for the drone-motion correction
   synthetic.py    synthetic river with known ground truth
   cli.py          command line
@@ -558,6 +578,7 @@ notebooks/
 
 tools/
   strip_notebooks.py       keeps run outputs out of committed notebooks
+  codec_test/              compression tests behind droneRecommendations.md
 ```
 
 ## Limitations

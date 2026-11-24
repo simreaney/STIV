@@ -130,6 +130,107 @@ class TestCameraPresets:
 
 
 # --------------------------------------------------------------------------- #
+class TestCameraFromVideo:
+    """The drone the video names in its metadata stands in for --camera.
+
+    Reading the name is tested in test_videometa.py; here the reader is stood
+    in for, since the clip must also be one OpenCV can decode."""
+
+    @pytest.fixture
+    def names(self, monkeypatch):
+        from stiv import videometa
+        from stiv.cameras import preset_for_name
+
+        calls = []
+
+        def install(name, source=videometa.TRACK):
+            def fake(path):
+                calls.append(path)
+                return videometa.CameraId(name, source, preset_for_name(name)) if name else None
+            monkeypatch.setattr(videometa, "identify_camera", fake)
+            return calls
+        return install
+
+    def test_init_uses_the_drone_the_video_names(self, drifting, tmp_path, capsys, names):
+        names("DJI Mini4 Pro")
+        out = tmp_path / "s.yaml"
+        assert _init(drifting[1], out, "--altitude-m", "40") == 0
+        assert yaml.safe_load(out.read_text())["rectify"] == {
+            "method": "scale", "altitude_m": 40.0, "hfov_deg": 69.7}
+        note = 'hfov_deg 69.7 for the DJI Mini 4 Pro, as the video\'s DJI metadata track says "DJI Mini4 Pro"'
+        assert any(note in ln for ln in _header(out))
+        assert note in capsys.readouterr().out
+
+    def test_info_asks_only_for_the_altitude(self, drifting, capsys, names):
+        names("FC3411", "model tag")
+        assert cli.main(["info", str(drifting[1])]) == 0
+        out = capsys.readouterr().out
+        assert "for the DJI Air 2S" in out
+        assert "pass --altitude-m (or --takeoff-height, with a flight log)\n" in out
+        assert "and --camera (or --hfov-deg)" not in out
+
+    def test_a_different_camera_is_warned_about(self, drifting, tmp_path, capsys, names):
+        names("DJI Mini4 Pro")
+        out = tmp_path / "s.yaml"
+        assert _init(drifting[1], out, "--camera", "air-2s", "--altitude-m", "40") == 0
+        assert yaml.safe_load(out.read_text())["rectify"]["hfov_deg"] == 77.6     # as asked
+        err = capsys.readouterr().err
+        assert "--camera air-2s is the DJI Air 2S" in err and "--camera mini-4-pro would give 69.7" in err
+
+    def test_the_same_camera_is_not(self, drifting, tmp_path, capsys, names):
+        names("DJI Mini4 Pro")
+        assert _init(drifting[1], tmp_path / "s.yaml", "--camera", "mini-4-pro") == 0
+        assert "warning" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize("extra", [["--hfov-deg", "70"], ["--m-per-px", "0.02"]])
+    def test_a_scale_given_outright_is_not_second_guessed(self, drifting, tmp_path, names, extra):
+        calls = names("DJI Mini4 Pro")
+        assert _init(drifting[1], tmp_path / "s.yaml", *extra) == 0
+        assert calls == []
+
+    def test_not_read_for_ground_control(self, drifting, names):
+        import argparse
+
+        calls = names("DJI Mini4 Pro")
+        sc = cli._resolve_scale(argparse.Namespace(gcps=True), drifting[1])
+        assert calls == [] and sc.hfov_deg is None
+
+    def test_a_drone_with_no_preset_is_reported(self, drifting, tmp_path, capsys, names):
+        names("DJI Avata2")
+        out = tmp_path / "s.yaml"
+        assert _init(drifting[1], out) == 0
+        assert yaml.safe_load(out.read_text())["rectify"]["m_per_px"] is None
+        assert 'says "DJI Avata2", a camera not in the drone list' in capsys.readouterr().out
+
+    def test_nothing_named_leaves_the_scale_open(self, drifting, tmp_path, names):
+        names(None)
+        out = tmp_path / "s.yaml"
+        assert _init(drifting[1], out) == 0
+        assert yaml.safe_load(out.read_text())["rectify"]["m_per_px"] is None
+
+    def test_not_used_for_vertical_video(self, tmp_path, capsys, names):
+        import cv2
+
+        names("DJI Mini4 Pro")
+        video = tmp_path / "tall.mp4"
+        writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 10, (96, 160))
+        for _ in range(5):
+            writer.write(np.zeros((160, 96, 3), np.uint8))
+        writer.release()
+        out = tmp_path / "s.yaml"
+        assert _init(video, out) == 0
+        assert yaml.safe_load(out.read_text())["rectify"]["m_per_px"] is None
+        assert "vertical mode" in capsys.readouterr().out
+
+    def test_zoom_is_still_caught(self, flight, tmp_path, capsys, names):
+        names("DJI Mini4 Pro")
+        flight.with_suffix(".SRT").write_text(_srt(focal=48.0), encoding="utf-8")
+        assert _init(flight, tmp_path / "s.yaml", "--takeoff-height", "0") == 0
+        narrowed = camera("mini-4-pro").zoomed_hfov_deg(48.0)
+        assert f"--hfov-deg {narrowed:.1f} instead of the preset" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
 class TestFlightLog:
     def test_info_reports_it_without_calling_it_the_altitude(self, flight, capsys):
         assert cli.main(["info", str(flight), "--camera", "mini-4-pro"]) == 0
@@ -385,3 +486,149 @@ def test_wizard_reopens_an_auto_survey(drifting, tmp_path):
     wz.state.water_source = "manual"
     assert not wz._water_at_run()
     assert len(wz._build_config().stabilise.water_mask_px[0]) == 3
+
+
+# --------------------------------------------------------------------------- #
+def _widgets(w):
+    yield w
+    for child in getattr(w, "children", ()):
+        yield from _widgets(child)
+
+
+def test_wizard_chooses_the_drone_the_video_names(drifting, tmp_path, monkeypatch):
+    pytest.importorskip("ipywidgets")
+    pytest.importorskip("ipyfilechooser")
+    import ipywidgets as W
+
+    from stiv import videometa
+    from stiv.cameras import preset_for_name
+    from stiv.notebook_ui import Wizard
+
+    named = {"name": "DJI Mini4 Pro"}
+    monkeypatch.setattr(videometa, "identify_camera", lambda path: videometa.CameraId(
+        named["name"], videometa.TRACK, preset_for_name(named["name"])))
+
+    wz = Wizard()
+    status = W.HTML()
+    wz._load_video(str(drifting[1]), is_demo=False, status=status)
+    s = wz.state
+    assert (s.scale_mode, s.camera_key, s.hfov_deg) == ("flight", "mini-4-pro", 69.7)
+    assert "recorded by a <b>DJI Mini 4 Pro</b>" in status.value
+
+    step = wz._build_step1()
+    html = lambda: " ".join(w.value for w in _widgets(step) if isinstance(w, W.HTML))
+    assert "Chosen from the video itself" in html()
+    dropdown = next(w for w in _widgets(step) if isinstance(w, W.Dropdown)
+                    and w.description == "Drone / camera")
+    dropdown.value = "air-2s"
+    assert "not the DJI Air 2S" in html() and "Chosen from the video" not in html()
+
+    # Reopening a survey: the Mini 3 Pro and Mini 4 Pro share a field of view,
+    # and the video says which it was.
+    raw = _raw(drifting[1], tmp_path / "results")
+    raw["rectify"] = {"method": "scale", "altitude_m": 40.0, "hfov_deg": 69.7}
+    path = tmp_path / "config_used.yaml"
+    Config.from_dict(raw).dump_yaml(path)
+    for name, key in (("DJI Mini 3 Pro", "mini-3-pro"), ("DJI Mini4 Pro", "mini-4-pro")):
+        named["name"] = name
+        wz._reopen_survey(str(path), W.HTML())
+        assert wz.state.camera_key == key
+
+
+def test_wizard_names_a_drone_it_has_no_preset_for(drifting, monkeypatch):
+    pytest.importorskip("ipywidgets")
+    pytest.importorskip("ipyfilechooser")
+    import ipywidgets as W
+
+    from stiv import videometa
+    from stiv.notebook_ui import Wizard
+
+    monkeypatch.setattr(videometa, "identify_camera",
+                        lambda path: videometa.CameraId("DJI Avata2", videometa.TRACK, None))
+    wz = Wizard()
+    status = W.HTML()
+    wz._load_video(str(drifting[1]), is_demo=False, status=status)
+    assert wz.state.camera_key is None and wz.state.scale_mode == "manual"
+    assert "&ldquo;DJI Avata2&rdquo;" in status.value
+    step = wz._build_step1()
+    assert any("not in the list" in w.value for w in _widgets(step) if isinstance(w, W.HTML))
+
+
+# --------------------------------------------------------------------------- #
+class TestFocalLengthHint:
+    """A flight log logging a lens wider than 24 mm points to the Air 2S."""
+
+    HINT = "only the DJI Air 2S's lens is that wide"
+
+    @pytest.fixture
+    def air_2s(self, flight):
+        flight.with_suffix(".SRT").write_text(_srt(focal=22.4, plain=True), encoding="utf-8")
+        return flight
+
+    def test_info_points_to_the_air_2s(self, air_2s, capsys):
+        assert cli.main(["info", str(air_2s)]) == 0
+        out = capsys.readouterr().out
+        assert self.HINT in out and "--camera air-2s gives 77.6 deg" in out
+
+    def test_init_suggests_it_but_does_not_choose_it(self, air_2s, tmp_path, capsys):
+        out = tmp_path / "s.yaml"
+        assert _init(air_2s, out) == 0
+        assert yaml.safe_load(out.read_text())["rectify"]["m_per_px"] is None
+        assert any(self.HINT in ln for ln in _header(out))
+        assert self.HINT in capsys.readouterr().out
+
+    def test_a_drone_whose_lens_is_too_long_is_warned_about(self, air_2s, tmp_path, capsys):
+        assert _init(air_2s, tmp_path / "s.yaml", "--camera", "mini-4-pro") == 0
+        err = capsys.readouterr().err
+        assert "wider than the DJI Mini 4 Pro's 24 mm lens can give" in err
+        assert "--camera air-2s, 77.6 deg" in err
+
+    def test_the_air_2s_itself_is_quiet(self, air_2s, tmp_path, capsys):
+        assert _init(air_2s, tmp_path / "s.yaml", "--camera", "air-2s") == 0
+        cap = capsys.readouterr()
+        assert "warning" not in cap.err and self.HINT not in cap.out
+
+    def test_metadata_that_disagrees_with_the_log(self, air_2s, tmp_path, capsys, monkeypatch):
+        from stiv import videometa
+
+        monkeypatch.setattr(videometa, "identify_camera", lambda path: videometa.CameraId(
+            "DJI Mini4 Pro", videometa.TRACK, camera("mini-4-pro")))
+        assert _init(air_2s, tmp_path / "s.yaml") == 0
+        assert "wider than the DJI Mini 4 Pro's 24 mm lens" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("focal,extra", [
+        (24.0, []),                          # fits nearly every drone listed
+        (44.8, []),                          # a zoomed Air 2S, or a zoomed anything
+        (22.4, ["--hfov-deg", "77.6"]),      # the field of view is settled already
+        (22.4, ["--m-per-px", "0.02"]),
+    ])
+    def test_no_hint(self, flight, tmp_path, capsys, focal, extra):
+        flight.with_suffix(".SRT").write_text(_srt(focal=focal), encoding="utf-8")
+        assert _init(flight, tmp_path / "s.yaml", *extra) == 0
+        cap = capsys.readouterr()
+        assert "lens is that wide" not in cap.out + cap.err
+
+
+def test_wizard_points_to_the_air_2s_from_the_flight_log(flight):
+    pytest.importorskip("ipywidgets")
+    pytest.importorskip("ipyfilechooser")
+    import ipywidgets as W
+
+    from stiv.notebook_ui import Wizard
+
+    flight.with_suffix(".SRT").write_text(_srt(focal=22.4, plain=True), encoding="utf-8")
+    wz = Wizard()
+    status = W.HTML()
+    wz._load_video(str(flight), is_demo=False, status=status)
+    assert "flight log points to a <b>DJI Air 2S</b>" in status.value
+    assert wz.state.camera_key is None and wz.state.hfov_deg is None      # a hint, not a choice
+
+    step = wz._build_step1()
+    html = lambda: " ".join(w.value for w in _widgets(step) if isinstance(w, W.HTML))
+    dropdown = next(w for w in _widgets(step) if isinstance(w, W.Dropdown)
+                    and w.description == "Drone / camera")
+    assert "only the <b>DJI Air 2S</b>'s lens is that wide" in html()
+    dropdown.value = "mini-4-pro"
+    assert "wider than the DJI Mini 4 Pro's 24 mm lens can give" in html()
+    dropdown.value = "air-2s"
+    assert "lens is that wide" not in html() and "lens can give" not in html()

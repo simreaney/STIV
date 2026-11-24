@@ -39,7 +39,7 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-from .cameras import DJI_CAMERAS, camera
+from .cameras import DJI_CAMERAS, camera, preset_for_focal_length
 from .config import (
     FRAME_STEP_SPEEDS_MS,
     Config,
@@ -58,6 +58,7 @@ from .config import (
     suggest_frame_step,
     survey_dict,
 )
+from .srt import shortest_focal_len
 from .video import VideoInfo, probe, read_frame_at
 
 #: How to install what this module needs, from GitHub.
@@ -406,6 +407,9 @@ class _State:
     hfov_deg: Optional[float] = None
     #: A key of :data:`stiv.cameras.DJI_CAMERAS`, "custom", or None.
     camera_key: Optional[str] = None
+    #: The camera the video names in its own metadata (a
+    #: :class:`stiv.videometa.CameraId`), or None.
+    camera_id: Optional[object] = None
     #: Height of the take-off point above the water, for the flight-log altitude.
     takeoff_height_m: Optional[float] = None
 
@@ -1014,9 +1018,26 @@ class Wizard:
         s.frame_t_s = 0.0
         s.duration_s = default_duration_s(info.duration_s)
         self._read_flight_log()
+        self._identify_camera()
+        named = s.camera_id
+        # The drone the file names is chosen for the user, who can still change
+        # it -- except in the vertical mode, which no preset describes.
+        if named is not None and named.preset is not None and info.height <= info.width:
+            s.scale_mode = "flight"
+            s.camera_key = named.preset.key
+            s.hfov_deg = round(named.preset.hfov_deg, 1)
         msg = f"Loaded <b>{_esc(Path(path).name)}</b>."
         if s.srt_records:
             msg += f" Found its flight log, <code>{_esc(Path(s.srt_path).name)}</code>."
+        if named is not None:
+            what = (f"a <b>{_esc(named.preset.label)}</b>" if named.preset
+                    else f"&ldquo;{_esc(named.name)}&rdquo;")
+            msg += f" The file says it was recorded by {what}."
+        if named is None or named.preset is None:
+            likely = preset_for_focal_length(shortest_focal_len(s.srt_records))
+            if likely is not None:
+                msg += (f" Its flight log points to a <b>{_esc(likely.label)}</b>, from the focal "
+                        f"length it records (see the next step).")
         status.value = _callout("ok", msg) + (
             "" if info.fps > 0 else
             _callout("warn", "The file does not record its frame rate; you will be asked for it in the "
@@ -1024,6 +1045,13 @@ class Wizard:
         )
         self._refresh_preview()
         self._refresh_summary()
+
+    def _identify_camera(self) -> None:
+        from .videometa import identify_camera
+
+        s = self.state
+        s.camera_id = (identify_camera(s.video_path)
+                       if s.video_path and not s.is_demo else None)
 
     def _read_flight_log(self) -> None:
         from .srt import find_srt, parse_srt
@@ -1104,6 +1132,7 @@ class Wizard:
         s.fps_override = cfg.video.fps_override
         s.frame_step = cfg.video.frame_step if cfg.video.frame_step > 1 else None
         self._read_flight_log()
+        self._identify_camera()
 
         r = cfg.rectify
         if r.m_per_px is not None:
@@ -1111,6 +1140,11 @@ class Wizard:
         elif r.altitude_m is not None and r.hfov_deg is not None:
             s.scale_mode, s.altitude_m, s.hfov_deg = "flight", float(r.altitude_m), float(r.hfov_deg)
             match = [p for p in DJI_CAMERAS if abs(round(p.hfov_deg, 1) - s.hfov_deg) < 0.051]
+            # Drones can share a field of view (the Mini 3 Pro and Mini 4 Pro
+            # do); the one the video names is the one it was.
+            named = s.camera_id.preset if s.camera_id is not None else None
+            if named in match:
+                match = [named]
             s.camera_key = match[0].key if match else "custom"
         else:
             # Sensor width and focal length, which the wizard has no boxes for.
@@ -1314,6 +1348,12 @@ class Wizard:
                              _help("Height above the <b>water surface</b>, not the take-off point."),
                              cam_dd, hfov_box, cam_note, fov_help])
 
+        named = s.camera_id
+        # The lens the flight log records: zoom only lengthens it, so no lens
+        # logs a focal length shorter than its own.
+        shortest = shortest_focal_len(s.srt_records)
+        likely = preset_for_focal_length(shortest)
+
         def _cam_note():
             preset = camera(cam_dd.value)
             if preset:
@@ -1322,6 +1362,37 @@ class Wizard:
                 cam_note.value = "<div class='stiv-help'>Enter your camera's horizontal field of view.</div>"
             else:
                 cam_note.value = ""
+            if named is not None:
+                said = f"&ldquo;{_esc(named.name)}&rdquo;"
+                if named.preset is None:
+                    cam_note.value += (
+                        f"<div class='stiv-help'>The video names its camera {said}, which is not in the "
+                        f"list: choose <i>Other camera</i> and type its horizontal field of view.</div>")
+                elif portrait:
+                    pass                            # the portrait warning says why not
+                elif cam_dd.value == named.preset.key:
+                    cam_note.value += (f"<div class='stiv-help'>Chosen from the video itself, whose "
+                                       f"metadata says {said}.</div>")
+                elif preset is not None:
+                    cam_note.value += _callout(
+                        "warn", f"The video's metadata says it was recorded by the "
+                                f"<b>{_esc(named.preset.label)}</b> ({said}), not the {_esc(preset.label)}. "
+                                f"Check which drone you flew.")
+            if shortest is None or portrait:
+                return
+            if preset is not None and not preset.can_log_focal_length(shortest):
+                cam_note.value += _callout(
+                    "warn", f"The flight log records a {shortest:g} mm-equivalent focal length, wider than "
+                            f"the {_esc(preset.label)}'s {preset.eq_focal_mm:g} mm lens can give"
+                            + (f": of the drones listed, only the <b>{_esc(likely.label)}</b>'s lens is "
+                               f"that wide" if likely else "")
+                            + ". Check which drone you flew.")
+            elif (likely is not None and not cam_dd.value
+                  and (named is None or named.preset is None)):
+                cam_note.value += _callout(
+                    "info", f"The flight log records a {shortest:g} mm-equivalent focal length, and of the "
+                            f"drones listed only the <b>{_esc(likely.label)}</b>'s lens is that wide. If "
+                            f"that is what you flew, choose it above.")
 
         def _on_cam(change):
             s.camera_key = change["new"] or None

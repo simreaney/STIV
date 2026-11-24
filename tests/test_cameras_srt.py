@@ -177,3 +177,36 @@ class TestSrt:
         (tmp_path / "DJI_0001.SRT").write_text(MODERN.replace("\n", "\r\n"), encoding="utf-8")
         srt = find_srt(video)
         assert srt is not None and len(parse_srt(srt)) == 3      # Windows line endings too
+
+
+# --------------------------------------------------------------------------- #
+class TestFocalLengthHint:
+    """Zoom only lengthens the logged focal length, so a log can rule drones out."""
+
+    @pytest.mark.parametrize("focal", [22.0, 22.4])
+    def test_only_the_air_2s_lens_is_that_wide(self, focal):
+        from stiv.cameras import preset_for_focal_length
+
+        assert preset_for_focal_length(focal) is camera("air-2s")
+
+    @pytest.mark.parametrize("focal", [24.0, 23.0, 26.0, 28.0, 44.8, 12.0, None, 0.0])
+    def test_anything_else_points_nowhere(self, focal):
+        """24 mm fits nearly every preset; 44.8 mm is a zoomed Air 2S or a
+        zoomed anything; 12 mm is a lens wider than any preset's."""
+        from stiv.cameras import preset_for_focal_length
+
+        assert preset_for_focal_length(focal) is None
+
+    def test_a_lens_cannot_log_wider_than_itself(self):
+        mini4 = camera("mini-4-pro")
+        assert not mini4.can_log_focal_length(22.4)
+        assert mini4.can_log_focal_length(23.9) and mini4.can_log_focal_length(48.0)
+        assert camera("air-2s").can_log_focal_length(22.4)
+
+    def test_shortest_focal_length_in_a_log(self):
+        from stiv.srt import shortest_focal_len
+
+        assert shortest_focal_len(parse_srt_text(MODERN)) == 24.0     # 24, 24, then 48 zoomed
+        assert shortest_focal_len(parse_srt_text(AIR_2S)) == 22.0     # logged as tenths: 220
+        assert shortest_focal_len(parse_srt_text(MAVIC_PRO)) is None
+        assert shortest_focal_len([]) is None

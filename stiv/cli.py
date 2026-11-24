@@ -13,7 +13,9 @@
 The scale can be given to info, init and pick as the flight geometry:
 ``--camera mini-4-pro`` (or ``--hfov-deg``) for the field of view, and
 ``--altitude-m`` -- or, with the drone's ``.SRT`` flight log beside the video,
-``--takeoff-height`` -- for the height above the water.
+``--takeoff-height`` -- for the height above the water.  Without ``--camera``,
+a video that names its drone in its own metadata (newer DJIs do) supplies the
+field of view.
 """
 
 from __future__ import annotations
@@ -130,7 +132,8 @@ def _resolve_scale(args, video: str | Path, start_s: float = 0.0,
     only with ``--takeoff-height`` -- the height of that point above the water
     -- and never stands in for height above the water on its own.
     """
-    from .srt import altitude_stats, find_srt, parse_srt
+    from .cameras import preset_for_focal_length
+    from .srt import altitude_stats, find_srt, parse_srt, shortest_focal_len
 
     m_per_px = getattr(args, "m_per_px", None)
     key, hfov = getattr(args, "camera", None), getattr(args, "hfov_deg", None)
@@ -154,19 +157,52 @@ def _resolve_scale(args, video: str | Path, start_s: float = 0.0,
 
     sc = _Scale(m_per_px=m_per_px, altitude_m=altitude, hfov_deg=hfov)
     preset = None
+    # The drone the video names in its own metadata, when the field of view is
+    # still open: --hfov-deg, --m-per-px and --gcps each settle it otherwise.
+    named = None
+    if m_per_px is None and hfov is None and not getattr(args, "gcps", False):
+        from .videometa import identify_camera
+
+        named = identify_camera(video)
     if key:
         preset = _camera_preset(key)
         # One decimal, as the notebook wizard writes it, so a survey set up
         # either way reads the same -- and reopens in the wizard as this drone.
         sc.hfov_deg = round(preset.hfov_deg, 1)
         sc.notes.append(f"hfov_deg {sc.hfov_deg:g} from --camera {preset.key}: {preset.describe()}")
+        if named is not None and named.preset is not None and named.preset.key != preset.key:
+            sc.warnings.append(
+                f"--camera {preset.key} is the {preset.label}, but {named.evidence}: the "
+                f"{named.preset.label}. Check which drone recorded it; --camera "
+                f"{named.preset.key} would give {named.preset.hfov_deg:.1f} deg"
+            )
+    elif named is not None and named.preset is not None:
+        from .video import probe
+
+        info = probe(video)
+        if info.height > info.width:
+            sc.notes.append(
+                f"{named.evidence} ({named.preset.label}), but the clip was shot in the "
+                f"vertical mode, which the preset does not describe; give --hfov-deg for "
+                f"that mode, or --m-per-px")
+        else:
+            preset = named.preset
+            sc.hfov_deg = round(preset.hfov_deg, 1)
+            sc.notes.append(
+                f"hfov_deg {sc.hfov_deg:g} for the {preset.label}, as {named.evidence}: "
+                f"{preset.describe()}. --camera or --hfov-deg overrides it")
+    elif named is not None:
+        sc.notes.append(f"{named.evidence}, a camera not in the drone list; give its "
+                        f"horizontal field of view with --hfov-deg")
 
     sc.srt = find_srt(video)
+    records = []
     if sc.srt is not None:
         try:
-            sc.srt_stats = altitude_stats(parse_srt(sc.srt), start_s, duration_s)
+            records = parse_srt(sc.srt)
         except OSError:
-            sc.srt_stats = None
+            records = []
+        sc.srt_stats = altitude_stats(records, start_s, duration_s)
     st = sc.srt_stats
 
     if takeoff is not None:
@@ -203,8 +239,27 @@ def _resolve_scale(args, video: str | Path, start_s: float = 0.0,
             f"{st.focal_len_mm / preset.eq_focal_mm:.1f}x digital zoom on the "
             f"{preset.label}'s {preset.eq_focal_mm:g} mm lens, so the view is narrower "
             f"than the preset's: about {narrowed:.1f} deg horizontally. If the zoom was "
-            f"on for this clip, use --hfov-deg {narrowed:.1f} instead of --camera"
+            f"on for this clip, use --hfov-deg {narrowed:.1f} instead of the preset"
         )
+
+    # The lens the log records says which drones could have flown: zoom only
+    # lengthens it, so no lens logs a focal length shorter than its own.
+    shortest = shortest_focal_len(records)
+    likely = preset_for_focal_length(shortest)
+    if shortest is not None and preset is not None and not preset.can_log_focal_length(shortest):
+        sc.warnings.append(
+            f"{sc.srt.name} logs a {shortest:g} mm-equivalent focal length, wider than the "
+            f"{preset.label}'s {preset.eq_focal_mm:g} mm lens can give"
+            + (f"; of the drones listed, only the {likely.label}'s lens is that wide "
+               f"(--camera {likely.key}, {likely.hfov_deg:.1f} deg)" if likely else "")
+            + ". Check which drone recorded it"
+        )
+    elif (likely is not None and preset is None and sc.hfov_deg is None and sc.m_per_px is None
+          and not getattr(args, "gcps", False)):
+        sc.notes.append(
+            f"{sc.srt.name} logs a {shortest:g} mm-equivalent focal length, and of the drones "
+            f"`stiv cameras` lists only the {likely.label}'s lens is that wide. If that is what "
+            f"flew, --camera {likely.key} gives {likely.hfov_deg:.1f} deg")
     return sc
 
 
@@ -243,7 +298,13 @@ def cmd_cameras(args) -> int:
           "horizontal one, which --camera KEY fills in (e.g. `stiv init clip.mp4\n"
           "--camera mini-4-pro --altitude-m 40`). The presets assume the normal\n"
           "landscape video mode, which uses the full sensor width: digital zoom,\n"
-          "cropped high-frame-rate modes and vertical shooting narrow the view.")
+          "cropped high-frame-rate modes and vertical shooting narrow the view.\n"
+          "\n"
+          "Without --camera or --hfov-deg, info, init and pick use the drone the\n"
+          "video names in its own metadata, when it names one: the Mini 4 Pro,\n"
+          "Mini 5 Pro, Air 3, Air 3S and Mavic 3 do; older DJIs mostly do not.\n"
+          "A flight log (.SRT) whose focal length reads about 22 mm points to the\n"
+          "Air 2S, the only drone listed with a lens that wide.")
     return 0
 
 
@@ -304,9 +365,14 @@ def cmd_info(args) -> int:
                   "you know it, or work it out as m_per_px * fps / U)")
     else:
         _report_scale(sc)
-        print("  pass --altitude-m (or --takeoff-height, with a flight log) and --camera "
-              "(or --hfov-deg)\n  to get a ground sample distance and a frame_step "
-              "suggestion; `stiv cameras` lists the drones")
+        need = []
+        if sc.altitude_m is None:
+            need.append("--altitude-m (or --takeoff-height, with a flight log)")
+        if sc.hfov_deg is None:
+            need.append("--camera (or --hfov-deg)")
+        print(f"  pass {' and '.join(need)}\n  to get a ground sample distance and a "
+              f"frame_step suggestion"
+              + ("; `stiv cameras` lists the drones" if sc.hfov_deg is None else ""))
     return 0
 
 
@@ -393,6 +459,8 @@ def cmd_init(args) -> int:
     }
     if sc.m_per_px is None and sc.altitude_m is None and sc.hfov_deg is None:
         header = _INIT_HEADER.format(info=info, **wording)
+        if sc.notes:                        # e.g. which drone the flight log points to
+            header = header.rstrip("\n") + "\n#\n" + _header_notes(sc) + "\n"
     else:
         missing = "".join(f"#   {m}\n" for m in sc.missing())
         header = _INIT_HEADER_SCALED.format(info=info, missing=missing,
@@ -625,7 +693,8 @@ def _add_scale_options(parser: argparse.ArgumentParser, m_per_px: bool = True) -
                         "horizontally); see --camera")
     g.add_argument("--camera", metavar="KEY",
                    help="a DJI drone, e.g. mini-4-pro, for its horizontal field of view; "
-                        "`stiv cameras` lists them")
+                        "`stiv cameras` lists them. Without it (or --hfov-deg), the drone "
+                        "the video names in its metadata is used, if it names one")
 
 
 def build_parser() -> argparse.ArgumentParser:
