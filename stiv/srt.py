@@ -77,12 +77,24 @@ class AltitudeStats:
 
 
 def find_srt(video_path: str | Path) -> Optional[Path]:
-    """The ``.SRT`` beside ``video_path`` with the same name, if there is one."""
+    """The ``.SRT`` beside ``video_path`` with the same name, if there is one.
+
+    The name is matched ignoring case -- ``DJI_0659.MP4`` finds
+    ``dji_0659.srt`` -- since a file copied or uploaded can change case, and on
+    Linux (Colab included) names that differ only in case are different files.
+    """
     p = Path(video_path)
     for suffix in (".SRT", ".srt", ".Srt"):
         q = p.with_suffix(suffix)
         if q.is_file():
             return q
+    wanted = (p.stem + ".srt").lower()
+    try:
+        for q in sorted(p.parent.iterdir()):
+            if q.name.lower() == wanted and q.is_file():
+                return q
+    except OSError:
+        pass
     return None
 
 

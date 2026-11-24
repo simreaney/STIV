@@ -160,6 +160,16 @@ class TestSrt:
         assert rec.altitude_m == 812.5
         assert altitude_stats([rec]) is None
 
+    def test_found_whatever_the_case_of_its_name(self, tmp_path):
+        """Uploads and copies can change a name's case; on Linux, Colab
+        included, FLIGHT.MP4 and flight.SRT are otherwise strangers."""
+        video = tmp_path / "FLIGHT.MP4"
+        video.write_bytes(b"")
+        (tmp_path / "flight.SRT").write_text(MODERN, encoding="utf-8")
+        found = find_srt(video)
+        assert found is not None and found.name.lower() == "flight.srt"
+        assert find_srt(tmp_path / "OTHER.MP4") is None
+
     def test_found_beside_the_video(self, tmp_path):
         video = tmp_path / "DJI_0001.MP4"
         video.write_bytes(b"")
