@@ -408,7 +408,8 @@ final class SurveyRecordingTests: XCTestCase {
         let folder = try XCTUnwrap(model.exportDirectory)
         XCTAssertEqual(folder.deletingLastPathComponent().standardizedFileURL,
                        URL.documentsDirectory.standardizedFileURL)
-        let names = ["report.txt", "summary.json", "survey.yaml", "velocity.csv", "velocity_map.png"]
+        let names = ["report.pdf", "report.txt", "summary.json", "survey.yaml", "velocity.csv",
+                     "velocity_map.png"]
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(),
                        names, "saved without Share being tapped")
         let saved = documents()
@@ -416,6 +417,14 @@ final class SurveyRecordingTests: XCTestCase {
         let png = try Data(contentsOf: folder.appendingPathComponent("velocity_map.png"))
         let picture = try XCTUnwrap(UIImage(data: png))
         XCTAssertEqual(picture.size.width * picture.scale, 1800, accuracy: 1)
+        // And the report: A4, titled, summary + figures + table + survey.
+        let report = try XCTUnwrap(pdfDocument(folder.appendingPathComponent("report.pdf")))
+        XCTAssertGreaterThanOrEqual(report.numberOfPages, 6)
+        XCTAssertEqual(report.page(at: 1)?.getBoxRect(.mediaBox).width ?? 0, 595.28, accuracy: 0.5)
+        XCTAssertEqual(pdfTitle(report), "STIV report - \(model.survey.section.name)")
+        for number in 1...report.numberOfPages {
+            XCTAssertTrue(pdfHasMarks(try XCTUnwrap(report.page(at: number))), "page \(number) is blank")
+        }
 
         XCTAssertEqual(model.survey.capture.frameStep, 2)
         model.setFrameStep(1)
@@ -557,4 +566,40 @@ final class SurveyRecordingTests: XCTestCase {
         model.updateThermalState(.nominal)
         XCTAssertNil(model.thermalWarning)
     }
+}
+
+// MARK: - reading back a PDF
+
+func pdfDocument(_ url: URL) -> CGPDFDocument? {
+    guard let data = try? Data(contentsOf: url) as CFData,
+          let provider = CGDataProvider(data: data) else { return nil }
+    return CGPDFDocument(provider)
+}
+
+func pdfTitle(_ document: CGPDFDocument) -> String? {
+    guard let info = document.info else { return nil }
+    var title: CGPDFStringRef?
+    guard CGPDFDictionaryGetString(info, "Title", &title), let title else { return nil }
+    return CGPDFStringCopyTextString(title) as String?
+}
+
+/// The text a PDF page draws, as far as `CGPDFScanner` can tell: enough to
+/// check a page is not blank, not to read it back word for word.
+func pdfHasMarks(_ page: CGPDFPage) -> Bool {
+    var operators = 0
+    let table = CGPDFOperatorTableCreate()!
+    for name in ["Tj", "TJ", "f", "S", "Do", "B"] {
+        CGPDFOperatorTableSetCallback(table, name) { _, info in
+            info!.assumingMemoryBound(to: Int.self).pointee += 1
+        }
+    }
+    withUnsafeMutablePointer(to: &operators) { counter in
+        let stream = CGPDFContentStreamCreateWithPage(page)
+        let scanner = CGPDFScannerCreate(stream, table, counter)
+        CGPDFScannerScan(scanner)
+        CGPDFScannerRelease(scanner)
+        CGPDFContentStreamRelease(stream)
+    }
+    CGPDFOperatorTableRelease(table)
+    return operators > 0
 }

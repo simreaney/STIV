@@ -165,8 +165,12 @@ layer proves, what it cannot, and the field protocol.
 ## Exports
 
 `velocity.csv`, `summary.json`, `report.txt` — columns matching the desktop's —
-`velocity_map.png`, and `survey.yaml`, which expresses the run as a
-`stiv.Config`. The flow map is the results screen's: an arrow per station, its
+`velocity_map.png`, `report.pdf`, and `survey.yaml`, which expresses the run
+as a `stiv.Config`. `report.pdf` is the desktop's PDF report for the phone: the
+headline velocities, the survey and every warning, then the flow map, the
+profile, the space-time images, the station table and `survey.yaml`, on A4
+pages -- one document to keep or hand in, which the results screen can also
+share on its own. The flow map is the results screen's: an arrow per station, its
 length proportional to the speed, as the desktop's `velocity_map.png` -- but
 drawn in plan, true to scale on the water, rather than over a frame, because a
 phone looks across a river at a shallow angle and in its own view a far-bank

@@ -468,13 +468,13 @@ final class SurveyModel: ObservableObject {
         waterSource = nil
         flowLooksReversed = false
         let started = collectWaterFrames(plane) { [weak self] frames in
-            guard let self, run == self.waterRun else { return }
-            DispatchQueue.global(qos: .userInitiated).async {
+            guard let model = self, run == model.waterRun else { return }
+            DispatchQueue.global(qos: .userInitiated).async { [weak model] in
                 let outline = detectWaterOutline(frames: frames, sectionStart: sectionStart,
                                                  sectionEnd: sectionEnd, downstream: downstream)
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, run == self.waterRun else { return }
-                    self.adopt(outline)
+                DispatchQueue.main.async { [weak model] in
+                    guard let model, run == model.waterRun else { return }
+                    model.adopt(outline)
                 }
             }
         }
@@ -886,8 +886,8 @@ final class SurveyModel: ObservableObject {
             urls.append(json)
 
             let yaml = directory.appendingPathComponent("survey.yaml")
-            try surveyYAML(result: result, bridge: bridge)
-                .write(to: yaml, atomically: true, encoding: .utf8)
+            let yamlText = surveyYAML(result: result, bridge: bridge)
+            try yamlText.write(to: yaml, atomically: true, encoding: .utf8)
             urls.append(yaml)
 
             let report = directory.appendingPathComponent("report.txt")
@@ -899,6 +899,10 @@ final class SurveyModel: ObservableObject {
                 try png.write(to: map)
                 urls.append(map)
             }
+
+            let pdf = directory.appendingPathComponent("report.pdf")
+            try ReportPDF.make(result: result, configYAML: yamlText).write(to: pdf)
+            urls.append(pdf)
         } catch {
             analysisError = "Could not write the export: \(error.localizedDescription)"
         }

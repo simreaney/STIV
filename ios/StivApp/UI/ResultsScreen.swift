@@ -104,6 +104,14 @@ struct ResultsScreen: View {
                     }
                     .font(.callout)
                 }
+                // The one document to keep or hand in: the summary, the
+                // figures, the station table and the survey, as report.pdf.
+                Button {
+                    shareItems = model.exportFiles().filter { $0.lastPathComponent == "report.pdf" }
+                    showingShare = !shareItems.isEmpty
+                } label: {
+                    Label("Share the PDF report", systemImage: "doc.richtext")
+                }
             }
 
             if model.canRetune {
@@ -359,25 +367,27 @@ struct StiSheet: View {
         }
     }
 
-    /// Render an STI as a greyscale image: space across, time down, as Fig. 4.
-    ///
-    /// From the single-precision preview StivKit keeps for display, so no
-    /// double-precision copy of the STI is made just to be thrown away.
-    private func stiImage(_ preview: StiPreview) -> UIImage? {
-        let bytes = displayBytes(preview)
-        guard !bytes.isEmpty else { return nil }
-        let provider = CGDataProvider(data: Data(bytes) as CFData)
-        guard let provider,
-              let cgImage = CGImage(
-                width: preview.cols, height: preview.rows,
-                bitsPerComponent: 8, bitsPerPixel: 8,
-                bytesPerRow: preview.cols,
-                space: CGColorSpaceCreateDeviceGray(),
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-                provider: provider, decode: nil,
-                shouldInterpolate: false, intent: .defaultIntent) else { return nil }
-        return UIImage(cgImage: cgImage)
-    }
+}
+
+/// Render an STI as a greyscale image: space across, time down, as Fig. 4.
+/// For the contact sheet and the PDF report.
+///
+/// From the single-precision preview StivKit keeps for display, so no
+/// double-precision copy of the STI is made just to be thrown away.
+func stiImage(_ preview: StiPreview) -> UIImage? {
+    let bytes = displayBytes(preview)
+    guard !bytes.isEmpty else { return nil }
+    let provider = CGDataProvider(data: Data(bytes) as CFData)
+    guard let provider,
+          let cgImage = CGImage(
+            width: preview.cols, height: preview.rows,
+            bitsPerComponent: 8, bitsPerPixel: 8,
+            bytesPerRow: preview.cols,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: provider, decode: nil,
+            shouldInterpolate: false, intent: .defaultIntent) else { return nil }
+    return UIImage(cgImage: cgImage)
 }
 
 struct ShareSheet: UIViewControllerRepresentable {

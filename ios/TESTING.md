@@ -73,7 +73,7 @@ frames of a scene whose answer is known.
 | `SyntheticRiverTests` | end to end: a textured surface moving at a known speed, filmed by a swaying hand-held camera, through `RecordingPlan.sampleRow` and the full analysis |
 | `RecordingPreflightTests` | before Start: the memory budget shortens, then thins, using the layout's own sample counts, and the defaults fit a typical survey; a view facing away, held flat, or with the section mostly off screen is refused |
 | `CaptureSessionTests` | the frame queue ends a recording at its duration, progress is published at a fraction of the frame rate, an interruption drops the recording and its end never overtakes its start, a refused camera is reported as a permission problem |
-| `SurveyModelTests` | the tap sequence and undo; and, from camera views the tests supply, a whole recording: the layout rebuilt from the view at Start, the budget applied, the double-stop and stop-then-start races, an abandoned hand-over dropped, retunes run one at a time and capped where the STIs would be too short (at the median frame period, as StivKit grids them), every result saved to its recording's folder in Documents -- the flow map with it -- and overwritten by a retune, interruptions and failures sending the user back to measure, Results → New and re-measuring starting clean, the idle timer and the heat warning |
+| `SurveyModelTests` | the tap sequence and undo; and, from camera views the tests supply, a whole recording: the layout rebuilt from the view at Start, the budget applied, the double-stop and stop-then-start races, an abandoned hand-over dropped, retunes run one at a time and capped where the STIs would be too short (at the median frame period, as StivKit grids them), every result saved to its recording's folder in Documents -- the flow map and an A4 PDF report, titled and with no blank page, with it -- and overwritten by a retune, interruptions and failures sending the user back to measure, Results → New and re-measuring starting clean, the idle timer and the heat warning |
 
 `SyntheticRiverTests` is the one to understand. The app's central claim is
 that sampling fixed *world* points through each frame's own pose removes camera
@@ -183,7 +183,7 @@ Worth noting alongside each run:
 | frame step used | and whether the results screen suggested another |
 | null-test result | max \|v\| over unflagged stations |
 | float speeds and stations | each run, not just the mean |
-| exports | `summary.json`, `velocity.csv`, `survey.yaml`, `report.txt`, `velocity_map.png` |
+| exports | `summary.json`, `velocity.csv`, `survey.yaml`, `report.txt`, `velocity_map.png`, `report.pdf` |
 | water outline | found automatically, weak, or drawn by hand -- and whether it looked right |
 
 `survey.yaml` reruns the same analysis on the desktop. Film the section with
