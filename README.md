@@ -120,16 +120,21 @@ jupyter lab notebooks/STIV_Interactive.ipynb
    drift from). The water is then outlined automatically, from where the image
    moves once the drone's drift is removed; check it and confirm, or draw your
    own. It also warns if the water seems to flow away from your downstream
-   point. Loading a different video starts the survey afresh.
+   point. To measure in more than one place, **Add another cross-section**
+   once that is done: every section is analysed together, in one pass over
+   the video. Loading a different video starts the survey afresh.
 4. **Settings** -- station count, expected velocity range, drone-motion
    compensation, and optional discharge, with sensible defaults and the fussier
    options tucked under "Advanced". A PDF report is written with the results
-   unless you untick it.
+   unless you untick it. With several cross-sections you name each one here,
+   and give each its own depth file (those without one report velocities only).
 5. **Run** -- reviews the choices, then analyses the video with a progress bar.
 6. **Results** -- headline numbers, then tabs with the flow map (an arrow per
    station, its length proportional to the velocity), the velocity profile,
    the STIs and the table, then the PDF report (or a button to make one) and
-   a zip of the results folder.
+   a zip of the results folder. With several cross-sections, a row of buttons
+   switches between all of them side by side -- a table, and the flow map with
+   every section on one frame -- and each one's own results.
 
 **About the field of view.** DJI spec sheets quote the *diagonal* field of
 view -- 84° for a 24 mm-equivalent lens -- but `hfov_deg` is the *horizontal*
@@ -227,6 +232,43 @@ overwrites an existing file unless given `--force`. The video path is written
 relative to the config file's folder (or absolute, if the video is elsewhere),
 because that is what relative paths in a config are resolved against.
 
+#### Several cross-sections
+
+One clip can be measured at several places at once:
+
+```bash
+stiv pick flight.mp4 --sections 3 -o survey.yaml
+```
+
+asks for each cross-section in turn (each window shows those already clicked),
+then for one point downstream of all of them. The config lists them under
+`sections`, and the `section` block then holds only what they share:
+
+```yaml
+section:   {n_stations: 40, edge_trim: 0.02}    # shared by every section
+sections:
+  - {name: gauge, start_px: [330, 880], end_px: [1608, 830],
+     bathymetry_csv: gauge_depths.csv}
+  - {name: riffle, start_px: [340, 1250], end_px: [1640, 1210], n_stations: 30}
+flow:      {direction: auto, downstream_px: [1000, 2100]}
+```
+
+An entry needs only its ends; whatever else it leaves out -- `n_stations`,
+`edge_trim`, `downstream_px`, the depths -- comes from the shared blocks. A
+section can have its own `downstream_px` where no one point is downstream of
+them all, and its own `bathymetry_csv` (or `depths_m`, `water_level_m`), which
+turns its discharge on. [`examples/multi_section.yaml`](examples/multi_section.yaml)
+has three; `stiv init --sections 3` writes the skeleton with the ends as `null`.
+
+`stiv run` analyses them together, in **one pass over the video**: the frames
+are read and the drone's drift tracked once, and every section's search lines
+are sampled from each frame. Each section is then analysed as it would be on
+its own, with its own flow direction, quality control and discharge. The one
+difference is that the drift correction keeps off the water around every
+section's search lines, not one section's, so it follows slightly different
+bank features: on the synthetic test river the velocities move by a couple of
+mm/s, and with `stabilise.enabled: false` they are identical.
+
 ### 3. Run
 
 ```bash
@@ -251,6 +293,15 @@ Outputs, in `output.out_dir`:
 | `orientation_fields.npz` | per-window orientation and coherency fields, if `output.save_fields` |
 | `config_used.yaml` | the fully resolved config, for reproducibility |
 | `report.pdf` | one document to keep or hand in: the headline velocities, the survey details and every warning, then each figure, the station table and the config used -- with `--pdf` or `output.pdf_report: true` (the notebook wizard writes it by default) |
+
+With several cross-sections, each one's files above go in a sub-folder named
+after it -- its own `config_used.yaml` re-runs that section alone -- and the
+top of `output.out_dir` holds what compares them: `sections.csv` (a row per
+section: width, stations passing, mean and maximum velocity, discharge),
+`report.txt`, `summary.json`, the survey's `config_used.yaml`, `overview.png`
+and `velocity_map.png` with every section on one frame (one arrow scale for
+all, so arrows compare between sections), and a single `report.pdf` covering
+them all.
 
 Each run lists the files it wrote in `.stiv_outputs.json`, and a re-run into
 the same folder first removes exactly those, so a run with fewer stations, or
@@ -392,6 +443,12 @@ from its neighbours for the discharge, with a warning. If no station has a
 velocity at all, the run warns and reports no discharge, and still writes the
 velocity results.
 
+With [several cross-sections](#several-cross-sections) each has its own depths:
+`bathymetry_csv` (or `depths_m`) in its entry under `sections`. A section given
+depths gets a discharge and the others report velocities only;
+`discharge.enabled: true` asks for one at every section, so each then needs
+depths, its own or the `discharge` block's.
+
 ---
 
 ## On an iPhone
@@ -435,6 +492,21 @@ for s in result.stations:
               f"(window spread {s.velocity_spread_ms:.3f} m/s)")
     else:  # a real measurement with a caveat, e.g. tan_phi_low
         print(f"{s.station_m:6.2f} m  {s.velocity_ms:.3f} m/s ({', '.join(s.flags)})")
+```
+
+A config with several `sections` is analysed with `run_survey`, which reads the
+video once and returns a result per section:
+
+```python
+from stiv import Config, run_survey
+from stiv.report import write_survey_outputs
+
+cfg = Config.from_yaml("survey.yaml")
+survey = run_survey(cfg)
+print(survey.to_frame())                 # a row per section
+for result in survey:                    # each a StivResult, as above
+    print(result.config.section.name, result.velocities)
+write_survey_outputs(survey, cfg)        # the folder layout `stiv run` writes
 ```
 
 The pieces are usable on their own — `structure_tensor_field` and

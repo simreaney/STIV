@@ -18,6 +18,9 @@ or from the command line::
 
     stiv pick flight.mp4 -o survey.yaml     # click the cross-section
     stiv run survey.yaml                    # analyse and write outputs
+
+A config listing several cross-sections under ``sections`` is analysed in one
+pass over the video by :func:`run_survey`, which returns a result for each.
 """
 
 # The single source of the package version: pyproject.toml reads it from here
@@ -25,7 +28,7 @@ or from the command line::
 # submodule can import it while the package is still initialising.
 __version__ = "1.1.1"
 
-from .analysis import StationResult, StivResult, run
+from .analysis import StationResult, StivResult, SurveyResult, run, run_survey
 from .config import Config, ConfigError
 from .discharge import DischargeResult, compute_discharge
 from .geometry import (
@@ -52,7 +55,9 @@ __all__ = [
     "Config",
     "ConfigError",
     "run",
+    "run_survey",
     "StivResult",
+    "SurveyResult",
     "StationResult",
     "DischargeResult",
     "compute_discharge",

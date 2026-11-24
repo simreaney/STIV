@@ -1,0 +1,72 @@
+# -------------------------------------------------------------------------- #
+# STIV survey: several cross-sections of one drone hover
+#
+# The footage and scale of nadir_drone.yaml, measured at three places at once.
+# The cross-sections are listed under `sections` and analysed together in one
+# pass over the video: the frames are read, and the drone's drift tracked,
+# once for all of them.  Each section's results go in a sub-folder of
+# output.out_dir named after it; sections.csv beside them compares them, and
+# the overview and flow map draw every section on one frame.
+#
+# An entry needs only its two ends.  Whatever else it leaves out comes from the
+# shared blocks: n_stations and edge_trim from `section`, downstream_px from
+# `flow`, the depths from `discharge`.  Depths given to a section turn its
+# discharge on; the others report surface velocity only.
+#
+#   stiv run examples/multi_section.yaml
+#   stiv pick flight.mp4 --sections 3 -o survey.yaml   # click your own
+# -------------------------------------------------------------------------- #
+
+video:
+  path: ../footage/hover_30m.mp4
+  start_s: 4.0
+  duration_s: 30.0
+  frame_step: 1
+
+rectify:
+  method: scale
+  altitude_m: 30.0          # height above the WATER SURFACE, not above take-off
+  hfov_deg: 71.5            # HORIZONTAL field of view (see nadir_drone.yaml)
+
+section:                    # shared by every cross-section below
+  n_stations: 40
+  edge_trim: 0.02
+
+sections:
+  - name: gauge             # also the name of its results folder
+    start_px: [330, 880]    # left waterline looking downstream; distance 0 m
+    end_px:   [1608, 830]
+    bathymetry_csv: bathymetry_example.csv   # 0-18 m from start_px
+  - name: riffle
+    start_px: [340, 1250]
+    end_px:   [1640, 1210]
+    n_stations: 30          # its own station count
+  - name: pool_tail
+    start_px: [350, 1620]
+    end_px:   [1670, 1580]
+
+flow:
+  direction: auto           # perpendicular to each section, in world space
+  # One point downstream of ALL the sections fixes the sign for each.  Where
+  # no single point is (sections strung out along a bend, say), give a
+  # section its own downstream_px instead.
+  downstream_px: [1000, 2100]
+
+stabilise:
+  enabled: true
+  water_mask_px:
+    - [[266, 0], [1606, 0], [1690, 2160], [350, 2160]]
+
+stiv:
+  search_line_length_m: 4.0
+  velocity_range_ms: [-0.5, 3.0]
+
+discharge:
+  # Off for the sections without depths; on for `gauge`, which has its own.
+  # `enabled: true` would ask for discharge at every section.
+  enabled: false
+  alpha: 0.85
+  bank_coefficient: 0.7
+
+output:
+  out_dir: ../results/dee_three_sections

@@ -33,7 +33,8 @@ log = logging.getLogger(__name__)
 class _Picker:
     """Collect an ordered list of clicked points from one frame."""
 
-    def __init__(self, frame_bgr: np.ndarray, title: str, n_points: Optional[int]):
+    def __init__(self, frame_bgr: np.ndarray, title: str, n_points: Optional[int],
+                 shown: Sequence[Sequence[Sequence[float]]] = ()):
         import matplotlib.pyplot as plt
 
         self.plt = plt
@@ -42,6 +43,13 @@ class _Picker:
 
         self.fig, self.ax = plt.subplots(figsize=(13, 8))
         self.ax.imshow(frame_bgr[:, :, ::-1])
+        # Cross-sections clicked already, for reference.
+        for k, line in enumerate(shown):
+            p = np.asarray(line, float)
+            self.ax.plot(p[:, 0], p[:, 1], "o-", color="#2a78d6", markersize=6,
+                         markeredgecolor="white", markeredgewidth=1.2, lw=1.8, alpha=0.85)
+            self.ax.annotate(f"section {k + 1}", p[0], xytext=(8, 8), textcoords="offset points",
+                             color="#2a78d6", fontsize=10, weight="bold")
         self.ax.set_title(title, fontsize=11, loc="left")
         self.ax.set_axis_off()
         self.marks = self.ax.plot([], [], "o-", color="#eb6834", markersize=8,
@@ -102,15 +110,19 @@ def _require_gui() -> None:
 
 
 def pick_points(video: str | Path, n_points: Optional[int], prompt: str,
-                t_s: float = 0.0) -> list[tuple[float, float]]:
-    """Open a frame and return the points the user clicks."""
+                t_s: float = 0.0, shown: Sequence[Sequence[Sequence[float]]] = ()
+                ) -> list[tuple[float, float]]:
+    """Open a frame and return the points the user clicks.
+
+    ``shown`` are cross-sections clicked already, drawn for reference.
+    """
     _require_gui()
     frame = read_frame_at(video, t_s)
     title = (
         f"{prompt}\n"
         f"left click = add    right click / backspace = undo    enter = done"
     )
-    return _Picker(frame, title, n_points).run()
+    return _Picker(frame, title, n_points, shown).run()
 
 
 def confirm_water_outline(video: str | Path, polygon: Sequence[Sequence[float]],
@@ -204,6 +216,7 @@ def build_config_interactively(
     config_path: Optional[str | Path] = None,
     auto_water: bool = True,
     fps: Optional[float] = None,
+    n_sections: int = 1,
 ) -> dict:
     """Walk the user through defining a survey, returning a raw config dict.
 
@@ -222,6 +235,11 @@ def build_config_interactively(
     With ``auto_water`` the water is outlined automatically after the
     downstream click and offered for confirmation; it is clicked by hand only
     if that finds nothing or the user turns it down.
+
+    ``n_sections`` cross-sections are clicked one after another, each window
+    showing those already in, and written as ``sections`` to be analysed
+    together.  One downstream point serves them all, so it is asked for below
+    the last of them.
     """
     info = probe(video)
     if info.duration_s and t_s >= info.duration_s:
@@ -229,20 +247,34 @@ def build_config_interactively(
             f"-t {t_s:g} s is past the end of the video ({info.duration_s:.1f} s long)"
         )
 
-    pts = pick_points(
-        video, 2,
-        "Click the TWO ENDS of the measurement cross-section "
-        "(bank to bank, across the flow).",
-        t_s,
-    )
-    if len(pts) < 2:
-        raise ConfigError("a cross-section needs two endpoints; none were selected")
+    if n_sections < 1:
+        raise ConfigError(f"n_sections must be 1 or more, got {n_sections}")
+    sections: list[list[tuple[float, float]]] = []
+    for k in range(n_sections):
+        which = ("the measurement cross-section" if n_sections == 1
+                 else f"cross-section {k + 1} of {n_sections}")
+        # Passed only once there is something to show.
+        extra = {"shown": list(sections)} if sections else {}
+        pts = pick_points(
+            video, 2,
+            f"Click the TWO ENDS of {which} (bank to bank, across the flow).",
+            t_s, **extra,
+        )
+        if len(pts) < 2:
+            what = "a cross-section" if n_sections == 1 else f"cross-section {k + 1}"
+            raise ConfigError(f"{what} needs two endpoints; "
+                              f"{'none were' if not pts else 'only one was'} selected")
+        sections.append(pts[:2])
+    pts = sections[0]
 
+    extra = {"shown": list(sections)} if n_sections > 1 else {}
     down = pick_points(
         video, 1,
         "Click one point DOWNSTREAM of the cross-section "
+        "(this fixes which way the flow runs)." if n_sections == 1 else
+        "Click one point DOWNSTREAM of ALL the cross-sections "
         "(this fixes which way the flow runs).",
-        t_s,
+        t_s, **extra,
     )
 
     gcps = None
@@ -283,4 +315,6 @@ def build_config_interactively(
         downstream_px=down[0] if down else None,
         water_mask_px=[water] if len(water) >= 3 else None,
         out_dir=out_dir,
+        sections=([{"start_px": a, "end_px": b} for a, b in sections]
+                  if n_sections > 1 else None),
     )

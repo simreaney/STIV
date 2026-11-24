@@ -206,7 +206,9 @@ class StivResult:
             )
         return pd.DataFrame(rows)
 
-    def summary(self) -> str:
+    def summary(self, omit_warnings: Sequence[str] = ()) -> str:
+        """The run report.  ``omit_warnings`` are left out of it: a survey's
+        report lists the warnings its sections share once, not under each."""
         v = self.velocities
         clean = [s for s in self.stations if s.ok]
         failed = [s for s in self.stations if s.failed]
@@ -232,17 +234,150 @@ class StivResult:
         if self.discharge is not None:
             lines.append("")
             lines.append(self.discharge.summary())
-        if self.warnings:
+        warnings = [w for w in self.warnings if w not in set(omit_warnings)]
+        if warnings:
             lines.append("")
-            lines += [f"warning: {w}" for w in self.warnings]
+            lines += [f"warning: {w}" for w in warnings]
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+@dataclass
+class SurveyResult:
+    """Every cross-section of a survey, analysed together in one pass.
+
+    ``results`` holds one :class:`StivResult` per section, in the order the
+    config lists them, each complete on its own: its ``config`` is the
+    single-section config of :meth:`Config.section_configs`, and its warnings
+    include those about the clip as a whole.  A config with one ``section``
+    gives a survey of one.
+    """
+
+    config: Config
+    results: list[StivResult]
+    #: Warnings about the clip as a whole -- the video, the rectification, the
+    #: camera motion -- which every section's own list repeats.
+    shared_warnings: list[str] = field(default_factory=list)
+    elapsed_s: float = 0.0
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def __iter__(self):
+        return iter(self.results)
+
+    def __getitem__(self, i: int) -> StivResult:
+        return self.results[i]
+
+    @property
+    def names(self) -> list[str]:
+        return [r.config.section.name for r in self.results]
+
+    def to_frame(self) -> pd.DataFrame:
+        """One row per section: its size, its velocities and its discharge."""
+        rows = []
+        for r in self.results:
+            v = r.velocities
+            finite = v[np.isfinite(v)]
+            d = r.discharge
+            rows.append(
+                {
+                    "section": r.config.section.name,
+                    "width_m": r.geometry.width_m,
+                    "n_stations": len(r.stations),
+                    "n_failed": sum(1 for s in r.stations if s.failed),
+                    "n_interpolated": sum(1 for s in r.stations
+                                          if s.failed and "interpolated" in s.flags),
+                    "mean_surface_velocity_ms": float(finite.mean()) if finite.size else np.nan,
+                    "median_surface_velocity_ms": float(np.median(finite)) if finite.size else np.nan,
+                    "max_surface_velocity_ms": float(finite.max()) if finite.size else np.nan,
+                    "flow_bearing_deg": r.geometry.flow_bearing_deg,
+                    "discharge_m3s": d.discharge_m3s if d is not None else np.nan,
+                    "area_m2": d.area_m2 if d is not None else np.nan,
+                    "mean_velocity_ms": d.mean_velocity_ms if d is not None else np.nan,
+                    "n_warnings": len([w for w in r.warnings if w not in self.shared_warnings]),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def summary(self) -> str:
+        """The run report: a table of the sections, then each one in turn."""
+        if len(self.results) == 1:
+            return self.results[0].summary()
+        first = self.results[0]
+        lines = [
+            f"survey         {len(self.results)} cross-sections, analysed together",
+            f"frames         {first.n_frames} over {first.duration_s:.2f} s "
+            f"(St = {first.st_s_per_px * 1000:.1f} ms/row, {first.fps:.2f} fps source)",
+            f"rectification  {first.geometry.rectifier.describe()}",
+            first.stabilisation.summary(),
+            *([f"water mask     {first.water_mask_note}"] if first.water_mask_note else []),
+            "",
+        ]
+        width = max(8, *(len(n) for n in self.names))
+        has_q = any(r.discharge is not None for r in self.results)
+        head = (f"{'section':<{width}}  {'width':>7}  {'clean':>7}  {'mean U':>7}  {'max U':>7}"
+                + ("  {:>9}".format("Q") if has_q else ""))
+        units = (f"{'':<{width}}  {'(m)':>7}  {'':>7}  {'(m/s)':>7}  {'(m/s)':>7}"
+                 + ("  {:>9}".format("(m3/s)") if has_q else ""))
+        lines += [head, units]
+        for r in self.results:
+            v = r.velocities
+            finite = v[np.isfinite(v)]
+            clean = f"{sum(1 for s in r.stations if s.ok)}/{len(r.stations)}"
+            mean = f"{finite.mean():.3f}" if finite.size else "-"
+            vmax = f"{finite.max():.3f}" if finite.size else "-"
+            row = (f"{r.config.section.name:<{width}}  {r.geometry.width_m:7.2f}  {clean:>7}  "
+                   f"{mean:>7}  {vmax:>7}")
+            if has_q:
+                row += f"  {r.discharge.discharge_m3s:9.3f}" if r.discharge is not None else f"  {'-':>9}"
+            lines.append(row)
+        for r in self.results:
+            lines += ["", f"--- {r.config.section.name} " + "-" * max(3, 60 - len(r.config.section.name)),
+                      r.summary(omit_warnings=self.shared_warnings)]
+        if self.shared_warnings:
+            lines.append("")
+            lines += [f"warning: {w}" for w in self.shared_warnings]
         return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
 def run(cfg: Config, progress: bool = True) -> StivResult:
-    """Execute a full STIV analysis described by ``cfg``."""
+    """Execute a full STIV analysis of the cross-section ``cfg`` describes.
+
+    A config listing several ``sections`` is analysed with :func:`run_survey`,
+    which returns a result for each.
+    """
+    if cfg.sections is not None and len(cfg.sections) != 1:
+        raise ConfigError(
+            f"this config lists {len(cfg.sections)} cross-sections under `sections`; analyse "
+            f"them with stiv.analysis.run_survey, which returns a result for each"
+        )
+    return run_survey(cfg, progress).results[0]
+
+
+def run_survey(cfg: Config, progress: bool = True) -> SurveyResult:
+    """Analyse every cross-section of ``cfg`` in one pass over the video.
+
+    Reading the frames and tracking the camera's motion is most of a run's
+    time, and both are the same whichever section is being measured, so they
+    are done once: each frame is sampled along every section's search lines
+    together, against the one stabilisation.  Each section is then analysed
+    exactly as it would be on its own -- its own flow direction, quality
+    control and discharge.
+
+    The one difference from running a section alone is the stabiliser, which
+    keeps off the water around *every* section's search lines rather than one
+    section's, so it tracks a slightly different set of bank features.  The
+    velocities move by the stabiliser's own noise -- a couple of mm/s on the
+    synthetic test river -- and with stabilisation off they are identical.
+    """
     t_start = time.perf_counter()
-    warnings: list[str] = []
+    configs = cfg.section_configs()
+    multi = cfg.sections is not None
+
+    def _named(c: Config, text: str) -> str:
+        return f"cross-section {c.section.name!r}: {text}" if multi else text
 
     source = FrameSource(cfg.video)
     log.info("video: %s", source.info)
@@ -267,96 +402,116 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
             f"a smaller stiv.window_px"
         )
 
-    geom = geometry.build_section(cfg, source.shape)
-    log.info("rectification: %s", geom.rectifier.describe())
-    log.info(
-        "section %.2f m wide, %d stations, %.2f m search lines along %+.1f deg",
-        geom.width_m, len(geom.search_lines), cfg.stiv.search_line_length_m, geom.flow_bearing_deg,
-    )
+    geoms = [geometry.build_section(c, source.shape) for c in configs]
+    log.info("rectification: %s", geoms[0].rectifier.describe())
 
-    narrow = [sl.index for sl in geom.search_lines if sl.n_samples < need]
-    if narrow and len(narrow) == len(geom.search_lines):
-        raise ConfigError(
-            f"the search lines have only {min(sl.n_samples for sl in geom.search_lines)} "
-            f"samples, but a {cfg.stiv.window_px} px {cfg.stiv.window_type} window "
-            f"needs at least {need}; lengthen stiv.search_line_length_m, raise "
-            f"stiv.n_samples, or use a smaller stiv.window_px"
+    # Each section's warnings in the order a lone section has always listed
+    # them: its own layout first, the clip's next, then its own analysis.
+    own: list[list[str]] = []
+    for c, geom in zip(configs, geoms):
+        log.info(
+            "%s%.2f m wide, %d stations, %.2f m search lines along %+.1f deg",
+            f"section {c.section.name!r}: " if multi else "section ",
+            geom.width_m, len(geom.search_lines), c.stiv.search_line_length_m,
+            geom.flow_bearing_deg,
         )
-    if narrow:
-        warnings.append(
-            f"{len(narrow)} search line(s) have fewer than the {need} samples a "
-            f"{cfg.stiv.window_px} px window needs (stations {narrow[:5]}"
-            f"{'...' if len(narrow) > 5 else ''}) and will fail; lengthen "
-            f"stiv.search_line_length_m or use a smaller stiv.window_px"
-        )
+        w: list[str] = []
+        narrow = [sl.index for sl in geom.search_lines if sl.n_samples < need]
+        if narrow and len(narrow) == len(geom.search_lines):
+            raise ConfigError(_named(c,
+                f"the search lines have only {min(sl.n_samples for sl in geom.search_lines)} "
+                f"samples, but a {c.stiv.window_px} px {c.stiv.window_type} window "
+                f"needs at least {need}; lengthen stiv.search_line_length_m, raise "
+                f"stiv.n_samples, or use a smaller stiv.window_px"
+            ))
+        if narrow:
+            w.append(
+                f"{len(narrow)} search line(s) have fewer than the {need} samples a "
+                f"{c.stiv.window_px} px window needs (stations {narrow[:5]}"
+                f"{'...' if len(narrow) > 5 else ''}) and will fail; lengthen "
+                f"stiv.search_line_length_m or use a smaller stiv.window_px"
+            )
+        outside = geometry.check_lines_in_frame(geom, source.shape)
+        if outside:
+            w.append(
+                f"{len(outside)} search line(s) extend outside the frame "
+                f"(stations {outside[:5]}{'...' if len(outside) > 5 else ''}); "
+                f"shorten stiv.search_line_length_m or move the section"
+            )
+        own.append(w)
 
-    outside = geometry.check_lines_in_frame(geom, source.shape)
-    if outside:
-        warnings.append(
-            f"{len(outside)} search line(s) extend outside the frame "
-            f"(stations {outside[:5]}{'...' if len(outside) > 5 else ''}); "
-            f"shorten stiv.search_line_length_m or move the section"
-        )
-
-    _rectification_warnings(geom, warnings)
+    shared: list[str] = []
+    # One rectifier serves every section, so its fit is judged once.
+    _rectification_warnings(geoms[0], shared)
 
     stab_cfg, water_note = cfg.stabilise, ""
     if is_auto_water_mask(cfg.stabilise.water_mask_px):
-        stab_cfg, water_note = _automatic_water_mask(cfg, warnings)
+        # The outline is of the water, not of a section: the first section
+        # calibrates it, and it then serves them all.
+        stab_cfg, water_note = _automatic_water_mask(configs[0], shared)
 
-    stis, stab_report, reference_bgr = _collect_stis(cfg, source, geom, progress, stab_cfg)
-    warnings.extend(source.warnings)
+    groups, stab_report, reference_bgr = _collect_stis(cfg, source, geoms, progress, stab_cfg)
+    shared.extend(source.warnings)
+    shared_after = stab_report.warnings()
 
-    stations, fields, estimates = _analyse_stis(cfg, stis, geom)
+    results: list[StivResult] = []
+    for c, geom, stis, warnings in zip(configs, geoms, groups, own):
+        warnings.extend(shared)
+        stations, fields, estimates = _analyse_stis(c, stis, geom)
 
-    # Direction first: it can replace every station's estimate, and quality
-    # control must judge the estimates that are actually going to be reported.
-    if _direction_check(cfg, stations, stis, fields, estimates, warnings):
-        # The stations now report the flow as running the other way along the
-        # search lines, so the direction reported and drawn follows them.  The
-        # lines themselves are already laid out and sampled, and nothing reads
-        # this back to lay them out again.
-        geom.flow_dir_world = -geom.flow_dir_world
-        bearing = geom.flow_bearing_deg + 180.0
-        geom.flow_bearing_deg = bearing - 360.0 if bearing > 180.0 else bearing
-    _quality_control(cfg, stations, warnings)
-    _range_advice(cfg, stations, source, warnings)
-    warnings.extend(stab_report.warnings())
+        # Direction first: it can replace every station's estimate, and quality
+        # control must judge the estimates that are actually going to be reported.
+        if _direction_check(c, stations, stis, fields, estimates, warnings):
+            # The stations now report the flow as running the other way along the
+            # search lines, so the direction reported and drawn follows them.  The
+            # lines themselves are already laid out and sampled, and nothing reads
+            # this back to lay them out again.
+            geom.flow_dir_world = -geom.flow_dir_world
+            bearing = geom.flow_bearing_deg + 180.0
+            geom.flow_bearing_deg = bearing - 360.0 if bearing > 180.0 else bearing
+        _quality_control(c, stations, warnings)
+        _range_advice(c, stations, source, warnings)
+        warnings.extend(shared_after)
 
-    disch = None
-    if cfg.discharge.enabled:
-        # A discharge that cannot be computed -- every station failed, say --
-        # must not take the velocity profile down with it.
-        try:
-            disch = compute_discharge(
-                cfg.discharge,
-                [s.station_m for s in stations],
-                [s.velocity_ms for s in stations],
-                geom.width_m,
-            )
-        except ConfigError as exc:
-            warnings.append(f"discharge was not computed: {exc}")
-        else:
-            warnings.extend(disch.warnings)
+        disch = None
+        if c.discharge.enabled:
+            # A discharge that cannot be computed -- every station failed, say --
+            # must not take the velocity profile down with it.
+            try:
+                disch = compute_discharge(
+                    c.discharge,
+                    [s.station_m for s in stations],
+                    [s.velocity_ms for s in stations],
+                    geom.width_m,
+                )
+            except ConfigError as exc:
+                warnings.append(f"discharge was not computed: {exc}")
+            else:
+                warnings.extend(disch.warnings)
 
-    return StivResult(
-        config=cfg,
-        geometry=geom,
-        stations=stations,
-        stis=stis,
-        fields=fields,
-        estimates=estimates,
-        stabilisation=stab_report,
-        n_frames=stis[0].data.shape[0] if stis else 0,
-        duration_s=(stis[0].data.shape[0] * source.st_s_per_px) if stis else 0.0,
-        fps=source.fps,
-        st_s_per_px=source.st_s_per_px,
-        reference_frame_bgr=reference_bgr,
-        discharge=disch,
-        warnings=warnings,
-        elapsed_s=time.perf_counter() - t_start,
-        water_mask_note=water_note,
-    )
+        results.append(StivResult(
+            config=c,
+            geometry=geom,
+            stations=stations,
+            stis=stis,
+            fields=fields,
+            estimates=estimates,
+            stabilisation=stab_report,
+            n_frames=stis[0].data.shape[0] if stis else 0,
+            duration_s=(stis[0].data.shape[0] * source.st_s_per_px) if stis else 0.0,
+            fps=source.fps,
+            st_s_per_px=source.st_s_per_px,
+            reference_frame_bgr=reference_bgr,
+            discharge=disch,
+            warnings=warnings,
+            water_mask_note=water_note,
+        ))
+
+    elapsed = time.perf_counter() - t_start
+    for r in results:
+        r.elapsed_s = elapsed
+    return SurveyResult(config=cfg, results=results,
+                        shared_warnings=shared + shared_after, elapsed_s=elapsed)
 
 
 def _automatic_water_mask(cfg: Config, warnings: list[str]) -> tuple[StabiliseConfig, str]:
@@ -446,19 +601,21 @@ def _rectification_warnings(geom: SectionGeometry, warnings: list[str]) -> None:
 
 
 def _collect_stis(
-    cfg: Config, source: FrameSource, geom: SectionGeometry, progress: bool,
+    cfg: Config, source: FrameSource, geoms: Sequence[SectionGeometry], progress: bool,
     stabilise_cfg: Optional[StabiliseConfig] = None,
-) -> tuple[list[SpaceTimeImage], StabilisationReport, np.ndarray]:
+) -> tuple[list[list[SpaceTimeImage]], StabilisationReport, np.ndarray]:
     """Single streaming pass over the video, building every STI at once.
 
+    Every section's search lines are sampled from each frame together.
     ``stabilise_cfg`` is ``cfg.stabilise`` with an automatic water mask
-    resolved; ``cfg.stabilise`` itself when omitted.  Returns the STIs, the
-    stabilisation diagnostics, and the reference frame (kept for the overview
-    plot).
+    resolved; ``cfg.stabilise`` itself when omitted.  Returns each section's
+    STIs, the stabilisation diagnostics, and the reference frame (kept for the
+    overview plot).
     """
     stab_cfg = stabilise_cfg if stabilise_cfg is not None else cfg.stabilise
-    collector = sti_mod.StiCollector(geom.search_lines, source.n_frames, source.st_s_per_px)
-    probe = np.vstack([geom.start_px[None, :], geom.end_px[None, :]])
+    lines = [sl for g in geoms for sl in g.search_lines]
+    collector = sti_mod.StiCollector(lines, source.n_frames, source.st_s_per_px)
+    probe = np.vstack([np.vstack([g.start_px, g.end_px]) for g in geoms])
 
     stabiliser: Optional[Stabiliser] = None
     reference_bgr = np.zeros((*source.shape, 3), np.uint8)
@@ -493,7 +650,12 @@ def _collect_stis(
             bar.close()
 
     report = stabiliser.report if stabiliser else StabilisationReport(enabled=False)
-    return collector.finish(), report, reference_bgr
+    stis = collector.finish()
+    groups, k = [], 0
+    for g in geoms:
+        groups.append(stis[k:k + len(g.search_lines)])
+        k += len(g.search_lines)
+    return groups, report, reference_bgr
 
 
 def _eq14(cfg: Config, field_: OrientationField, phi_min: float, phi_max: float) -> AngleEstimate:

@@ -5,6 +5,7 @@
     stiv info      flight.mp4              inspect a video
     stiv init      flight.mp4 -o survey.yaml   write a starter config
     stiv pick      flight.mp4 -o survey.yaml   click the section on a frame
+                   (--sections 3 to click three, analysed together)
     stiv run       survey.yaml             analyse and write the outputs
     stiv cameras                           list the DJI field-of-view presets
     stiv demo                              render a synthetic river and analyse it
@@ -319,10 +320,8 @@ _INIT_HEADER = """\
 #                         altitude_m: 60.0   # above the WATER SURFACE
 #                         hfov_deg: 71.5     # HORIZONTAL FOV, not the diagonal
 #                                            # one DJI quotes (see stiv.cameras)
-#   section.start_px    the two ends of the cross-section, in image pixels
-#   section.end_px      (`stiv pick` lets you click them on a frame instead)
-#
-# flow.downstream_px is optional: any image point downstream of the section,
+{section_help}#
+# flow.downstream_px is optional: any image point downstream of {the_sections},
 # which fixes the sign of the flow direction.
 #
 # stabilise.water_mask_px can be set to `auto`, to outline the water from the
@@ -337,10 +336,8 @@ _INIT_HEADER_SCALED = """\
 #
 # `stiv run` refuses this file until the null placeholders are filled in:
 #
-{missing}#   section.start_px    the two ends of the cross-section, in image pixels
-#   section.end_px      (`stiv pick` lets you click them on a frame instead)
-#
-# flow.downstream_px is optional: any image point downstream of the section,
+{missing}{section_help}#
+# flow.downstream_px is optional: any image point downstream of {the_sections},
 # which fixes the sign of the flow direction.
 #
 # stabilise.water_mask_px can be set to `auto`, to outline the water from the
@@ -351,9 +348,31 @@ _INIT_HEADER_SCALED = """\
 """
 
 
+_SECTION_HELP = """\
+#   section.start_px    the two ends of the cross-section, in image pixels
+#   section.end_px      (`stiv pick` lets you click them on a frame instead)
+"""
+
+_SECTIONS_HELP = """\
+#   sections: start_px  the two ends of each cross-section, in image pixels
+#             end_px    (`stiv pick --sections {n}` lets you click them instead)
+#
+# The cross-sections are analysed together, in one pass over the video.  Each
+# one's name also names the sub-folder its results go in; anything else an
+# entry leaves out (n_stations, edge_trim) comes from the `section` block, and
+# an entry can have its own downstream_px and bathymetry_csv.
+"""
+
+
+def _check_n_sections(n: int) -> None:
+    if n < 1:
+        raise ConfigError(f"--sections must be 1 or more, got {n}")
+
+
 def cmd_init(args) -> int:
     from .video import probe
 
+    _check_n_sections(args.sections)
     out = Path(args.output)
     _refuse_overwrite(out, args.force)
     info = probe(args.video)
@@ -364,18 +383,26 @@ def cmd_init(args) -> int:
         duration_s=duration,
         name=Path(args.video).stem,
         out_dir=_default_out_dir(out),
+        sections=[{} for _ in range(args.sections)] if args.sections > 1 else None,
     )
     _apply_scale(raw, sc)
+    multi = args.sections > 1
+    wording = {
+        "section_help": _SECTIONS_HELP.format(n=args.sections) if multi else _SECTION_HELP,
+        "the_sections": "every cross-section" if multi else "the section",
+    }
     if sc.m_per_px is None and sc.altitude_m is None and sc.hfov_deg is None:
-        header = _INIT_HEADER.format(info=info)
+        header = _INIT_HEADER.format(info=info, **wording)
     else:
         missing = "".join(f"#   {m}\n" for m in sc.missing())
         header = _INIT_HEADER_SCALED.format(info=info, missing=missing,
-                                            notes=_header_notes(sc) + ("#\n" if sc.notes else ""))
+                                            notes=_header_notes(sc) + ("#\n" if sc.notes else ""),
+                                            **wording)
     out.write_text(header + yaml_text(raw), encoding="utf-8")
     print(f"wrote {out}")
     _report_scale(sc)
-    todo = ["the section coordinates"]
+    todo = [f"the coordinates of the {args.sections} cross-sections" if multi
+            else "the section coordinates"]
     if not sc.complete:
         todo.insert(0, " and ".join(m.split(" ")[0] for m in sc.missing()) or "the scale")
     print(f"Next: fill in {' and '.join(todo)}, then `stiv run {out}`")
@@ -389,6 +416,7 @@ def cmd_pick(args) -> int:
 
     out = Path(args.output)
     # Everything that can be refused is refused before any clicking, not after.
+    _check_n_sections(args.sections)
     _refuse_overwrite(out, args.force)
     scale_given = any(getattr(args, k) is not None for k in
                       ("m_per_px", "altitude_m", "hfov_deg", "camera", "takeoff_height"))
@@ -406,9 +434,13 @@ def cmd_pick(args) -> int:
         n_stations=args.n_stations,
         config_path=out,
         auto_water=not args.no_auto_water,
+        n_sections=args.sections,
     )
     _apply_scale(raw, sc)
     header = "# STIV survey configuration (written by `stiv pick`)\n#\n" + _header_notes(sc)
+    if args.sections > 1:
+        header += ("# The cross-sections are analysed together; rename them in `sections`\n"
+                   "# if you like: each name is also its results sub-folder.\n#\n")
     if args.gcps:
         header += ("# Fill in rectify.gcp_world -- the surveyed position of each control\n"
                    "# point in metres, in the order they were clicked -- before running.\n\n")
@@ -434,7 +466,8 @@ def cmd_pick(args) -> int:
 
 
 def cmd_run(args) -> int:
-    from .analysis import run as run_analysis
+    from .analysis import run_survey
+    from .report import write_survey_outputs
 
     cfg = Config.from_yaml(args.config)
 
@@ -447,6 +480,10 @@ def cmd_run(args) -> int:
         if value is not None:
             section, key = override.split(".")
             setattr(getattr(cfg, section), key, value)
+    if args.n_stations is not None:
+        # Every cross-section, not just those that leave it to `section`.
+        for entry in cfg.sections or []:
+            entry.n_stations = args.n_stations
     if args.no_stabilise:
         cfg.stabilise.enabled = False
     if args.no_figures:
@@ -456,11 +493,11 @@ def cmd_run(args) -> int:
         cfg.output.pdf_report = True
     cfg.validate()
 
-    result = run_analysis(cfg, progress=not args.quiet)
-    out = _write_outputs(result, cfg)
+    survey = run_survey(cfg, progress=not args.quiet)
+    out = write_survey_outputs(survey, cfg)
 
     print()
-    print(result.summary())
+    print(survey.summary())
     print()
     print(f"outputs written to {out}")
     return 0
@@ -618,6 +655,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("init", parents=[common], help="write a starter config file")
     s.add_argument("video")
     s.add_argument("-o", "--output", default="survey.yaml")
+    s.add_argument("--sections", type=int, default=1, metavar="N",
+                   help="lay out N cross-sections, analysed together (default 1)")
     s.add_argument("--force", action="store_true", help="overwrite an existing config file")
     _add_scale_options(s)
     s.set_defaults(func=cmd_init)
@@ -631,6 +670,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "since the stabiliser measures drift from the first analysed frame")
     s.add_argument("--gcps", action="store_true",
                    help="also click ground control points for an oblique view")
+    s.add_argument("--sections", type=int, default=1, metavar="N",
+                   help="click N cross-sections, analysed together in one pass over the "
+                        "video (default 1)")
     s.add_argument("-n", "--n-stations", type=int, default=SectionConfig.n_stations)
     s.add_argument("--force", action="store_true", help="overwrite an existing config file")
     s.add_argument("--no-auto-water", action="store_true",
@@ -643,7 +685,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("config")
     s.add_argument("--frame-step", type=int, help="override video.frame_step")
     s.add_argument("--duration", type=float, help="override video.duration_s")
-    s.add_argument("-n", "--n-stations", type=int, help="override section.n_stations")
+    s.add_argument("-n", "--n-stations", type=int,
+                   help="override section.n_stations (for every cross-section)")
     s.add_argument("--out-dir", help="override output.out_dir")
     s.add_argument("--no-stabilise", action="store_true",
                    help="skip camera-motion compensation (fixed cameras only)")

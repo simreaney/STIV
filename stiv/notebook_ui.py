@@ -54,6 +54,7 @@ from .config import (
     VideoConfig,
     default_duration_s,
     is_auto_water_mask,
+    section_folder,
     suggest_frame_step,
     survey_dict,
 )
@@ -312,7 +313,7 @@ def _read_survey(path: str | Path) -> Config:
     except ConfigError as strict:
         import yaml
 
-        from .config import _build, _ConfigLoader
+        from .config import _build, _build_sections, _ConfigLoader
 
         try:
             raw = yaml.load(path.read_text(encoding="utf-8"), Loader=_ConfigLoader) or {}
@@ -323,7 +324,12 @@ def _read_survey(path: str | Path) -> Config:
         cfg = Config()
         for f in fields(Config):
             section = raw.get(f.name)
-            if isinstance(section, dict):
+            if f.name == "sections":
+                try:
+                    cfg.sections = _build_sections(section)
+                except ConfigError:
+                    raise strict from None
+            elif isinstance(section, dict):
                 setattr(cfg, f.name, _build(type(getattr(cfg, f.name)), section, f.name))
         cfg.normalise_types()
         cfg.resolve_paths(path.parent)
@@ -340,9 +346,17 @@ def _merge_survey(base: dict, new: dict) -> dict:
     for section, values in new.items():
         if section == "rectify" or not isinstance(values, dict):
             # The scale is one choice: altitude + FOV, or m/px, never a mixture.
+            # And `sections` arrives complete, with what the file gave each
+            # section and the wizard does not manage already folded in.
             out[section] = copy.deepcopy(values)
         else:
             out.setdefault(section, {}).update(copy.deepcopy(values))
+    # One cross-section or several: whichever the wizard has now, not the file.
+    if "sections" in new:
+        out["section"] = {k: v for k, v in out.get("section", {}).items()
+                          if k not in ("start_px", "end_px", "name")}
+    else:
+        out.pop("sections", None)
     # survey_dict leaves these out when unset; the file's must not fill in.
     out["video"]["fps_override"] = new["video"].get("fps_override")
     water = new["stabilise"].get("water_mask_px")
@@ -396,6 +410,10 @@ class _State:
     takeoff_height_m: Optional[float] = None
 
     section_pts: list = field(default_factory=list)
+    #: Further cross-sections, analysed with the first in one pass over the
+    #: video: each a dict of "pts" (its two ends), "name" and "bathymetry_csv",
+    #: and "extra" -- keys of a reopened survey's entry the wizard leaves alone.
+    more_sections: list = field(default_factory=list)
     downstream_pts: list = field(default_factory=list)
     water_pts: list = field(default_factory=list)
     #: Further water polygons from a reopened survey, kept as they were.
@@ -413,6 +431,9 @@ class _State:
     edge_trim: float = SectionConfig.edge_trim
     search_line_length_m: float = StiConfig.search_line_length_m
     section_name: Optional[str] = None
+    #: The first section's entry keys the wizard leaves alone, from a reopened
+    #: multi-section survey (see ``more_sections``).
+    section_extra: dict = field(default_factory=dict)
 
     discharge_enabled: bool = False
     #: Write report.pdf with the results: on by default here, where it is a
@@ -463,6 +484,8 @@ class Wizard:
         #: Furthest step reached with everything before it complete.
         self._furthest = 0
         self._pick_stage = 0
+        #: Ends clicked so far of a cross-section being added, else None.
+        self._adding_pts: Optional[list] = None
         self._step2_box = None
         self._step2_key = None
         self._step2_sync = None
@@ -528,6 +551,7 @@ class Wizard:
             plt.close(self._fig)
         self.state.clear()
         self._pick_stage = 0
+        self._adding_pts = None
         self._furthest = 0
         self._step2_box = None
         self._step2_key = None
@@ -643,10 +667,21 @@ class Wizard:
                 return False, "Click a point downstream of the section, then press Confirm."
             if self._pick_stage < len(self._PICK_STAGES):
                 return False, "Confirm each picking stage (or skip the water outline), then press Next."
+            if self._adding_pts is not None:
+                return False, ("Finish the cross-section you are adding (click both ends, then "
+                               "Confirm), or press Cancel.")
             return True, ""
         if step == 3:
-            if s.discharge_enabled and not s.bathymetry_csv:
-                return False, "Choose a bathymetry CSV file, or turn discharge off."
+            if s.discharge_enabled and not any(sec["bathymetry_csv"] for sec in self._sections()):
+                return False, ("Choose a bathymetry CSV file, or turn discharge off."
+                               if not s.more_sections else
+                               "Choose a bathymetry CSV file for at least one cross-section, "
+                               "or turn discharge off.")
+            names = [sec["name"] for sec in self._sections()]
+            folders = [section_folder(n).lower() for n in names]
+            if len(set(folders)) < len(folders):
+                return False, ("Two cross-sections have the same name (or names that make the "
+                               "same results folder); give each its own name.")
             return True, ""
         return True, ""
 
@@ -660,6 +695,25 @@ class Wizard:
             return None
         r = RectifyConfig(method="scale", altitude_m=s.altitude_m, hfov_deg=s.hfov_deg)
         return r.resolve_m_per_px(s.info.width)
+
+    def _sections(self) -> list[dict]:
+        """Every cross-section marked so far: "name", "pts", "bathymetry_csv".
+
+        The first is the one the picking stages mark.  A lone section is
+        named as it always was -- the name given, else the video's -- and
+        several ``section_1``, ``section_2``, ... unless named.
+        """
+        s = self.state
+        multi = bool(s.more_sections)
+        first_name = s.section_name or (
+            "section_1" if multi else Path(s.video_path).stem if s.video_path else "section")
+        out = [{"name": first_name, "pts": s.section_pts,
+                "bathymetry_csv": s.bathymetry_csv, "extra": s.section_extra}]
+        for k, sec in enumerate(s.more_sections, start=2):
+            out.append({"name": sec.get("name") or f"section_{k}", "pts": sec["pts"],
+                        "bathymetry_csv": sec.get("bathymetry_csv"),
+                        "extra": sec.get("extra", {})})
+        return out
 
     def _out_dir(self) -> str:
         """The results folder: the one chosen, else one named after the video.
@@ -759,7 +813,13 @@ class Wizard:
         if info is not None:
             row(None, "Analysis window", f"{s.start_s:g} – {s.start_s + s.duration_s:g} s")
 
-        if len(s.section_pts) == 2:
+        if len(s.section_pts) == 2 and s.more_sections:
+            secs = self._sections()
+            widths = [float(np.hypot(*np.subtract(sec["pts"][1], sec["pts"][0]))) for sec in secs]
+            row(True, "Cross-sections", f"{len(secs)} marked",
+                " · ".join(f"{w * m:.1f} m" if m else f"{w:.0f} px" for w in widths)
+                + (" · flow direction set" if s.downstream_pts else " · flow direction not set"))
+        elif len(s.section_pts) == 2:
             px = float(np.hypot(*np.subtract(s.section_pts[1], s.section_pts[0])))
             row(True, "Cross-section", f"{px * m:.1f} m wide" if m else f"{px:.0f} px wide",
                 "flow direction set" if s.downstream_pts else "flow direction not set")
@@ -772,13 +832,18 @@ class Wizard:
         elif self._water_at_run():
             row(None, "Water outline", "found when the analysis runs (auto)")
         elif self._pick_stage >= len(self._PICK_STAGES):
-            row(None, "Water outline", "none (section corridor only)")
+            row(None, "Water outline", "none (section corridors only)" if s.more_sections
+                else "none (section corridor only)")
 
         row(None, "Stations", f"{s.n_stations}",
             f"expected {s.velocity_range[0]:g} to {s.velocity_range[1]:g} m/s")
         row(None, "Drone motion", "compensated" if s.stabilise else "not compensated")
-        row(None, "Discharge", "on" if s.discharge_enabled else "off",
-            _esc(Path(s.bathymetry_csv).name) if s.discharge_enabled and s.bathymetry_csv else "")
+        if s.more_sections and s.discharge_enabled:
+            with_depths = sum(1 for sec in self._sections() if sec["bathymetry_csv"])
+            row(None, "Discharge", "on", f"depths for {with_depths} of {len(self._sections())} sections")
+        else:
+            row(None, "Discharge", "on" if s.discharge_enabled else "off",
+                _esc(Path(s.bathymetry_csv).name) if s.discharge_enabled and s.bathymetry_csv else "")
         if s.video_path:
             out = self._out_dir()
             row(None, "Results folder", _esc(Path(out).name), _esc(out) if out != Path(out).name else "")
@@ -1052,7 +1117,9 @@ class Wizard:
             s.scale_mode, s.m_per_px = "manual", r.resolve_m_per_px(info.width)
 
         sec = cfg.section
-        if sec.start_px is not None and sec.end_px is not None:
+        if cfg.sections:
+            self._reopen_sections(cfg)
+        elif sec.start_px is not None and sec.end_px is not None:
             s.section_pts = [tuple(map(float, sec.start_px)), tuple(map(float, sec.end_px))]
         if cfg.flow.downstream_px is not None:
             s.downstream_pts = [tuple(map(float, cfg.flow.downstream_px))]
@@ -1063,12 +1130,16 @@ class Wizard:
         if polys:
             s.water_pts, s.extra_water_polys, s.water_source = polys[0], polys[1:], "loaded"
         s.picks_t_s = start
-        s.n_stations, s.edge_trim, s.section_name = sec.n_stations, sec.edge_trim, sec.name
+        s.n_stations, s.edge_trim = sec.n_stations, sec.edge_trim
         s.velocity_range = tuple(cfg.stiv.velocity_range_ms)
         s.window_px, s.search_line_length_m = cfg.stiv.window_px, cfg.stiv.search_line_length_m
         s.stabilise = cfg.stabilise.enabled
-        s.discharge_enabled = bool(cfg.discharge.enabled and cfg.discharge.bathymetry_csv)
-        s.bathymetry_csv = cfg.discharge.bathymetry_csv
+        if cfg.sections:
+            s.discharge_enabled = any(x["bathymetry_csv"] for x in self._sections())
+        else:
+            s.section_name = sec.name
+            s.discharge_enabled = bool(cfg.discharge.enabled and cfg.discharge.bathymetry_csv)
+            s.bathymetry_csv = cfg.discharge.bathymetry_csv
         s.alpha, s.bank_coefficient = cfg.discharge.alpha, cfg.discharge.bank_coefficient
         s.loaded_out_dir = cfg.output.out_dir
         s.pdf_report = cfg.output.pdf_report
@@ -1096,6 +1167,40 @@ class Wizard:
             self._error.value = _callout(
                 "ok", f"Survey <b>{_esc(Path(path).name)}</b> reopened. Review it and run, or use the "
                       "steps above to change anything first.")
+
+    #: Keys of a ``sections`` entry the wizard shows and edits itself.
+    _MANAGED_SECTION_KEYS = frozenset({"name", "start_px", "end_px", "bathymetry_csv"})
+
+    def _reopen_sections(self, cfg: Config) -> None:
+        """Fill the wizard's cross-sections from a survey's ``sections``.
+
+        A section whose ends are not filled in yet is left out, bar the
+        first, which the picking stages then ask for.  Shared depths with
+        ``discharge.enabled`` become each section's own.
+        """
+        from dataclasses import asdict
+
+        s = self.state
+        shared = cfg.discharge.bathymetry_csv if cfg.discharge.enabled else None
+        entries = []
+        for k, e in enumerate(cfg.sections):
+            have_ends = e.start_px is not None and e.end_px is not None
+            if not have_ends and k > 0:
+                continue
+            entries.append({
+                "name": e.name,
+                "pts": ([tuple(map(float, e.start_px)), tuple(map(float, e.end_px))]
+                        if have_ends else []),
+                "bathymetry_csv": e.bathymetry_csv or (None if e.depths_m is not None else shared),
+                "extra": {key: v for key, v in asdict(e).items()
+                          if v is not None and key not in self._MANAGED_SECTION_KEYS},
+            })
+        first, rest = entries[0], entries[1:]
+        s.section_pts = first["pts"]
+        s.section_name = first["name"]
+        s.bathymetry_csv = first["bathymetry_csv"]
+        s.section_extra = first["extra"]
+        s.more_sections = rest
 
     # ------------------------------------------------------------------ #
     # step 1 -- scale
@@ -1350,7 +1455,7 @@ class Wizard:
         if s.frame_bgr is None or s.frame_t_s != s.start_s:
             s.frame_bgr = read_frame_at(s.video_path, s.start_s)
             s.frame_t_s = s.start_s
-        has_points = bool(s.section_pts or s.downstream_pts or s.water_pts)
+        has_points = bool(s.section_pts or s.downstream_pts or s.water_pts or s.more_sections)
         return has_points and s.picks_t_s is not None and s.picks_t_s != s.frame_t_s
 
     def _water_inputs(self) -> tuple:
@@ -1473,6 +1578,13 @@ class Wizard:
         undo_btn = W.Button(description="Undo point", icon="undo")
         clear_btn = W.Button(description="Clear stage", icon="eraser")
         restart_btn = W.Button(description="Restart", icon="refresh")
+        # Further cross-sections, once the stages are done: all are analysed
+        # together, in one pass over the video.
+        add_sec_btn = W.Button(description="Add another cross-section", icon="plus",
+                               layout=W.Layout(display="none", width="auto"))
+        remove_sec_btn = W.Button(description="Remove the last one", icon="minus",
+                                  layout=W.Layout(display="none", width="auto"))
+        cancel_add_btn = W.Button(description="Cancel", icon="times", layout=W.Layout(display="none"))
 
         lines = {
             stage["attr"]: ax.plot([], [], "o-", color=self._PICK_COLOURS[stage["attr"]], markersize=7,
@@ -1482,6 +1594,11 @@ class Wizard:
         water_fill = Polygon(np.zeros((3, 2)), closed=True, facecolor=GREEN, edgecolor="none",
                              alpha=0.25, visible=False)
         ax.add_patch(water_fill)
+        more_line = ax.plot([], [], "o-", color=ORANGE, markersize=7, markeredgecolor="white",
+                            markeredgewidth=1.3, lw=2)[0]
+        adding_line = ax.plot([], [], "o--", color=ORANGE, markersize=7, markeredgecolor="white",
+                              markeredgewidth=1.3, lw=2)[0]
+        numbers: list = []
 
         def _current_stage():
             return self._PICK_STAGES[self._pick_stage] if self._pick_stage < len(self._PICK_STAGES) else None
@@ -1507,6 +1624,27 @@ class Wizard:
                 water_fill.set_visible(True)
             else:
                 water_fill.set_visible(False)
+            # The further cross-sections, and the one being added; numbered
+            # once there is more than one.
+            xs, ys = [], []
+            for sec in s.more_sections:
+                (x0, y0), (x1, y1) = sec["pts"]
+                xs += [x0, x1, np.nan]
+                ys += [y0, y1, np.nan]
+            more_line.set_data(xs, ys)
+            adding = self._adding_pts or []
+            adding_line.set_data([p[0] for p in adding], [p[1] for p in adding])
+            for t in numbers:
+                t.remove()
+            numbers.clear()
+            if s.more_sections or self._adding_pts:
+                ends = [s.section_pts] + [sec["pts"] for sec in s.more_sections] + [adding]
+                for k, pts in enumerate(ends, start=1):
+                    if pts:
+                        numbers.append(ax.annotate(
+                            str(k), pts[0], xytext=(-9, 9), textcoords="offset points",
+                            ha="right", va="bottom", color="white", fontsize=10, weight="bold",
+                            bbox=dict(boxstyle="circle,pad=0.25", fc=ORANGE, ec="white", lw=1)))
             fig.canvas.draw_idle()
 
         stale_note = (
@@ -1520,6 +1658,19 @@ class Wizard:
         def _update_controls():
             stage = _current_stage()
             stages_html.value = self._stage_list_html()
+            if self._adding_pts is not None:
+                for b in (skip_btn, detect_btn, flip_btn, add_sec_btn, remove_sec_btn):
+                    _show(b, False)
+                _show(cancel_add_btn, True)
+                water_note.value = ""
+                n = len(self._adding_pts)
+                stage_label.value = _callout(
+                    "info", f"<b>Cross-section {len(s.more_sections) + 2}.</b> Click its two ends, bank "
+                            f"to bank, then press <b>Confirm</b> ({n} of 2 clicked).")
+                confirm_btn.disabled = n < 2
+                self._refresh_summary()
+                return
+            _show(cancel_add_btn, False)
             on_water = stage is not None and stage["attr"] == "water_pts"
             if on_water and len(s.water_pts) < 3 and self._water_key != self._water_inputs():
                 stage_label.value = _callout("info", "Looking for the water&hellip;")
@@ -1530,10 +1681,20 @@ class Wizard:
             det = self._water_detection
             _show(flip_btn, bool(det and det.flow_agrees is False and s.downstream_pts))
             self._refresh_summary()
+            _show(add_sec_btn, stage is None)
+            _show(remove_sec_btn, stage is None and bool(s.more_sections))
             if stage is None:
                 s.picks_t_s = s.frame_t_s
-                stage_label.value = _callout("ok", "<b>All set.</b> Press <b>Next</b> to continue, or "
-                                                   "<b>Restart</b> to redo the picking.")
+                n_sec = len(s.more_sections) + 1
+                if n_sec == 1:
+                    msg = ("<b>All set.</b> Press <b>Next</b> to continue, or <b>Restart</b> to redo the "
+                           "picking. To measure in more than one place, <b>Add another "
+                           "cross-section</b>: they are all analysed together.")
+                else:
+                    msg = (f"<b>All set: {n_sec} cross-sections.</b> Press <b>Next</b> to continue, or add "
+                           f"another. The one downstream point (blue) serves them all, so it should be "
+                           f"downstream of every one.")
+                stage_label.value = _callout("ok", msg)
                 confirm_btn.disabled = True
                 _show(skip_btn, False)
                 return
@@ -1551,6 +1712,16 @@ class Wizard:
 
         def _on_click(event):
             if event.inaxes is not ax or event.xdata is None:
+                return
+            if self._adding_pts is not None:
+                if event.button == 3:
+                    _on_undo(None)
+                    return
+                if len(self._adding_pts) < 2:
+                    self._adding_pts.append((float(event.xdata), float(event.ydata)))
+                    s.picks_t_s = s.frame_t_s
+                _redraw()
+                _update_controls()
                 return
             stage = _current_stage()
             if stage is None:
@@ -1571,6 +1742,12 @@ class Wizard:
             _update_controls()
 
         def _on_undo(_btn):
+            if self._adding_pts is not None:
+                if self._adding_pts:
+                    self._adding_pts.pop()
+                _redraw()
+                _update_controls()
+                return
             stage = _current_stage()
             if stage is None:
                 return
@@ -1584,6 +1761,11 @@ class Wizard:
             _update_controls()
 
         def _on_clear(_btn):
+            if self._adding_pts is not None:
+                self._adding_pts.clear()
+                _redraw()
+                _update_controls()
+                return
             stage = _current_stage()
             if stage is None:
                 return
@@ -1594,6 +1776,14 @@ class Wizard:
             _update_controls()
 
         def _on_confirm(_btn):
+            if self._adding_pts is not None:
+                if len(self._adding_pts) == 2:
+                    s.more_sections.append({"name": None, "pts": list(self._adding_pts),
+                                            "bathymetry_csv": None, "extra": {}})
+                    self._adding_pts = None
+                _redraw()
+                _update_controls()
+                return
             s.picks_t_s = s.frame_t_s
             self._pick_stage += 1
             _redraw()
@@ -1602,6 +1792,8 @@ class Wizard:
         def _on_restart(_btn):
             for stage in self._PICK_STAGES:
                 _points(stage).clear()
+            s.more_sections.clear()
+            self._adding_pts = None
             s.extra_water_polys = []
             s.water_source = None
             s.picks_t_s = None
@@ -1636,6 +1828,25 @@ class Wizard:
             _redraw()
             _update_controls()
 
+        def _on_add(_btn):
+            self._adding_pts = []
+            _redraw()
+            _update_controls()
+
+        def _on_remove(_btn):
+            if s.more_sections:
+                s.more_sections.pop()
+            _redraw()
+            _update_controls()
+
+        def _on_cancel(_btn):
+            self._adding_pts = None
+            _redraw()
+            _update_controls()
+
+        add_sec_btn.on_click(_on_add)
+        remove_sec_btn.on_click(_on_remove)
+        cancel_add_btn.on_click(_on_cancel)
         fig.canvas.mpl_connect("button_press_event", _on_click)
         confirm_btn.on_click(_on_confirm)
         skip_btn.on_click(_on_confirm)
@@ -1658,9 +1869,10 @@ class Wizard:
             stage_label,
             water_note,
             fig.canvas,
-            W.HBox([confirm_btn, skip_btn, detect_btn, undo_btn, clear_btn, restart_btn],
+            W.HBox([confirm_btn, cancel_add_btn, skip_btn, detect_btn, undo_btn, clear_btn, restart_btn],
                    layout=W.Layout(flex_flow="row wrap")),
             flip_btn,
+            W.HBox([add_sec_btn, remove_sec_btn], layout=W.Layout(flex_flow="row wrap")),
             _help("Left click = add a point &middot; right click = undo &middot; use the toolbar beside "
                   "the image to zoom in first if you need precision."),
         ])
@@ -1710,15 +1922,49 @@ class Wizard:
         bank_coeff = W.FloatSlider(value=s.bank_coefficient, min=0.0, max=1.0, step=0.05,
                                    description="Bank coefficient", style=_DESC, layout=_field("520px"))
         bathy_note = W.HTML()
+        multi = bool(s.more_sections)
+
+        # With several cross-sections each has its own depths, chosen one
+        # section at a time; a section with none reports velocities only.
+        def _target_options():
+            return [(f"{k + 1}. {sec['name']}", k) for k, sec in enumerate(self._sections())]
+
+        bathy_target = W.Dropdown(options=_target_options(), value=0, description="Depths for",
+                                  style=_DESC, layout=_field())
+        bathy_clear = W.Button(description="No depths for this section", icon="times",
+                               layout=W.Layout(width="auto"))
+
+        def _set_bathy(path: Optional[str]) -> None:
+            k = bathy_target.value if multi else 0
+            if k == 0:
+                s.bathymetry_csv = path
+            else:
+                s.more_sections[k - 1]["bathymetry_csv"] = path
 
         def _bathy_note():
-            bathy_note.value = (f"<div class='stiv-help'>Using <code>{_esc(s.bathymetry_csv)}</code></div>"
-                                if s.bathymetry_csv else "")
+            if not multi:
+                bathy_note.value = (f"<div class='stiv-help'>Using <code>{_esc(s.bathymetry_csv)}</code></div>"
+                                    if s.bathymetry_csv else "")
+                return
+            rows = "".join(
+                f"<tr><td>{k + 1}. {_esc(sec['name'])}</td><td>"
+                + (f"<code>{_esc(Path(sec['bathymetry_csv']).name)}</code>" if sec["bathymetry_csv"]
+                   else "<span class='stiv-help'>none: velocities only</span>")
+                + "</td></tr>"
+                for k, sec in enumerate(self._sections()))
+            bathy_note.value = f"<table class='stiv-table'>{rows}</table>"
 
         _bathy_note()
-        discharge_box = W.VBox([bathy_fc, bathy_upload, bathy_note, alpha, bank_coeff,
-                                _help("alpha converts surface to depth-averaged velocity (0.85 is the "
-                                      "usual value for natural channels).")])
+        bathy_clear.on_click(lambda _b: (_set_bathy(None), _bathy_note(), self._refresh_summary()))
+        discharge_box = W.VBox(
+            ([_help("Each cross-section has its own depths. Pick the section, then choose or upload "
+                    "its CSV; sections without depths report velocities only."),
+              bathy_target] if multi else [])
+            + [bathy_fc, bathy_upload]
+            + ([bathy_clear] if multi else [])
+            + [bathy_note, alpha, bank_coeff,
+               _help("alpha converts surface to depth-averaged velocity (0.85 is the "
+                     "usual value for natural channels).")])
         _show(discharge_box, s.discharge_enabled)
 
         def _on_discharge_toggle(change):
@@ -1729,7 +1975,7 @@ class Wizard:
         discharge_chk.observe(_on_discharge_toggle, names="value")
 
         def _on_bathy(chooser):
-            s.bathymetry_csv = chooser.selected
+            _set_bathy(chooser.selected)
             _bathy_note()
             self._refresh_summary()
 
@@ -1745,7 +1991,7 @@ class Wizard:
             dest.mkdir(exist_ok=True)
             path = dest / Path(files[0]["name"]).name
             path.write_bytes(bytes(files[0]["content"]))
-            s.bathymetry_csv = str(path)
+            _set_bathy(str(path))
             _bathy_note()
             self._refresh_summary()
 
@@ -1786,11 +2032,40 @@ class Wizard:
         for w_ in (n_stations, vrange, stabilise, frame_step_box, window_px, edge_trim, alpha, bank_coeff):
             w_.observe(_sync, names="value")
 
+        names_card = []
+        if multi:
+            name_boxes = []
+            for k, sec in enumerate(self._sections()):
+                box = W.Text(value=sec["name"], description=f"Cross-section {k + 1}", style=_DESC,
+                             layout=_field())
+
+                def _on_name(change, k=k):
+                    name = change["new"].strip() or None
+                    if k == 0:
+                        s.section_name = name
+                    else:
+                        s.more_sections[k - 1]["name"] = name
+                    keep = bathy_target.value
+                    bathy_target.options = _target_options()
+                    bathy_target.value = keep
+                    _bathy_note()
+                    self._refresh_summary()
+
+                box.observe(_on_name, names="value")
+                name_boxes.append(box)
+            names_card = [_card("Cross-sections",
+                                _help("All are analysed together, in one pass over the video. Each "
+                                      "name also names the folder its results go in."),
+                                *name_boxes)]
+
         return W.VBox([
             _heading("4. Analysis settings", "The defaults suit most surveys; adjust them if you know the river."),
+            *names_card,
             _card("Measurement",
-                  _help("Stations are the points across the section where velocity is measured. The "
-                        "expected velocity range bounds the search: make it generous, but not absurd."),
+                  _help("Stations are the points across the section where velocity is measured"
+                        + (" (the same number at every section)" if multi else "")
+                        + ". The expected velocity range bounds the search: make it generous, but "
+                          "not absurd."),
                   n_stations, vrange, advanced),
             _card("Camera motion", stabilise),
             _card("Discharge", discharge_chk, discharge_box),
@@ -1809,6 +2084,18 @@ class Wizard:
             raise ConfigError("no video has been loaded (step 1)")
         manual = s.scale_mode == "manual"
         water = ([s.water_pts] if len(s.water_pts) >= 3 else []) + list(s.extra_water_polys)
+        secs = self._sections()
+        sections = None
+        if len(secs) > 1:
+            sections = []
+            for sec in secs:
+                pts = sec["pts"]
+                sections.append({
+                    "name": sec["name"],
+                    "start_px": pts[0] if len(pts) == 2 else None,
+                    "end_px": pts[1] if len(pts) == 2 else None,
+                    "bathymetry_csv": sec["bathymetry_csv"] if s.discharge_enabled else None,
+                })
         raw = survey_dict(
             s.video_path,
             start_s=s.start_s,
@@ -1829,12 +2116,20 @@ class Wizard:
             search_line_length_m=s.search_line_length_m,
             window_px=s.window_px,
             velocity_range_ms=s.velocity_range,
-            bathymetry_csv=s.bathymetry_csv if s.discharge_enabled else None,
+            bathymetry_csv=s.bathymetry_csv if s.discharge_enabled and sections is None else None,
             alpha=s.alpha,
             bank_coefficient=s.bank_coefficient,
             out_dir=self._out_dir(),
+            sections=sections,
         )
         raw["output"]["pdf_report"] = bool(s.pdf_report)
+        for entry, sec in zip(raw.get("sections", []), secs):
+            # What a reopened survey gave each section that the wizard has no
+            # control for: its own station count, downstream point, depths...
+            for key, value in sec["extra"].items():
+                if key == "depths_m" and (not s.discharge_enabled or sec["bathymetry_csv"]):
+                    continue
+                entry.setdefault(key, copy.deepcopy(value))
         if s.base_raw:
             raw = _merge_survey(s.base_raw, raw)
         return Config.from_dict(raw)
@@ -1851,20 +2146,35 @@ class Wizard:
             scale_how = "entered directly"
         water = {"auto": "detected automatically", "manual": "drawn by hand",
                  "loaded": "from the reopened survey"}.get(s.water_source or "", "none")
+        secs = self._sections()
+        if len(secs) > 1:
+            parts = []
+            for sec in secs:
+                px = float(np.hypot(*np.subtract(sec["pts"][1], sec["pts"][0])))
+                parts.append(f"{_esc(sec['name'])} {px * m:.1f} m")
+            section_row = ("Cross-sections", f"{len(secs)}: " + ", ".join(parts)
+                           + " <span class='stiv-help'>(analysed together)</span>")
+        else:
+            section_row = ("Cross-section", f"{width_px * m:.1f} m ({width_px:.0f} px)")
+        if s.discharge_enabled and len(secs) > 1:
+            n_q = sum(1 for sec in secs if sec["bathymetry_csv"])
+            discharge_row = ("Discharge", f"on, at {n_q} of {len(secs)} cross-sections")
+        else:
+            discharge_row = ("Discharge", "on" if s.discharge_enabled else "off")
         rows = [
             ("Video", _esc(Path(s.video_path).name)),
             ("Ground resolution", f"{m:.4f} m/pixel <span class='stiv-help'>({scale_how})</span>"),
             ("Frame rate", (f"{self._fps():.3f} fps" if self._fps() else "unknown")
              + (" (entered)" if s.fps_override else "")),
             ("Analysis window", f"{s.start_s:.1f} s → {s.start_s + s.duration_s:.1f} s"),
-            ("Cross-section", f"{width_px * m:.1f} m ({width_px:.0f} px)"),
-            ("Stations", str(s.n_stations)),
+            section_row,
+            ("Stations", str(s.n_stations) + (" at each" if len(secs) > 1 else "")),
             ("Expected velocity range", f"{s.velocity_range[0]:.1f} to {s.velocity_range[1]:.1f} m/s"),
             ("Drone-motion compensation", "on" if s.stabilise else "off"),
             ("Water outline", water if len(s.water_pts) >= 3 or s.extra_water_polys
              else "found when the analysis runs (auto, from the survey file)"
              if self._water_at_run() else "none"),
-            ("Discharge", "on" if s.discharge_enabled else "off"),
+            discharge_row,
             ("PDF report", "yes" if s.pdf_report else "no"),
             ("Results folder", f"<code>{_esc(self._out_dir())}</code>"),
         ]
@@ -1903,19 +2213,23 @@ class Wizard:
         for btn in self._step_btns:
             btn.disabled = True
         status = W.HTML(_callout("info", "<b>Running the analysis&hellip;</b> reading the video and "
-                                         "building a space-time image at every station."))
+                                         "building a space-time image at every station"
+                                         + (f" of all {len(cfg.sections)} cross-sections"
+                                            if cfg.sections else "") + "."))
         progress_out = W.Output(layout=W.Layout(padding="4px", max_height="200px", overflow="auto"))
         self._body.children = [W.VBox([
             _heading("5. Review and run", "Analysing&hellip;"), status, _card(None, progress_out),
         ])]
 
         try:
-            from .analysis import run as run_analysis
-            from .report import write_outputs
+            from .analysis import run_survey
+            from .report import write_survey_outputs
 
             with progress_out:
-                result = run_analysis(cfg, progress=True)
-                out_path = write_outputs(result, cfg)
+                survey = run_survey(cfg, progress=True)
+                out_path = write_survey_outputs(survey, cfg)
+            # One section's result is kept as it always was; several, as the survey.
+            result = survey if cfg.sections is not None else survey.results[0]
         except ConfigError as exc:
             self._next_btn.disabled = False
             self._back_btn.disabled = False
@@ -1941,67 +2255,46 @@ class Wizard:
     # step 5 -- results
     # ------------------------------------------------------------------ #
     def _build_step5(self):
+        from .analysis import SurveyResult
+
         s = self.state
         if s.result is None:
             return W.HTML("<p>No results yet.</p>")
         result = s.result
         out = s.out_path
+        multi = isinstance(result, SurveyResult)
 
-        v = result.velocities
-        finite = v[np.isfinite(v)]
-        n = len(result.stations)
-        n_ok = sum(1 for st in result.stations if not st.failed)
-        stab = result.stabilisation
-        tiles = []
-        if finite.size:
-            tiles += [("Mean surface velocity", f"{finite.mean():.2f} m/s", f"over {finite.size} stations"),
-                      ("Max surface velocity", f"{finite.max():.2f} m/s", None)]
-        if result.discharge is not None:
-            tiles.append(("Discharge", f"{result.discharge.discharge_m3s:.3f} m³/s",
-                          f"area {result.discharge.area_m2:.2f} m²"))
-        tiles.append(("Stations passing QC", f"{n_ok} / {n}", None))
-        if not stab.enabled:
-            stab_txt = "off" if not stab.auto_disabled else "switched off"
-        elif stab.warnings():
-            stab_txt = "check warnings"
+        if multi:
+            survey = result
+            first = survey.results[0]
+            views = {"All cross-sections": lambda: self._survey_view(survey, Path(out))}
+            for r in survey.results:
+                folder = Path(out) / section_folder(r.config.section.name)
+                views[r.config.section.name] = (
+                    lambda r=r, folder=folder: self._result_view(r, folder, survey))
+            picker = W.ToggleButtons(options=list(views), value="All cross-sections",
+                                     style={"button_width": "auto"})
+            built: dict = {}
+            holder = W.VBox([])
+
+            def _show_view(change=None):
+                name = picker.value
+                if name not in built:
+                    built[name] = views[name]()
+                holder.children = [built[name]]
+
+            picker.observe(_show_view, names="value")
+            _show_view()
+            body = [_help("Choose a cross-section to see its own figures, table and report."),
+                    picker, holder]
+            lead = (f"{len(survey.results)} cross-sections &middot; "
+                    f"{first.duration_s:.0f} s analysed together")
+            cfg = survey.config
         else:
-            stab_txt = "OK"
-        tiles.append(("Camera motion", stab_txt, "drift correction"))
-
-        warn_html = ""
-        if result.warnings:
-            items = "".join(f"<li>{_esc(w)}</li>" for w in result.warnings)
-            warn_html = _callout("warn", f"<b>Warnings</b><ul style='margin:4px 0 0 18px;padding:0'>{items}</ul>")
-
-        def _img(name: str):
-            p = out / name
-            if not p.is_file():
-                return None
-            return W.Image(value=p.read_bytes(), format="png", layout=W.Layout(width="100%", max_width="900px"))
-
-        panes, titles = [], []
-        for name, title in (("velocity_map.png", "Flow map"), ("velocity_profile.png", "Velocity profile"),
-                            ("overview.png", "Section check"), ("sti_panel.png", "Space-time"),
-                            ("discharge.png", "Discharge")):
-            img = _img(name)
-            if img is not None:
-                panes.append(img)
-                titles.append(title)
-        table_out = W.Output()
-        with table_out:
-            df = result.to_frame()
-            cols = ["station_m", "velocity_ms", "velocity_std_ms", "coherency", "flags"]
-            display(df[cols].round(3))
-        panes.append(table_out)
-        titles.append("Table")
-        panes.append(W.HTML(f"<pre class='stiv-report'>{_esc(result.summary())}</pre>"))
-        titles.append("Run report")
-        tabs = W.Tab(children=panes)
-        if "titles" in tabs.trait_names():          # ipywidgets 8
-            tabs.titles = tuple(titles)
-        else:                                       # ipywidgets 7, which Colab may still ship
-            for i, t in enumerate(titles):
-                tabs.set_title(i, t)
+            body = [self._result_view(result, Path(out))]
+            lead = (f"{_esc(result.config.section.name)} &middot; "
+                    f"{result.geometry.width_m:.1f} m wide &middot; {result.duration_s:.0f} s analysed")
+            cfg = result.config
 
         zip_btn = W.Button(description="Download results (.zip)" if _in_colab() else "Zip the results",
                            icon="download", layout=W.Layout(width="auto"))
@@ -2024,7 +2317,7 @@ class Wizard:
                     files_note.value = _callout("info", "Writing the PDF report&hellip;")
                     from .report import add_pdf_report
 
-                    add_pdf_report(result, result.config)
+                    add_pdf_report(result, cfg)
                 if _in_colab():
                     from google.colab import files
 
@@ -2068,18 +2361,145 @@ class Wizard:
         colab_note = (" Colab deletes its own disk when the session ends, so download them or keep them "
                       "on Google Drive." if _in_colab() and not str(Path(out).resolve()).startswith("/content/drive")
                       else "")
+        where = (" Each cross-section's own tables, figures and report are in a sub-folder named after it; "
+                 "<code>sections.csv</code> compares them." if multi else "")
         return W.VBox([
-            _heading("6. Results", f"{_esc(result.config.section.name)} &middot; "
-                                   f"{result.geometry.width_m:.1f} m wide &middot; {result.duration_s:.0f} s analysed"),
-            W.HTML(_tiles(tiles) + warn_html),
-            tabs,
+            _heading("6. Results", lead),
+            *body,
             _card("Files",
                   _help(f"Tables, figures, the run report{', report.pdf' if pdf_path.is_file() else ''} "
                         f"and <code>config_used.yaml</code> were written to "
-                        f"<code>{_esc(Path(out).resolve())}</code>. Reopen that YAML in step 1 to come back "
-                        f"to this survey later.{colab_note}"),
+                        f"<code>{_esc(Path(out).resolve())}</code>.{where} Reopen that YAML in step 1 to "
+                        f"come back to this survey later.{colab_note}"),
                   W.HBox([pdf_btn, zip_btn, rerun_btn], layout=W.Layout(flex_flow="row wrap")),
                   files_note),
+        ])
+
+    @staticmethod
+    def _tabs(panes: list, titles: list) -> W.Tab:
+        tabs = W.Tab(children=panes)
+        if "titles" in tabs.trait_names():          # ipywidgets 8
+            tabs.titles = tuple(titles)
+        else:                                       # ipywidgets 7, which Colab may still ship
+            for i, t in enumerate(titles):
+                tabs.set_title(i, t)
+        return tabs
+
+    @staticmethod
+    def _image(path: Path):
+        if not path.is_file():
+            return None
+        return W.Image(value=path.read_bytes(), format="png",
+                       layout=W.Layout(width="100%", max_width="900px"))
+
+    @staticmethod
+    def _warnings_html(warnings: list[str], title: str = "Warnings") -> str:
+        if not warnings:
+            return ""
+        items = "".join(f"<li>{_esc(w)}</li>" for w in warnings)
+        return _callout("warn", f"<b>{title}</b><ul style='margin:4px 0 0 18px;padding:0'>{items}</ul>")
+
+    def _result_view(self, result, out: Path, survey=None) -> W.VBox:
+        """Headline numbers, figures, table and report of one cross-section.
+
+        ``out`` is the folder its figures were written to.  Within a
+        ``survey``, the warnings it lists once for all its sections are left
+        out here.
+        """
+        omit_warnings = survey.shared_warnings if survey is not None else []
+        v = result.velocities
+        finite = v[np.isfinite(v)]
+        n = len(result.stations)
+        n_ok = sum(1 for st in result.stations if not st.failed)
+        stab = result.stabilisation
+        tiles = []
+        if finite.size:
+            tiles += [("Mean surface velocity", f"{finite.mean():.2f} m/s", f"over {finite.size} stations"),
+                      ("Max surface velocity", f"{finite.max():.2f} m/s", None)]
+        if result.discharge is not None:
+            tiles.append(("Discharge", f"{result.discharge.discharge_m3s:.3f} m³/s",
+                          f"area {result.discharge.area_m2:.2f} m²"))
+        tiles.append(("Stations passing QC", f"{n_ok} / {n}", None))
+        if not stab.enabled:
+            stab_txt = "off" if not stab.auto_disabled else "switched off"
+        elif stab.warnings():
+            stab_txt = "check warnings"
+        else:
+            stab_txt = "OK"
+        tiles.append(("Camera motion", stab_txt, "drift correction"))
+
+        omit = set(omit_warnings)
+        warnings = [w for w in result.warnings if w not in omit]
+        warn_html = self._warnings_html(
+            warnings, "Warnings for this cross-section" if survey is not None else "Warnings")
+
+        panes, titles = [], []
+        for name, title in (("velocity_map.png", "Flow map"), ("velocity_profile.png", "Velocity profile"),
+                            ("overview.png", "Section check"), ("sti_panel.png", "Space-time"),
+                            ("discharge.png", "Discharge")):
+            img = self._image(out / name)
+            if img is not None:
+                panes.append(img)
+                titles.append(title)
+        table_out = W.Output()
+        with table_out:
+            df = result.to_frame()
+            cols = ["station_m", "velocity_ms", "velocity_std_ms", "coherency", "flags"]
+            display(df[cols].round(3))
+        panes.append(table_out)
+        titles.append("Table")
+        panes.append(W.HTML(f"<pre class='stiv-report'>{_esc(result.summary(omit_warnings=omit_warnings))}</pre>"))
+        titles.append("Run report")
+        head = ([W.HTML(f"<div class='stiv-help'>{_esc(result.config.section.name)} &middot; "
+                        f"{result.geometry.width_m:.1f} m wide</div>")] if survey is not None else [])
+        return W.VBox(head + [W.HTML(_tiles(tiles) + warn_html), self._tabs(panes, titles)])
+
+    def _survey_view(self, survey, out: Path) -> W.VBox:
+        """Every cross-section side by side: the table, and the figures with all of them."""
+        results = survey.results
+        n = sum(len(r.stations) for r in results)
+        n_ok = sum(1 for r in results for st in r.stations if not st.failed)
+        tiles = [("Cross-sections", str(len(results)), "analysed together"),
+                 ("Stations passing QC", f"{n_ok} / {n}", "over every section")]
+        q = [r.discharge.discharge_m3s for r in results if r.discharge is not None]
+        if q:
+            tiles.append(("Discharge", f"{len(q)} of {len(results)}", "sections with depths"))
+        stab = results[0].stabilisation
+        if not stab.enabled:
+            stab_txt = "off" if not stab.auto_disabled else "switched off"
+        else:
+            stab_txt = "check warnings" if stab.warnings() else "OK"
+        tiles.append(("Camera motion", stab_txt, "one correction for every section"))
+
+        rows = []
+        for r in results:
+            v = r.velocities
+            finite = v[np.isfinite(v)]
+            ok = sum(1 for st in r.stations if not st.failed)
+            rows.append(
+                f"<tr><td><b>{_esc(r.config.section.name)}</b></td><td>{r.geometry.width_m:.1f} m</td>"
+                f"<td>{ok} / {len(r.stations)}</td>"
+                f"<td>{f'{finite.mean():.2f}' if finite.size else '–'}</td>"
+                f"<td>{f'{finite.max():.2f}' if finite.size else '–'}</td>"
+                + (f"<td>{r.discharge.discharge_m3s:.3f}</td>" if r.discharge is not None
+                   else ("<td>–</td>" if q else "")) + "</tr>")
+        table = ("<table class='stiv-table'><tr><th>section</th><th>width</th><th>passing QC</th>"
+                 "<th>mean U (m/s)</th><th>max U (m/s)</th>" + ("<th>Q (m³/s)</th>" if q else "")
+                 + "</tr>" + "".join(rows) + "</table>")
+
+        panes, titles = [], []
+        for name, title in (("velocity_map.png", "Flow map"), ("overview.png", "Section check")):
+            img = self._image(out / name)
+            if img is not None:
+                panes.append(img)
+                titles.append(title)
+        panes.append(W.HTML(f"<pre class='stiv-report'>{_esc(survey.summary())}</pre>"))
+        titles.append("Run report")
+        return W.VBox([
+            W.HTML(_tiles(tiles) + self._warnings_html(survey.shared_warnings,
+                                                       "Warnings for the whole survey")),
+            _card("Cross-sections", W.HTML(table)),
+            self._tabs(panes, titles),
         ])
 
 

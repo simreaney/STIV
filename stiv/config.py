@@ -10,6 +10,16 @@ config file reads like the analysis it describes::
     flow:       {direction: auto}
     stiv:       {search_line_length_m: 4.0, window_px: 31}
 
+Several cross-sections of the same clip are listed under ``sections`` instead,
+and analysed together in one pass over the video (:func:`stiv.analysis.run_survey`).
+``section`` then holds only what they share::
+
+    section:    {n_stations: 30, edge_trim: 0.05}
+    sections:
+      - {name: upstream, start_px: [310, 880], end_px: [1640, 830]}
+      - {name: bridge, start_px: [300, 1400], end_px: [1620, 1350],
+         bathymetry_csv: bridge_depths.csv}
+
 :func:`survey_dict` is the one place a *new* survey's raw config is put
 together, so ``stiv init``, ``stiv pick`` and the notebook wizard all start from
 the same schema defaults.
@@ -143,6 +153,48 @@ class SectionConfig:
     edge_trim: float = 0.0
     #: Name written into the output tables.
     name: str = "section"
+
+
+@dataclass
+class SectionEntry:
+    """One cross-section of a survey that measures several, under ``sections``.
+
+    Anything left out is taken from the blocks every section shares:
+    ``n_stations`` and ``edge_trim`` from ``section``, ``downstream_px`` from
+    ``flow``, and the depths and ``water_level_m`` from ``discharge``.
+
+    Depths given here turn the discharge on for this section, whatever
+    ``discharge.enabled`` says; ``discharge.enabled: true`` asks for it at
+    every section, so each then needs depths, its own or the shared ones.
+    """
+
+    #: Names the section in the outputs, and the sub-folder its results go in.
+    #: ``section_1``, ``section_2``, ... when left out.
+    name: Optional[str] = None
+    start_px: Optional[Point] = None
+    end_px: Optional[Point] = None
+    n_stations: Optional[int] = None
+    edge_trim: Optional[float] = None
+    #: A point downstream of *this* section.  Worth giving when the sections
+    #: are strung out along the reach, so no single point is downstream of all.
+    downstream_px: Optional[Point] = None
+    bathymetry_csv: Optional[str] = None
+    depths_m: Optional[Sequence[float]] = None
+    water_level_m: Optional[float] = None
+
+
+#: Sub-folders a run writes beside its tables, which no section folder may take.
+_RESERVED_FOLDERS = frozenset({"sti", "sti_detail"})
+
+
+def section_folder(name: str) -> str:
+    """The results sub-folder of a section in a multi-section survey.
+
+    The name with anything but letters, digits, ``.``, ``-`` and ``_``
+    replaced, so it is a safe folder name on every system.
+    """
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("._") or "section"
+    return f"section_{slug}" if slug.lower() in _RESERVED_FOLDERS else slug
 
 
 @dataclass
@@ -340,6 +392,9 @@ class Config:
     video: VideoConfig = field(default_factory=VideoConfig)
     rectify: RectifyConfig = field(default_factory=RectifyConfig)
     section: SectionConfig = field(default_factory=SectionConfig)
+    #: Several cross-sections, analysed in one pass over the video; None for
+    #: the usual one, given in ``section``.  See :class:`SectionEntry`.
+    sections: Optional[list[SectionEntry]] = None
     flow: FlowConfig = field(default_factory=FlowConfig)
     stabilise: StabiliseConfig = field(default_factory=StabiliseConfig)
     stiv: StiConfig = field(default_factory=StiConfig)
@@ -386,6 +441,9 @@ class Config:
         kwargs: dict[str, Any] = {}
         for f in fields(cls):
             section_raw = raw.get(f.name)
+            if f.name == "sections":
+                kwargs[f.name] = _build_sections(section_raw)
+                continue
             if section_raw is None:
                 kwargs[f.name] = f.default_factory()  # type: ignore[misc]
                 continue
@@ -416,6 +474,8 @@ class Config:
 
         self.video.path = _abs(self.video.path) or ""
         self.discharge.bathymetry_csv = _abs(self.discharge.bathymetry_csv)
+        for entry in self.sections or []:
+            entry.bathymetry_csv = _abs(entry.bathymetry_csv)
         self.output.out_dir = _abs(self.output.out_dir) or "stiv_output"
 
     def normalise_types(self) -> None:
@@ -427,11 +487,21 @@ class Config:
         should be.  Left alone, those surface as a ``TypeError`` from deep in
         the analysis -- or, worse, not at all.
         """
-        for sec in fields(self):
-            obj = getattr(self, sec.name)
+        blocks: list[tuple[str, Any]] = [
+            (sec.name, getattr(self, sec.name)) for sec in fields(self) if sec.name != "sections"
+        ]
+        if self.sections is not None:
+            if isinstance(self.sections, (str, bytes)) or not isinstance(self.sections, _AbcSequence):
+                raise ConfigError(f"sections must be a list of cross-sections, got {self.sections!r}")
+            self.sections = list(self.sections)
+            for i, entry in enumerate(self.sections):
+                if not isinstance(entry, SectionEntry):
+                    raise ConfigError(f"sections[{i}] must be a cross-section, got {entry!r}")
+            blocks += [(f"sections[{i}]", e) for i, e in enumerate(self.sections)]
+        for block, obj in blocks:
             hints = _type_hints(type(obj))
             for f in fields(obj):
-                where = f"{sec.name}.{f.name}"
+                where = f"{block}.{f.name}"
                 value = getattr(obj, f.name)
                 if where == "stabilise.water_mask_px" and isinstance(value, str):
                     # The one field that takes a word as well as polygons.
@@ -447,6 +517,9 @@ class Config:
     # ------------------------------------------------------------------ #
     def validate(self) -> None:
         self.normalise_types()
+        if self.sections is not None:
+            self._validate_sections()
+            return
         v, r, s, st, q = self.video, self.rectify, self.section, self.stiv, self.quality
 
         if not v.path:
@@ -610,8 +683,92 @@ class Config:
         if self.output.dpi < 1:
             raise ConfigError("output.dpi must be >= 1")
 
+    def _validate_sections(self) -> None:
+        """Validate a multi-section survey: each section as the run will see it."""
+        s = self.section
+        if s.start_px is not None or s.end_px is not None:
+            raise ConfigError(
+                "the cross-sections are listed under `sections`, so section.start_px and "
+                "section.end_px must be left out: with `sections`, the `section` block holds "
+                "only what every cross-section shares (n_stations, edge_trim)"
+            )
+        if not self.sections:
+            raise ConfigError(
+                "sections is empty: list at least one cross-section, or remove it and give "
+                "the one cross-section under `section`"
+            )
+        for i, e in enumerate(self.sections):
+            if e.start_px is None or e.end_px is None:
+                raise ConfigError(
+                    f"sections[{i}]{f' ({e.name!r})' if e.name else ''} needs start_px and "
+                    f"end_px: the two ends of the cross-section in image pixels"
+                )
+        configs = self.section_configs()
+        seen: dict[str, int] = {}
+        for i, cfg in enumerate(configs):
+            name = cfg.section.name
+            folder = section_folder(name).lower()
+            if folder in seen:
+                j = seen[folder]
+                other = configs[j].section.name
+                clash = (f"are both called {name!r}" if other == name else
+                         f"({other!r} and {name!r}) would share the results folder "
+                         f"{section_folder(name)!r}")
+                raise ConfigError(
+                    f"cross-sections {j + 1} and {i + 1} {clash}: give each its own "
+                    f"name, which also names the folder its results go in"
+                )
+            seen[folder] = i
+            try:
+                cfg.validate()
+            except ConfigError as exc:
+                raise ConfigError(f"cross-section {i + 1} ({name!r}): {exc}") from None
+
+    def section_configs(self) -> list["Config"]:
+        """One single-section config per cross-section, in order.
+
+        ``[self]`` for a config with one ``section``.  For ``sections``, each
+        is this config with that section in ``section`` -- the shared
+        settings filled in where the entry leaves them out -- and results
+        going to the section's own sub-folder of ``output.out_dir``.  Each can
+        be analysed, written, or saved and re-run like any other config.
+        """
+        if self.sections is None:
+            return [self]
+        out = []
+        for i, e in enumerate(self.sections):
+            cfg = copy.deepcopy(self)
+            cfg.sections = None
+            name = e.name if e.name else f"section_{i + 1}"
+            cfg.section = SectionConfig(
+                start_px=copy.deepcopy(e.start_px),
+                end_px=copy.deepcopy(e.end_px),
+                n_stations=self.section.n_stations if e.n_stations is None else e.n_stations,
+                edge_trim=self.section.edge_trim if e.edge_trim is None else e.edge_trim,
+                name=name,
+            )
+            if e.downstream_px is not None:
+                cfg.flow.downstream_px = copy.deepcopy(e.downstream_px)
+            if e.bathymetry_csv is not None or e.depths_m is not None:
+                cfg.discharge.enabled = True
+                cfg.discharge.bathymetry_csv = e.bathymetry_csv
+                cfg.discharge.depths_m = copy.deepcopy(e.depths_m)
+            if e.water_level_m is not None:
+                cfg.discharge.water_level_m = e.water_level_m
+            cfg.output.out_dir = str(Path(self.output.out_dir) / section_folder(name))
+            out.append(cfg)
+        return out
+
     def to_dict(self) -> dict[str, Any]:
-        return _asdict(self)
+        d = _asdict(self)
+        if self.sections is None:
+            # A one-section config reads exactly as it did before `sections`.
+            del d["sections"]
+        else:
+            # Unset entries are inherited, and saying so line by line is noise.
+            d["sections"] = [{k: v for k, v in e.items() if v is not None} for e in d["sections"]]
+            d["section"] = {k: d["section"][k] for k in ("n_stations", "edge_trim")}
+        return d
 
     def dump_yaml(self, path: str | Path) -> None:
         Path(path).write_text(yaml_text(self.to_dict()), encoding="utf-8")
@@ -629,6 +786,26 @@ def _build(cls: type, raw: dict[str, Any], name: str):
             f"Valid keys: {sorted(valid)}"
         )
     return cls(**copy.deepcopy(raw))
+
+
+def _build_sections(raw: Any) -> Optional[list[SectionEntry]]:
+    """The ``sections`` list of a raw config, as :class:`SectionEntry` objects."""
+    if raw is None:
+        return None
+    if isinstance(raw, (str, bytes, dict)) or not isinstance(raw, _AbcSequence):
+        raise ConfigError(
+            "sections must be a list of cross-sections, each a mapping such as "
+            "{name: upstream, start_px: [x, y], end_px: [x, y]}"
+        )
+    out = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ConfigError(
+                f"sections[{i}] must be a mapping such as "
+                f"{{name: upstream, start_px: [x, y], end_px: [x, y]}}, got {item!r}"
+            )
+        out.append(_build(SectionEntry, item, f"sections[{i}]"))
+    return out
 
 
 class _ConfigLoader(yaml.SafeLoader):
@@ -895,6 +1072,7 @@ def survey_dict(
     alpha: float = DischargeConfig.alpha,
     bank_coefficient: float = DischargeConfig.bank_coefficient,
     out_dir: str = OutputConfig.out_dir,
+    sections: Optional[Sequence[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """The raw config of a new survey, with every default taken from the schema.
 
@@ -908,7 +1086,38 @@ def survey_dict(
     ``altitude_m`` and ``hfov_deg`` -- either of which may still be a
     placeholder -- else from ``m_per_px``.  ``water_mask_px`` is polygons, or
     ``"auto"`` for the automatic outline at run time.
+
+    ``sections`` lists several cross-sections, each a mapping of
+    :class:`SectionEntry` keys (``name``, ``start_px``, ``end_px``, and
+    optionally ``downstream_px`` and ``bathymetry_csv``) that replaces
+    ``start_px``, ``end_px``, ``name`` and ``bathymetry_csv`` above.  A list
+    of one is written as the usual single ``section``, so a survey of one
+    cross-section reads the same whichever way it was built.
     """
+    if sections is not None and len(sections) == 1:
+        (only,) = sections
+        start_px, end_px = only.get("start_px"), only.get("end_px")
+        name = only.get("name") or name
+        downstream_px = only.get("downstream_px", downstream_px)
+        bathymetry_csv = only.get("bathymetry_csv", bathymetry_csv)
+        sections = None
+    entries: Optional[list[dict[str, Any]]] = None
+    if sections is not None:
+        if not sections:
+            raise ConfigError("sections is empty: give at least one cross-section")
+        entries = []
+        for i, e in enumerate(sections):
+            entry: dict[str, Any] = {
+                "name": e.get("name") or f"section_{i + 1}",
+                "start_px": _point(e.get("start_px")),
+                "end_px": _point(e.get("end_px")),
+            }
+            if e.get("downstream_px") is not None:
+                entry["downstream_px"] = _point(e["downstream_px"])
+            if e.get("bathymetry_csv") is not None:
+                entry["bathymetry_csv"] = str(e["bathymetry_csv"])
+            entries.append(entry)
+
     if gcp_px is not None:
         rectify: dict[str, Any] = {
             "method": "gcp",
@@ -936,16 +1145,22 @@ def survey_dict(
     if fps_override is not None:
         video["fps_override"] = float(fps_override)
 
-    return {
-        "video": video,
-        "rectify": rectify,
-        "section": {
+    if entries is None:
+        section: dict[str, Any] = {
             "start_px": _point(start_px),
             "end_px": _point(end_px),
             "n_stations": int(n_stations),
             "edge_trim": float(edge_trim),
             "name": name,
-        },
+        }
+    else:
+        section = {"n_stations": int(n_stations), "edge_trim": float(edge_trim)}
+
+    raw: dict[str, Any] = {
+        "video": video,
+        "rectify": rectify,
+        "section": section,
+        **({"sections": entries} if entries is not None else {}),
         "flow": {"direction": "auto", "downstream_px": _point(downstream_px)},
         "stabilise": stab,
         "stiv": {
@@ -961,3 +1176,4 @@ def survey_dict(
         },
         "output": {"out_dir": str(out_dir)},
     }
+    return raw
