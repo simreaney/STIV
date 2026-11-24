@@ -47,10 +47,28 @@ enum PickTarget: Equatable {
         case .downstream:
             return "Tap a point downstream, so the search lines point the way the water goes."
         case .waterOutline:
-            return "Optional: tap around the water to outline it. This keeps the "
-                 + "camera-motion check off the moving surface."
+            return "Optional: outline the water, so the camera-motion check keeps off the "
+                 + "moving surface. It is found for you where it can be; tap around the "
+                 + "water to draw your own instead."
         }
     }
+}
+
+/// Where the water outline came from.
+enum WaterSource: Equatable {
+    case automatic
+    case manual
+}
+
+/// The automatic water outline, as far as it has got.
+enum WaterDetection: Equatable {
+    case idle
+    /// Collecting frames and comparing them: a second or two.
+    case looking
+    /// Outlined; `weak` when the detector has a reason for doubt.
+    case found(weak: Bool, message: String)
+    /// Not outlined, and why.
+    case notFound(String)
 }
 
 /// Not actor-isolated: every entry point is either a SwiftUI action (already
@@ -73,6 +91,12 @@ final class SurveyModel: ObservableObject {
     @Published var sectionEnd: PlanePoint?
     @Published var downstream: PlanePoint?
     @Published var waterPolygon: [PlanePoint] = []
+    /// Where `waterPolygon` came from, while there is one.
+    @Published private(set) var waterSource: WaterSource?
+    @Published private(set) var waterDetection: WaterDetection = .idle
+    /// Set when the water seems to flow toward the other side of the section
+    /// from the downstream point: the point is probably on the wrong side.
+    @Published private(set) var flowLooksReversed = false
     @Published var pickTarget: PickTarget = .sectionStart
     /// Why the last tap did nothing, when it did nothing.
     @Published var tapHint: String?
@@ -114,6 +138,13 @@ final class SurveyModel: ObservableObject {
     /// tests, which have no camera and stand in views of their own.
     var currentView: () -> CameraSnapshot? = { nil }
 
+    /// Collect the burst of frames the water outline is found from, handing
+    /// them to the closure on the main queue; false when there is no camera to
+    /// collect them from.  A seam for the tests, which supply rendered frames.
+    var collectWaterFrames: (WaterPlane, @escaping ([LumaFrame]) -> Void) -> Bool = { _, _ in false }
+    /// Increments per water detection, so a superseded one is dropped.
+    private var waterRun = 0
+
     /// The camera view at the last cross-section tap, while the user was aiming
     /// at the section.  Layouts are built from it until recording starts, when
     /// the live view on the record screen takes over; the settings screen shows
@@ -145,6 +176,12 @@ final class SurveyModel: ObservableObject {
 
     init() {
         currentView = { [capture] in capture.camera.map(CameraSnapshot.init) }
+        collectWaterFrames = { [capture] plane, done in
+            // No frames are arriving without a camera: nothing to wait for.
+            guard capture.camera != nil else { return false }
+            capture.collectWaterFrames(plane: plane, completion: done)
+            return true
+        }
         capture.onEvent = { [weak self] event in self?.handle(event) }
         NotificationCenter.default
             .publisher(for: ProcessInfo.thermalStateDidChangeNotification)
@@ -223,6 +260,9 @@ final class SurveyModel: ObservableObject {
         sectionEnd = nil
         downstream = nil
         waterPolygon = []
+        cancelWaterDetection()
+        waterSource = nil
+        flowLooksReversed = false
         pickTarget = .sectionStart
         tapHint = nil
         sectionView = nil
@@ -371,8 +411,14 @@ final class SurveyModel: ObservableObject {
             downstream = world
             pickTarget = .waterOutline
             rebuildLayout()
+            if waterPolygon.isEmpty { detectWater() }
         case .waterOutline:
+            // A tap means the user is drawing their own: it starts afresh
+            // over an automatic outline, and wins over one still being found.
             // The outline does not touch the layout: nothing to rebuild.
+            if waterSource == .automatic { waterPolygon = [] }
+            cancelWaterDetection()
+            waterSource = .manual
             waterPolygon.append(world)
         }
     }
@@ -387,13 +433,80 @@ final class SurveyModel: ObservableObject {
         case .downstream:
             sectionEnd = nil
             pickTarget = .sectionEnd
+        case .waterOutline where waterSource == .automatic:
+            // One undo takes the whole automatic outline: its vertices were
+            // never tapped, so walking back through them would mean nothing.
+            waterPolygon.removeAll()
+            waterSource = nil
+            waterDetection = .idle
         case .waterOutline where !waterPolygon.isEmpty:
             waterPolygon.removeLast()
+            if waterPolygon.isEmpty { waterSource = nil }
         case .waterOutline:
             downstream = nil
             waterPolygon.removeAll()
+            cancelWaterDetection()
+            flowLooksReversed = false
             pickTarget = .downstream
         }
+        rebuildLayout()
+    }
+
+    // MARK: - the water outline
+
+    /// Look for the water and outline it, replacing any outline so far.
+    ///
+    /// Called when the downstream point is tapped, while the phone is still
+    /// aimed at the section, and again from the button.  It needs a second or
+    /// two of frames; a tap, an undo or a new survey meanwhile supersedes it.
+    func detectWater() {
+        guard let plane, let sectionStart, let sectionEnd else { return }
+        waterRun += 1
+        let run = waterRun
+        let downstream = self.downstream
+        waterPolygon = []
+        waterSource = nil
+        flowLooksReversed = false
+        let started = collectWaterFrames(plane) { [weak self] frames in
+            guard let self, run == self.waterRun else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let outline = detectWaterOutline(frames: frames, sectionStart: sectionStart,
+                                                 sectionEnd: sectionEnd, downstream: downstream)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, run == self.waterRun else { return }
+                    self.adopt(outline)
+                }
+            }
+        }
+        waterDetection = started ? .looking : .idle
+    }
+
+    private func adopt(_ outline: WaterOutline) {
+        guard outline.ok else {
+            waterDetection = .notFound(outline.message)
+            return
+        }
+        waterPolygon = outline.polygon
+        waterSource = .automatic
+        waterDetection = .found(weak: outline.confidence == .weak, message: outline.message)
+        flowLooksReversed = outline.flowAgrees == false
+    }
+
+    /// Drop the detection in progress, if any: whatever it finds is not wanted.
+    private func cancelWaterDetection() {
+        waterRun += 1
+        waterDetection = .idle
+    }
+
+    /// Mirror the downstream point across the line of the section -- the fix
+    /// for one tapped on the wrong side.
+    func moveDownstreamAcross() {
+        guard let sectionStart, let sectionEnd, let downstream,
+              let along = try? (sectionEnd - sectionStart).normalised() else { return }
+        let normal = along.perpendicular
+        let offset = (downstream - sectionStart).dot(normal)
+        self.downstream = downstream + normal * (-2 * offset)
+        flowLooksReversed = false
         rebuildLayout()
     }
 
@@ -522,6 +635,9 @@ final class SurveyModel: ObservableObject {
     ///   will actually be sampled from.
     func startRecording(from view: CameraSnapshot? = nil) {
         guard !isFinishing, capture.phase != .recording else { return }
+        // An outline still being found would land in the middle of the
+        // recording, after the pose check has already used the old one.
+        if waterDetection == .looking { cancelWaterDetection() }
         recordingError = nil
         recordingNotice = nil
         recordingSeconds = nil
@@ -777,6 +893,12 @@ final class SurveyModel: ObservableObject {
             let report = directory.appendingPathComponent("report.txt")
             try result.summary().write(to: report, atomically: true, encoding: .utf8)
             urls.append(report)
+
+            if let png = flowMapPNG(result) {
+                let map = directory.appendingPathComponent("velocity_map.png")
+                try png.write(to: map)
+                urls.append(map)
+            }
         } catch {
             analysisError = "Could not write the export: \(error.localizedDescription)"
         }

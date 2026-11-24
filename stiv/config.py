@@ -33,6 +33,15 @@ import yaml
 
 Point = Sequence[float]
 
+#: ``stabilise.water_mask_px: auto`` -- outline the water automatically when
+#: the analysis starts (:mod:`stiv.watermask`) instead of from given polygons.
+WATER_MASK_AUTO = "auto"
+
+
+def is_auto_water_mask(value: Any) -> bool:
+    """True for a ``water_mask_px`` that asks for the automatic outline."""
+    return isinstance(value, str) and value.strip().lower() == WATER_MASK_AUTO
+
 
 class ConfigError(ValueError):
     """Raised when a configuration file is missing or internally inconsistent."""
@@ -189,6 +198,9 @@ class StabiliseConfig:
     static_mask_px: Optional[Sequence[Sequence[Point]]] = None
     #: Polygons enclosing water, excluded from tracking.  If neither mask is
     #: given, a corridor around the search lines is excluded automatically.
+    #: ``auto`` outlines the water from the footage itself when the analysis
+    #: starts (:mod:`stiv.watermask`), and carries on without an outline --
+    #: saying so -- if it cannot find one.
     water_mask_px: Optional[Sequence[Sequence[Point]]] = None
     #: Re-detect features when fewer than this fraction survive tracking.
     redetect_fraction: float = 0.5
@@ -418,6 +430,15 @@ class Config:
             for f in fields(obj):
                 where = f"{sec.name}.{f.name}"
                 value = getattr(obj, f.name)
+                if where == "stabilise.water_mask_px" and isinstance(value, str):
+                    # The one field that takes a word as well as polygons.
+                    if not is_auto_water_mask(value):
+                        raise ConfigError(
+                            f"{where} must be a list of polygons, or `auto` to outline "
+                            f"the water automatically; got {value!r}"
+                        )
+                    setattr(obj, f.name, WATER_MASK_AUTO)
+                    continue
                 setattr(obj, f.name, _coerce(value, hints[f.name], where, _default_of(f)))
 
     # ------------------------------------------------------------------ #
@@ -543,7 +564,10 @@ class Config:
         if stab.model not in {"similarity", "affine", "homography"}:
             raise ConfigError("stabilise.model must be 'similarity', 'affine' or 'homography'")
         for name in ("static_mask_px", "water_mask_px"):
-            for i, poly in enumerate(getattr(stab, name) or []):
+            polys = getattr(stab, name)
+            if name == "water_mask_px" and is_auto_water_mask(polys):
+                continue
+            for i, poly in enumerate(polys or []):
                 if len(poly) < 3:
                     raise ConfigError(
                         f"stabilise.{name}[{i}] must be a polygon of at least 3 [x, y] points"
@@ -860,7 +884,7 @@ def survey_dict(
     name: str = SectionConfig.name,
     downstream_px: Optional[Point] = None,
     stabilise: bool = StabiliseConfig.enabled,
-    water_mask_px: Optional[Sequence[Sequence[Point]]] = None,
+    water_mask_px: Optional[Sequence[Sequence[Point]] | str] = None,
     search_line_length_m: float = StiConfig.search_line_length_m,
     window_px: int = StiConfig.window_px,
     velocity_range_ms: Sequence[float] = StiConfig.velocity_range_ms,
@@ -878,7 +902,9 @@ def survey_dict(
     run until it has been filled in, rather than running on a made-up value.
 
     The scale comes from ``gcp_px``/``gcp_world`` if given, else from
-    ``altitude_m`` and ``hfov_deg``, else from ``m_per_px``.
+    ``altitude_m`` and ``hfov_deg`` -- either of which may still be a
+    placeholder -- else from ``m_per_px``.  ``water_mask_px`` is polygons, or
+    ``"auto"`` for the automatic outline at run time.
     """
     if gcp_px is not None:
         rectify: dict[str, Any] = {
@@ -887,13 +913,15 @@ def survey_dict(
             "gcp_world": [_point(p) for p in gcp_world]
             if gcp_world is not None else [[None, None] for _ in gcp_px],
         }
-    elif altitude_m is not None:
+    elif altitude_m is not None or hfov_deg is not None:
         rectify = {"method": "scale", "altitude_m": altitude_m, "hfov_deg": hfov_deg}
     else:
         rectify = {"method": "scale", "m_per_px": m_per_px}
 
     stab: dict[str, Any] = {"enabled": bool(stabilise)}
-    if water_mask_px:
+    if is_auto_water_mask(water_mask_px):
+        stab["water_mask_px"] = WATER_MASK_AUTO
+    elif water_mask_px:
         stab["water_mask_px"] = [[_point(p) for p in poly] for poly in water_mask_px]
 
     video: dict[str, Any] = {

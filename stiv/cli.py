@@ -6,7 +6,13 @@
     stiv init      flight.mp4 -o survey.yaml   write a starter config
     stiv pick      flight.mp4 -o survey.yaml   click the section on a frame
     stiv run       survey.yaml             analyse and write the outputs
+    stiv cameras                           list the DJI field-of-view presets
     stiv demo                              render a synthetic river and analyse it
+
+The scale can be given to info, init and pick as the flight geometry:
+``--camera mini-4-pro`` (or ``--hfov-deg``) for the field of view, and
+``--altitude-m`` -- or, with the drone's ``.SRT`` flight log beside the video,
+``--takeoff-height`` -- for the height above the water.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -69,14 +76,197 @@ def _default_out_dir(config_path: Path) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# the scale, from the command line
+# --------------------------------------------------------------------------- #
+@dataclass
+class _Scale:
+    """The scale the scale options describe, and how it was arrived at."""
+
+    m_per_px: Optional[float] = None
+    altitude_m: Optional[float] = None
+    hfov_deg: Optional[float] = None
+    #: How each number was arrived at, for the terminal and the YAML header.
+    notes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    #: The flight log beside the video, and what it records over the window.
+    srt: Optional[Path] = None
+    srt_stats: object = None
+
+    @property
+    def complete(self) -> bool:
+        return self.m_per_px is not None or (self.altitude_m is not None
+                                             and self.hfov_deg is not None)
+
+    def missing(self) -> list[str]:
+        """The rectify fields still to fill in, when flight geometry was begun."""
+        if self.complete or (self.altitude_m is None and self.hfov_deg is None):
+            return []
+        if self.altitude_m is None:
+            return ["rectify.altitude_m (height above the WATER SURFACE, not take-off)"]
+        return ["rectify.hfov_deg (the HORIZONTAL field of view; `stiv cameras` "
+                "lists DJI presets)"]
+
+
+def _camera_preset(key: str):
+    from .cameras import DJI_CAMERAS, camera
+
+    preset = camera(key)
+    if preset is None:
+        raise ConfigError(
+            f"unknown --camera {key!r}; choose one of: "
+            f"{', '.join(p.key for p in DJI_CAMERAS)} (`stiv cameras` describes them), "
+            f"or give the horizontal field of view with --hfov-deg"
+        )
+    return preset
+
+
+def _resolve_scale(args, video: str | Path, start_s: float = 0.0,
+                   duration_s: Optional[float] = None) -> _Scale:
+    """Turn the scale options into a scale, refusing contradictory ones.
+
+    Called before any clicking or writing, so a mistake costs nothing.  The
+    flight log's altitude is height above the *take-off point*, so it is used
+    only with ``--takeoff-height`` -- the height of that point above the water
+    -- and never stands in for height above the water on its own.
+    """
+    from .srt import altitude_stats, find_srt, parse_srt
+
+    m_per_px = getattr(args, "m_per_px", None)
+    key, hfov = getattr(args, "camera", None), getattr(args, "hfov_deg", None)
+    altitude, takeoff = getattr(args, "altitude_m", None), getattr(args, "takeoff_height", None)
+
+    if key and hfov is not None:
+        raise ConfigError("give --camera or --hfov-deg, not both: the camera preset is "
+                          "the horizontal field of view")
+    if altitude is not None and takeoff is not None:
+        raise ConfigError("give --altitude-m or --takeoff-height, not both: "
+                          "--takeoff-height works the altitude out from the flight log")
+    if m_per_px is not None and any(x is not None for x in (key, hfov, altitude, takeoff)):
+        raise ConfigError("--m-per-px is the scale itself; drop --camera, --hfov-deg, "
+                          "--altitude-m and --takeoff-height, or drop --m-per-px")
+    for name, value in (("--m-per-px", m_per_px), ("--altitude-m", altitude),
+                        ("--hfov-deg", hfov)):
+        if value is not None and not value > 0:
+            raise ConfigError(f"{name} must be greater than zero")
+    if hfov is not None and not hfov < 180:
+        raise ConfigError("--hfov-deg must be under 180 degrees")
+
+    sc = _Scale(m_per_px=m_per_px, altitude_m=altitude, hfov_deg=hfov)
+    preset = None
+    if key:
+        preset = _camera_preset(key)
+        # One decimal, as the notebook wizard writes it, so a survey set up
+        # either way reads the same -- and reopens in the wizard as this drone.
+        sc.hfov_deg = round(preset.hfov_deg, 1)
+        sc.notes.append(f"hfov_deg {sc.hfov_deg:g} from --camera {preset.key}: {preset.describe()}")
+
+    sc.srt = find_srt(video)
+    if sc.srt is not None:
+        try:
+            sc.srt_stats = altitude_stats(parse_srt(sc.srt), start_s, duration_s)
+        except OSError:
+            sc.srt_stats = None
+    st = sc.srt_stats
+
+    if takeoff is not None:
+        if sc.srt is None:
+            raise ConfigError(
+                f"--takeoff-height needs the drone's flight log beside the video "
+                f"({Path(video).with_suffix('.SRT').name}), and there is none; give "
+                f"--altitude-m, the height above the water, instead"
+            )
+        if st is None:
+            raise ConfigError(
+                f"{sc.srt.name} records no height above take-off, so --takeoff-height "
+                f"cannot be used; give --altitude-m, the height above the water, instead"
+            )
+        sc.altitude_m = round(st.median_m + takeoff, 2)
+        spread = (f", {st.min_m:.1f}-{st.max_m:.1f} m" if st.max_m - st.min_m >= 0.05 else "")
+        sc.notes.append(
+            f"altitude_m {sc.altitude_m:g} = {st.median_m:.2f} m above take-off "
+            f"({sc.srt.name}, median over the "
+            f"{'analysis window' if duration_s is not None else 'clip'}{spread}) + {takeoff:g} m "
+            f"take-off height above the water"
+        )
+
+    narrowed = preset.zoomed_hfov_deg(st.focal_len_mm) if preset and st else None
+    if narrowed is not None:
+        sc.warnings.append(
+            f"{sc.srt.name} logs a {st.focal_len_mm:g} mm-equivalent focal length, about "
+            f"{st.focal_len_mm / preset.eq_focal_mm:.1f}x digital zoom on the "
+            f"{preset.label}'s {preset.eq_focal_mm:g} mm lens, so the view is narrower "
+            f"than the preset's: about {narrowed:.1f} deg horizontally. If the zoom was "
+            f"on for this clip, use --hfov-deg {narrowed:.1f} instead of --camera"
+        )
+    return sc
+
+
+def _report_scale(sc: _Scale) -> None:
+    for note in sc.notes:
+        print(f"  {note}")
+    for warning in sc.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+
+def _header_notes(sc: _Scale) -> str:
+    """The scale's provenance, as YAML comments."""
+    return "".join(f"# {note}\n" for note in sc.notes)
+
+
+def _apply_scale(raw: dict, sc: _Scale) -> None:
+    """Write the scale into a raw config built without one."""
+    if sc.m_per_px is not None:
+        raw["rectify"] = {"method": "scale", "m_per_px": sc.m_per_px}
+    elif sc.altitude_m is not None or sc.hfov_deg is not None:
+        raw["rectify"] = {"method": "scale", "altitude_m": sc.altitude_m,
+                          "hfov_deg": sc.hfov_deg}
+
+
+# --------------------------------------------------------------------------- #
+def cmd_cameras(args) -> int:
+    from .cameras import DJI_CAMERAS
+
+    kw = max(len(p.key) for p in DJI_CAMERAS) + 2
+    lw = max(len(p.label) for p in DJI_CAMERAS) + 2
+    print(f"{'key':<{kw}}{'drone':<{lw}}{'horizontal FOV':>14}   {'DJI quotes (diagonal)'}")
+    for p in DJI_CAMERAS:
+        print(f"{p.key:<{kw}}{p.label:<{lw}}{p.hfov_deg:>10.1f} deg   {p.dfov_deg:g} deg")
+    print()
+    print("DJI's spec sheets quote the DIAGONAL field of view; the scale needs the\n"
+          "horizontal one, which --camera KEY fills in (e.g. `stiv init clip.mp4\n"
+          "--camera mini-4-pro --altitude-m 40`). The presets assume the normal\n"
+          "landscape video mode, which uses the full sensor width: digital zoom,\n"
+          "cropped high-frame-rate modes and vertical shooting narrow the view.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 def cmd_info(args) -> int:
     from .video import probe
 
     info = probe(args.video)
+    # Over the whole clip: info does not know which part will be analysed.
+    sc = _resolve_scale(args, args.video)
     # probe() reports 0 when the file records no frame rate (a raw .h264 or
     # .mjpeg stream, say) rather than guessing one.
     fps_known = info.fps > 0
     print(info)
+    if sc.srt is not None:
+        title = f"Flight log ({sc.srt.name})"
+        print()
+        print(title)
+        print("-" * len(title))
+        st = sc.srt_stats
+        if st is None:
+            print("  records no height above take-off")
+        else:
+            spread = f" ({st.min_m:.1f}-{st.max_m:.1f} m)" if st.max_m - st.min_m >= 0.05 else ""
+            print(f"  height above take-off   {st.median_m:.1f} m, median over the clip{spread}")
+            if st.focal_len_mm:
+                print(f"  focal length            {st.focal_len_mm:g} mm (35 mm equivalent)")
+            print("  That is NOT the height above the water. Give the take-off point's "
+                  "height above the water\n  with --takeoff-height (0 if you took off at "
+                  "water level) to use it.")
     print()
     print("Suggested settings")
     print("------------------")
@@ -86,13 +276,14 @@ def cmd_info(args) -> int:
               "proportional to it)")
     print(f"  video.duration_s      {default_duration_s(info.duration_s):.1f}   "
           f"(20-40 s of steady hover is plenty; the paper used 30 s)")
-    if args.altitude_m and args.hfov_deg:
-        rect = RectifyConfig(altitude_m=args.altitude_m, hfov_deg=args.hfov_deg)
+    if sc.altitude_m is not None and sc.hfov_deg is not None:
+        rect = RectifyConfig(altitude_m=sc.altitude_m, hfov_deg=sc.hfov_deg)
         gsd = rect.resolve_m_per_px(info.width)
         gw = gsd * info.width
         print(f"  rectify.m_per_px      {gsd:.4f}   "
-              f"(from {args.altitude_m} m altitude, {args.hfov_deg} deg HFOV; "
+              f"(from {sc.altitude_m:g} m altitude, {sc.hfov_deg:g} deg HFOV; "
               f"ground width {gw:.1f} m)")
+        _report_scale(sc)
         if fps_known:
             for v in FRAME_STEP_SPEEDS_MS:
                 print(f"      if U ~ {v:>3.1f} m/s  ->  video.frame_step: "
@@ -102,8 +293,10 @@ def cmd_info(args) -> int:
             print("      (no frame_step suggestion without a frame rate; re-run once "
                   "you know it, or work it out as m_per_px * fps / U)")
     else:
-        print("  pass --altitude-m and --hfov-deg to get a ground sample distance "
-              "and a frame_step suggestion")
+        _report_scale(sc)
+        print("  pass --altitude-m (or --takeoff-height, with a flight log) and --camera "
+              "(or --hfov-deg)\n  to get a ground sample distance and a frame_step "
+              "suggestion; `stiv cameras` lists the drones")
     return 0
 
 
@@ -115,14 +308,36 @@ _INIT_HEADER = """\
 #   rectify.m_per_px    ground sample distance, metres per pixel.  Or replace
 #                       it with the flight geometry:
 #                         altitude_m: 60.0   # above the WATER SURFACE
-#                         hfov_deg: 84.0     # your camera's horizontal FOV
+#                         hfov_deg: 71.5     # HORIZONTAL FOV, not the diagonal
+#                                            # one DJI quotes (see stiv.cameras)
 #   section.start_px    the two ends of the cross-section, in image pixels
 #   section.end_px      (`stiv pick` lets you click them on a frame instead)
 #
 # flow.downstream_px is optional: any image point downstream of the section,
 # which fixes the sign of the flow direction.
 #
+# stabilise.water_mask_px can be set to `auto`, to outline the water from the
+# footage when the analysis starts, rather than to polygons.
+#
 # Video: {info}
+
+"""
+
+_INIT_HEADER_SCALED = """\
+# STIV survey configuration (written by `stiv init`)
+#
+# `stiv run` refuses this file until the null placeholders are filled in:
+#
+{missing}#   section.start_px    the two ends of the cross-section, in image pixels
+#   section.end_px      (`stiv pick` lets you click them on a frame instead)
+#
+# flow.downstream_px is optional: any image point downstream of the section,
+# which fixes the sign of the flow direction.
+#
+# stabilise.water_mask_px can be set to `auto`, to outline the water from the
+# footage when the analysis starts, rather than to polygons.
+#
+{notes}# Video: {info}
 
 """
 
@@ -133,25 +348,47 @@ def cmd_init(args) -> int:
     out = Path(args.output)
     _refuse_overwrite(out, args.force)
     info = probe(args.video)
+    duration = default_duration_s(info.duration_s)
+    sc = _resolve_scale(args, args.video, 0.0, duration)
     raw = survey_dict(
         path_for_config(args.video, out),
-        duration_s=default_duration_s(info.duration_s),
+        duration_s=duration,
         name=Path(args.video).stem,
         out_dir=_default_out_dir(out),
     )
-    out.write_text(_INIT_HEADER.format(info=info) + yaml_text(raw), encoding="utf-8")
+    _apply_scale(raw, sc)
+    if sc.m_per_px is None and sc.altitude_m is None and sc.hfov_deg is None:
+        header = _INIT_HEADER.format(info=info)
+    else:
+        missing = "".join(f"#   {m}\n" for m in sc.missing())
+        header = _INIT_HEADER_SCALED.format(info=info, missing=missing,
+                                            notes=_header_notes(sc) + ("#\n" if sc.notes else ""))
+    out.write_text(header + yaml_text(raw), encoding="utf-8")
     print(f"wrote {out}")
-    print("Next: fill in the scale and the section coordinates, then "
-          f"`stiv run {out}`")
+    _report_scale(sc)
+    todo = ["the section coordinates"]
+    if not sc.complete:
+        todo.insert(0, " and ".join(m.split(" ")[0] for m in sc.missing()) or "the scale")
+    print(f"Next: fill in {' and '.join(todo)}, then `stiv run {out}`")
     return 0
 
 
 def cmd_pick(args) -> int:
     from .picker import build_config_interactively
 
+    from .video import probe
+
     out = Path(args.output)
-    # Checked before any clicking, not after it.
+    # Everything that can be refused is refused before any clicking, not after.
     _refuse_overwrite(out, args.force)
+    scale_given = any(getattr(args, k) is not None for k in
+                      ("m_per_px", "altitude_m", "hfov_deg", "camera", "takeoff_height"))
+    if args.gcps and scale_given:
+        raise ConfigError("--gcps takes the scale from ground control points; drop the "
+                          "other scale options")
+    info = probe(args.video)
+    sc = _resolve_scale(args, args.video, args.time,
+                        default_duration_s(info.duration_s, args.time))
     raw = build_config_interactively(
         args.video,
         out_dir=_default_out_dir(out),
@@ -159,18 +396,31 @@ def cmd_pick(args) -> int:
         with_gcps=args.gcps,
         n_stations=args.n_stations,
         config_path=out,
+        auto_water=not args.no_auto_water,
     )
-    header = "# STIV survey configuration (written by `stiv pick`)\n#\n"
+    _apply_scale(raw, sc)
+    header = "# STIV survey configuration (written by `stiv pick`)\n#\n" + _header_notes(sc)
     if args.gcps:
         header += ("# Fill in rectify.gcp_world -- the surveyed position of each control\n"
                    "# point in metres, in the order they were clicked -- before running.\n\n")
+        todo = ["rectify.gcp_world"]
+    elif sc.complete:
+        header += "\n"
+        todo = []
+    elif sc.missing():
+        todo = [m.split(" ")[0] for m in sc.missing()]
+        header += "".join(f"# Fill in {m} before running.\n" for m in sc.missing()) + "\n"
     else:
         header += ("# Fill in rectify.m_per_px (metres per pixel), or replace it with\n"
                    "# altitude_m plus hfov_deg, before running.\n\n")
+        todo = ["rectify.m_per_px"]
     out.write_text(header + yaml_text(raw), encoding="utf-8")
     print(f"wrote {out}")
-    what = "rectify.gcp_world" if args.gcps else "rectify.m_per_px"
-    print(f"Fill in {what}, then `stiv run {out}`")
+    _report_scale(sc)
+    if todo:
+        print(f"Fill in {' and '.join(todo)}, then `stiv run {out}`")
+    else:
+        print(f"Next: `stiv run {out}`")
     return 0
 
 
@@ -309,6 +559,26 @@ def _add_verbosity(parser: argparse.ArgumentParser, default) -> None:
                         help="debug logging")
 
 
+def _add_scale_options(parser: argparse.ArgumentParser, m_per_px: bool = True) -> None:
+    g = parser.add_argument_group(
+        "scale", "the ground resolution, directly or from the flight geometry")
+    if m_per_px:
+        g.add_argument("--m-per-px", type=float, help="ground resolution, metres per pixel")
+    g.add_argument("--altitude-m", type=float,
+                   help="flight altitude above the WATER SURFACE, metres")
+    g.add_argument("--takeoff-height", type=float, metavar="M",
+                   help="height of the take-off point above the water, metres: the altitude "
+                        "is then read from the drone's .SRT flight log beside the video, "
+                        "which records height above take-off")
+    g.add_argument("--hfov-deg", type=float,
+                   help="the camera's HORIZONTAL field of view, degrees -- not the diagonal "
+                        "one DJI spec sheets quote (84 deg for a 24 mm lens is ~71.5 "
+                        "horizontally); see --camera")
+    g.add_argument("--camera", metavar="KEY",
+                   help="a DJI drone, e.g. mini-4-pro, for its horizontal field of view; "
+                        "`stiv cameras` lists them")
+
+
 def build_parser() -> argparse.ArgumentParser:
     # -q/-v work either side of the subcommand.  The subcommand's copies
     # default to SUPPRESS: a subparser writes its defaults over the parent's
@@ -330,14 +600,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("info", parents=[common],
                        help="inspect a video and suggest settings")
     s.add_argument("video")
-    s.add_argument("--altitude-m", type=float, help="flight altitude above the water")
-    s.add_argument("--hfov-deg", type=float, help="camera horizontal field of view")
+    _add_scale_options(s, m_per_px=False)
     s.set_defaults(func=cmd_info)
 
     s = sub.add_parser("init", parents=[common], help="write a starter config file")
     s.add_argument("video")
     s.add_argument("-o", "--output", default="survey.yaml")
     s.add_argument("--force", action="store_true", help="overwrite an existing config file")
+    _add_scale_options(s)
     s.set_defaults(func=cmd_init)
 
     s = sub.add_parser("pick", parents=[common],
@@ -351,6 +621,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also click ground control points for an oblique view")
     s.add_argument("-n", "--n-stations", type=int, default=SectionConfig.n_stations)
     s.add_argument("--force", action="store_true", help="overwrite an existing config file")
+    s.add_argument("--no-auto-water", action="store_true",
+                   help="do not outline the water automatically; click it (or skip it) by hand")
+    _add_scale_options(s)
     s.set_defaults(func=cmd_pick)
 
     s = sub.add_parser("run", parents=[common],
@@ -364,6 +637,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip camera-motion compensation (fixed cameras only)")
     s.add_argument("--no-figures", action="store_true", help="tables only, no images")
     s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("cameras", parents=[common],
+                       help="list the DJI drones --camera knows, with their fields of view")
+    s.set_defaults(func=cmd_cameras)
 
     s = sub.add_parser("demo", parents=[common], help="render a synthetic river and validate against it")
     s.add_argument("--out-dir", default="stiv_demo")

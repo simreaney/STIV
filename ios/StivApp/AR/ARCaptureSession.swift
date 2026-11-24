@@ -232,6 +232,10 @@ final class ARCaptureSession: NSObject, ObservableObject {
     private var queuePhase: CapturePhase = .idle
     private var plan: RecordingPlan?
     private var recorder: StiRecorder?
+    /// The burst being collected for the automatic water outline, and who
+    /// asked for it.
+    private var waterProbe: WaterProbe?
+    private var waterProbeDone: (([LumaFrame]) -> Void)?
 
     /// Counts frames, so the published state can be refreshed at a fraction of
     /// the frame rate.  Owned by `frameQueue`.
@@ -343,6 +347,29 @@ final class ARCaptureSession: NSObject, ObservableObject {
         plan = nil
         fitter.reset()
         residualChecker.disarm()
+        finishWaterProbe()
+    }
+
+    // MARK: - water outline
+
+    /// Collect a short burst of reduced frames for `detectWaterOutline`, and
+    /// hand them to `completion` on the main queue: all of them, or whatever
+    /// there was when the session stopped or a newer burst was asked for.
+    func collectWaterFrames(plane: WaterPlane, completion: @escaping ([LumaFrame]) -> Void) {
+        frameQueue.async {
+            self.finishWaterProbe()
+            self.waterProbe = WaterProbe(plane: plane)
+            self.waterProbeDone = completion
+        }
+    }
+
+    /// Hand over the burst in progress, if any.  Frame queue only.
+    private func finishWaterProbe() {
+        guard let done = waterProbeDone else { return }
+        let frames = waterProbe?.frames ?? []
+        waterProbe = nil
+        waterProbeDone = nil
+        DispatchQueue.main.async { done(frames) }
     }
 
     // MARK: - water plane
@@ -524,6 +551,16 @@ extension ARCaptureSession: ARSessionDelegate {
             verifyProjectionParity(frame: frame)
         }
         #endif
+
+        if let probe = waterProbe {
+            let pose = camera.stivPose
+            let intrinsics = camera.stivIntrinsics
+            let finished = withLumaPlane(of: frame.capturedImage) { luma in
+                probe.offer(luma: luma, intrinsics: intrinsics, pose: pose,
+                            timestamp: frame.timestamp, trackingNormal: trackingState.isNormal)
+            } ?? false
+            if finished { finishWaterProbe() }
+        }
 
         switch queuePhase {
         case .fittingPlane:

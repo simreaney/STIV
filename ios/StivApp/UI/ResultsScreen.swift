@@ -1,8 +1,8 @@
 //  ResultsScreen.swift
 //  The profile, its uncertainty, and the reasons not to believe parts of it.
 //
-//  Same content as the desktop's `velocity_profile.png`, `velocity.csv` and
-//  `report.txt`, with one addition the desktop cannot offer: the frame step is
+//  Same content as the desktop's `velocity_map.png`, `velocity_profile.png`,
+//  `velocity.csv` and `report.txt`, with one addition the desktop cannot offer: the frame step is
 //  live.  The recording holds every frame, so moving that control re-runs the
 //  whole analysis in a second or two -- `tan phi` can be walked into the sweet
 //  spot of Fig. 7 while looking at the answer, instead of by re-recording.
@@ -70,6 +70,18 @@ struct ResultsScreen: View {
 
     private func content(_ result: StivResult) -> some View {
         List {
+            Section {
+                FlowMapView(map: FlowMap(result: result))
+                    .frame(height: 280)
+            } header: {
+                Text("Flow map")
+            } footer: {
+                Text("Seen from above, true to scale, with the near bank at the bottom. Each "
+                   + "arrow is a station, its length proportional to the surface speed; the "
+                   + "key is bottom left. Hollow red arrows failed quality control and were "
+                   + "interpolated; a cross had no velocity.")
+            }
+
             Section {
                 VelocityProfileChart(result: result)
                     .frame(height: 220)

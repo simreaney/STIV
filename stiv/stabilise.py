@@ -165,7 +165,7 @@ class StabilisationReport:
             out.append(
                 "fewer than half the tracked features agree with the fitted "
                 "camera motion; features are probably being picked up on the "
-                "water surface -- supply stabilise.water_mask_px"
+                "water surface -- supply stabilise.water_mask_px (a polygon, or auto)"
             )
         if self.shift_px and np.max(self.shift_px) > 100:
             out.append(
@@ -189,6 +189,14 @@ def build_mask(
     (``exclude_px``), which is water by construction.
     """
     h, w = image_shape[:2]
+    if isinstance(cfg.water_mask_px, str):
+        # `water_mask_px: auto` is resolved into polygons (or None) before the
+        # stabiliser is built -- see stiv.analysis.  Iterating the word would
+        # fill "polygons" of single characters.
+        raise ValueError(
+            f"water_mask_px {cfg.water_mask_px!r} must be resolved to polygons before "
+            f"building the tracking mask"
+        )
 
     if cfg.static_mask_px:
         mask = np.zeros((h, w), np.uint8)

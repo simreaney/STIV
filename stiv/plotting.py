@@ -1,8 +1,9 @@
 """Diagnostic figures for a STIV run.
 
-Five outputs, each answering a question an operator actually asks:
+Six outputs, each answering a question an operator actually asks:
 
 ``overview.png``            did I measure where I meant to?
+``velocity_map.png``        how fast, and which way, is the water going where?
 ``velocity_profile.png``    what is the velocity across the section?
 ``sti_panel.png``           do the space-time images show usable streaks?
 ``sti_detail_*.png``        why did *this* station give *that* number?
@@ -183,6 +184,165 @@ def _outline():
     import matplotlib.patheffects as pe
 
     return [pe.withStroke(linewidth=2.5, foreground="#00000090")]
+
+
+# --------------------------------------------------------------------------- #
+#: Longest arrow on the velocity map, as a fraction of the section width.
+_ARROW_FRACTION = 0.25
+#: Most stations given a printed value on the velocity map.
+_MAX_ARROW_LABELS = 8
+
+
+def _nice_speed(x: float) -> float:
+    """The largest 1-2-5 step (0.1, 0.2, 0.5, 1, 2, ...) not above ``x``."""
+    if not (np.isfinite(x) and x > 0):
+        return 1.0
+    exp = math.floor(math.log10(x))
+    for m in (5.0, 2.0, 1.0):
+        if m * 10.0 ** exp <= x:
+            return m * 10.0 ** exp
+    return 10.0 ** exp
+
+
+def plot_velocity_map(result: StivResult, path: Path, dpi: int = 150) -> Path:
+    """The frame with one flow arrow per station, its length proportional to speed.
+
+    Arrows are built in world coordinates -- from each station along the flow
+    direction, ``velocity * k`` metres long -- and only then mapped into the
+    image, so they stay proportional to speed in an oblique (GCP) view too.
+    The fastest arrow is about a quarter of the section width; a reference
+    arrow gives the scale.  A station that failed quality control and was
+    interpolated is drawn hollow; one that was excluded is a cross.
+    """
+    import matplotlib.patheffects as pe
+    from matplotlib.patches import Rectangle
+
+    frame = result.reference_frame_bgr
+    rgb = frame[:, :, ::-1] if frame.ndim == 3 else frame
+    h, w = rgb.shape[:2]
+    geom = result.geometry
+    rect = geom.rectifier
+    flow_dir = np.asarray(geom.flow_dir_world, float)
+
+    # Paired as the overview pairs them, so a result trimmed to fewer
+    # stations than its geometry still lines up.
+    pairs = list(zip(geom.search_lines, result.stations))
+    v = np.array([st.velocity_ms for _, st in pairs], float)
+    failed = np.array([st.failed for _, st in pairs], bool)
+    interp = failed & np.array(["interpolated" in st.flags for _, st in pairs], bool)
+    shown = np.isfinite(v)
+    measured = shown & ~failed
+    interp &= shown
+    excluded = ~shown
+
+    base_w = np.array([sl.centre_world for sl, _ in pairs], float).reshape(-1, 2)
+    base_px = np.array([sl.centre_px for sl, _ in pairs], float).reshape(-1, 2)
+
+    vmax = float(np.max(np.abs(v[shown]))) if shown.any() else 0.0
+    k = _ARROW_FRACTION * geom.width_m / vmax if vmax > 0 else 0.0
+
+    def _tips(scale: float) -> np.ndarray:
+        vv = np.where(shown, v, 0.0)
+        return rect.world_to_image(base_w + (vv * scale)[:, None] * flow_dir[None, :])
+
+    # Shrink the arrows until the longest stays inside the frame.
+    tips = _tips(k)
+    for _ in range(12):
+        t = tips[shown]
+        if not len(t) or ((t[:, 0] >= 0) & (t[:, 0] < w) & (t[:, 1] >= 0) & (t[:, 1] < h)).all():
+            break
+        k *= 0.8
+        tips = _tips(k)
+    d = tips - base_px
+    # Shaft width, as a fraction of the axes width: thin enough that adjacent
+    # arrow heads (3.6 shafts wide) do not run into each other.
+    spacing_px = (float(np.linalg.norm(base_px[-1] - base_px[0])) / (len(base_px) - 1)
+                  if len(base_px) > 1 else 0.05 * w)
+    shaft = float(np.clip(0.17 * spacing_px / w, 0.0012, 0.0045))
+
+    scale = max(1.0 / 110.0, _MIN_OVERVIEW_WIDTH_IN / w)
+    halo = [pe.withStroke(linewidth=2.8, foreground="#000000a0")]
+    with _style():
+        fig = _figure(figsize=(min(13, w * scale), min(9, h * scale)))
+        ax = fig.subplots()
+        ax.imshow(rgb)
+        # A light scrim so the arrows read over whitewater and glare.
+        ax.add_patch(Rectangle((-0.5, -0.5), w, h, color="black", alpha=0.18, lw=0, zorder=1))
+        ax.set_xlim(-0.5, w - 0.5)
+        ax.set_ylim(h - 0.5, -0.5)
+        ax.set_axis_off()
+        ax.grid(False)
+
+        ax.plot([geom.start_px[0], geom.end_px[0]], [geom.start_px[1], geom.end_px[1]],
+                color=SERIES_1, lw=1.8, alpha=0.95, solid_capstyle="round", zorder=2)
+        ax.scatter(base_px[:, 0], base_px[:, 1], s=10, color=SURFACE, edgecolor=INK,
+                   linewidth=0.6, zorder=3)
+
+        # The profile drawn on the river: a light band from the section out to
+        # the arrow tips, over each unbroken run of stations.
+        runs = np.split(np.arange(len(v)), np.flatnonzero(np.diff(shown.astype(int)) != 0) + 1)
+        for idx in runs:
+            if len(idx) < 2 or not shown[idx[0]]:
+                continue
+            poly = np.vstack([base_px[idx], tips[idx][::-1]])
+            ax.fill(poly[:, 0], poly[:, 1], color=SERIES_2, alpha=0.20, lw=0, zorder=2)
+            ax.plot(tips[idx, 0], tips[idx, 1], color=SURFACE, lw=1.0, ls=(0, (3, 2)),
+                    alpha=0.9, zorder=3, path_effects=halo)
+
+        q = None
+        if measured.any():
+            q = ax.quiver(base_px[measured, 0], base_px[measured, 1], d[measured, 0], d[measured, 1],
+                          angles="xy", scale_units="xy", scale=1.0, color=SERIES_2,
+                          edgecolor=SURFACE, linewidth=0.7, width=shaft, headwidth=3.6,
+                          headlength=4.2, headaxislength=3.8, zorder=5)
+        if interp.any():
+            q2 = ax.quiver(base_px[interp, 0], base_px[interp, 1], d[interp, 0], d[interp, 1],
+                           angles="xy", scale_units="xy", scale=1.0, facecolor="none",
+                           edgecolor=CRITICAL, linewidth=1.3, width=shaft, headwidth=3.6,
+                           headlength=4.2, headaxislength=3.8, zorder=5)
+            q = q or q2
+        if excluded.any():
+            ax.scatter(base_px[excluded, 0], base_px[excluded, 1], s=42, marker="X",
+                       color=CRITICAL, edgecolor=SURFACE, linewidth=0.8, zorder=6)
+
+        # Values on a few evenly spaced arrows.
+        lab = np.flatnonzero(shown)
+        if len(lab) > _MAX_ARROW_LABELS:
+            lab = lab[np.unique(np.linspace(0, len(lab) - 1, _MAX_ARROW_LABELS).round().astype(int))]
+        for i in lab:
+            n = d[i] / max(float(np.linalg.norm(d[i])), 1e-9)
+            ax.annotate(f"{v[i]:.2f}", tips[i], xytext=(7 * n[0], -7 * n[1]),
+                        textcoords="offset points", ha="center", va="center",
+                        color=SURFACE, fontsize=8, weight="bold", path_effects=_outline(),
+                        zorder=7)
+
+        if q is not None and k > 0:
+            ref = _nice_speed(0.6 * vmax)
+            centre = 0.5 * (np.asarray(geom.start_world, float) + np.asarray(geom.end_world, float))
+            ends = rect.world_to_image(np.array([centre, centre + flow_dir * ref * k]))
+            ref_px = float(np.linalg.norm(ends[1] - ends[0]))
+            qk = ax.quiverkey(q, 0.04, 0.05, ref_px, f"{ref:g} m/s", labelpos="E",
+                              coordinates="axes", color=SERIES_2, labelcolor=SURFACE,
+                              fontproperties={"size": 9, "weight": "bold"})
+            qk.text.set_path_effects(_outline())
+
+        handles = [Line2D([], [], color=SERIES_2, lw=2.4, marker=">", markersize=7,
+                          label="surface velocity (arrow length ∝ speed)")]
+        if interp.any():
+            handles.append(Line2D([], [], color=CRITICAL, lw=1.4, marker=">", markersize=7,
+                                  markerfacecolor="none", label="failed QC (interpolated)"))
+        if excluded.any():
+            handles.append(Line2D([], [], color=CRITICAL, lw=0, marker="X", markersize=7,
+                                  label="no velocity (excluded)"))
+        ax.legend(handles=handles, loc="lower center", ncol=len(handles),
+                  bbox_to_anchor=(0.5, -0.06), labelcolor=INK_2)
+
+        finite = v[np.isfinite(v)]
+        stats = (f"mean {finite.mean():.2f} m/s, max {finite.max():.2f} m/s"
+                 if finite.size else "no velocities passed quality control")
+        ax.set_title(f"Surface velocity  -  {result.config.section.name}   ({stats})", loc="left")
+        fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -480,6 +640,7 @@ def save_all(result: StivResult, out_dir: Path, dpi: int = 150,
     written: list[Path] = []
 
     written.append(plot_overview(result, out_dir / "overview.png", dpi))
+    written.append(plot_velocity_map(result, out_dir / "velocity_map.png", dpi))
     written.append(plot_velocity_profile(result, out_dir / "velocity_profile.png", dpi))
     written.append(plot_sti_panel(result, out_dir / "sti_panel.png", dpi=dpi))
 

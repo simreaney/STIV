@@ -86,6 +86,22 @@ stands out from the alignment noise, so a correct pose is left alone; it is
 ramped in rather than applied in one frame, held rather than dropped when a
 check fails, and refused above a 6 px cap.
 
+### The water outline
+
+The cross-check's patches must stay off the moving water, so the section screen
+asks for an outline of it -- and finds one itself. Straight after the downstream
+tap, while the phone is still aimed at the section, a second or so of frames
+is copied out, reduced about six times, and compared: each grid cell is
+followed as a point on the water plane through every frame's own pose, so the
+camera's motion is already accounted for, and whatever *still* changes is the
+water. The threshold is calibrated from the section just tapped -- its middle
+is water, the ground just beyond its ends is bank -- and a scene where the two
+do not differ clearly gets no outline rather than a guessed one. The outline is
+drawn on the feed for the user to accept, or replace by tapping their own. It
+also warns when the water seems to flow away from the downstream point, with a
+button to move the point across. This is the phone's version of
+`stiv/watermask.py`: `StivKit/Sources/StivKit/WaterOutline.swift`.
+
 ## Building
 
 Requires **Xcode 16+** and an **iPhone 12 Pro or later** for LiDAR. Non-Pro
@@ -149,7 +165,12 @@ layer proves, what it cannot, and the field protocol.
 ## Exports
 
 `velocity.csv`, `summary.json`, `report.txt` — columns matching the desktop's —
-and `survey.yaml`, which expresses the run as a `stiv.Config`. They are saved
+`velocity_map.png`, and `survey.yaml`, which expresses the run as a
+`stiv.Config`. The flow map is the results screen's: an arrow per station, its
+length proportional to the speed, as the desktop's `velocity_map.png` -- but
+drawn in plan, true to scale on the water, rather than over a frame, because a
+phone looks across a river at a shallow angle and in its own view a far-bank
+arrow would come out several times shorter than the same speed near by. They are saved
 as soon as each analysis finishes, in a folder per recording that the Files app
 shows under *On My iPhone → STIV*, and the share button sends the same files. The phone's
 ray–plane mapping is a plane-to-plane projective map, which is exactly what

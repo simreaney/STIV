@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from . import geometry, orientation, sti as sti_mod
-from .config import Config, ConfigError, FlowConfig
+from .config import Config, ConfigError, FlowConfig, StabiliseConfig, is_auto_water_mask
 from .discharge import DischargeResult, compute_discharge
 from .geometry import SectionGeometry
 from .orientation import AngleEstimate, OrientationField
@@ -159,6 +159,9 @@ class StivResult:
     discharge: Optional[DischargeResult] = None
     warnings: list[str] = field(default_factory=list)
     elapsed_s: float = 0.0
+    #: What became of ``stabilise.water_mask_px: auto``; empty when the config
+    #: gave polygons, or none.
+    water_mask_note: str = ""
 
     # ------------------------------------------------------------------ #
     @property
@@ -217,6 +220,7 @@ class StivResult:
             f"(St = {self.st_s_per_px * 1000:.1f} ms/row, {self.fps:.2f} fps source)",
             f"flow direction {self.geometry.flow_bearing_deg:+.1f} deg in world frame",
             self.stabilisation.summary(),
+            *([f"water mask     {self.water_mask_note}"] if self.water_mask_note else []),
             f"stations       {len(clean)}/{len(self.stations)} clean, "
             f"{len(failed)} failed ({len(filled)} interpolated)",
         ]
@@ -296,7 +300,11 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
 
     _rectification_warnings(geom, warnings)
 
-    stis, stab_report, reference_bgr = _collect_stis(cfg, source, geom, progress)
+    stab_cfg, water_note = cfg.stabilise, ""
+    if is_auto_water_mask(cfg.stabilise.water_mask_px):
+        stab_cfg, water_note = _automatic_water_mask(cfg, warnings)
+
+    stis, stab_report, reference_bgr = _collect_stis(cfg, source, geom, progress, stab_cfg)
     warnings.extend(source.warnings)
 
     stations, fields, estimates = _analyse_stis(cfg, stis, geom)
@@ -347,7 +355,57 @@ def run(cfg: Config, progress: bool = True) -> StivResult:
         discharge=disch,
         warnings=warnings,
         elapsed_s=time.perf_counter() - t_start,
+        water_mask_note=water_note,
     )
+
+
+def _automatic_water_mask(cfg: Config, warnings: list[str]) -> tuple[StabiliseConfig, str]:
+    """Resolve ``stabilise.water_mask_px: auto`` into polygons, or into none.
+
+    Returns the stabiliser settings to track with, and a line for the run
+    summary.  ``cfg`` itself keeps ``auto``, so the ``config_used.yaml`` a run
+    writes detects again on a re-run rather than freezing this outline.
+
+    Unlike the notebook wizard and ``stiv pick``, nobody is here to look at the
+    outline, so only a ``good`` one is used.  Without one the analysis goes on
+    as it would with no water mask at all -- the corridor around the search
+    lines is still kept off the water -- and the warnings say so.
+    """
+    without = replace(cfg.stabilise, water_mask_px=None)
+    if not cfg.stabilise.enabled:
+        return without, "auto: not needed, camera-motion compensation is off"
+    if cfg.stabilise.static_mask_px:
+        return without, "auto: not used, stabilise.static_mask_px already names the ground to track"
+
+    from .watermask import detect_water
+
+    try:
+        det = detect_water(cfg.video.path, cfg.video.start_s,
+                           [cfg.section.start_px, cfg.section.end_px],
+                           cfg.flow.downstream_px, fps=cfg.video.fps_override)
+    except (ConfigError, ValueError) as exc:
+        reason, det = f"the detector stopped: {exc}", None
+    else:
+        reason = det.message
+
+    if det is not None and det.flow_agrees is False:
+        warnings.append(
+            "the automatic water outline found the water moving towards the other side "
+            "of the cross-section from flow.downstream_px; check that point is "
+            "downstream"
+        )
+    if det is not None and det.confidence == "good":
+        log.info("water mask: %s", det.message)
+        return replace(cfg.stabilise, water_mask_px=[det.polygon_px]), f"auto: {det.message}"
+
+    what = "was not reliable enough to use" if det is not None and det.ok else "failed"
+    warnings.append(
+        f"stabilise.water_mask_px is auto, but the automatic water outline {what} "
+        f"({reason}), so no water mask was used: only the corridor around the search "
+        f"lines was kept off the water. If the run also warns about features on the "
+        f"water, outline it by hand instead (stiv pick, or polygons in the config)"
+    )
+    return without, f"auto: not used ({reason})"
 
 
 def _rectification_warnings(geom: SectionGeometry, warnings: list[str]) -> None:
@@ -388,13 +446,17 @@ def _rectification_warnings(geom: SectionGeometry, warnings: list[str]) -> None:
 
 
 def _collect_stis(
-    cfg: Config, source: FrameSource, geom: SectionGeometry, progress: bool
+    cfg: Config, source: FrameSource, geom: SectionGeometry, progress: bool,
+    stabilise_cfg: Optional[StabiliseConfig] = None,
 ) -> tuple[list[SpaceTimeImage], StabilisationReport, np.ndarray]:
     """Single streaming pass over the video, building every STI at once.
 
-    Returns the STIs, the stabilisation diagnostics, and the reference frame
-    (kept for the overview plot).
+    ``stabilise_cfg`` is ``cfg.stabilise`` with an automatic water mask
+    resolved; ``cfg.stabilise`` itself when omitted.  Returns the STIs, the
+    stabilisation diagnostics, and the reference frame (kept for the overview
+    plot).
     """
+    stab_cfg = stabilise_cfg if stabilise_cfg is not None else cfg.stabilise
     collector = sti_mod.StiCollector(geom.search_lines, source.n_frames, source.st_s_per_px)
     probe = np.vstack([geom.start_px[None, :], geom.end_px[None, :]])
 
@@ -404,7 +466,8 @@ def _collect_stis(
     bar = None
     if progress:
         try:
-            from tqdm import tqdm
+            # tqdm.auto: a progress widget in a notebook, a text bar elsewhere.
+            from tqdm.auto import tqdm
 
             bar = tqdm(total=source.n_frames, unit="frame", desc="STI", leave=False)
         except ImportError:
@@ -415,8 +478,8 @@ def _collect_stis(
             grey = source.to_grey(frame_bgr)
             if i == 0:
                 reference_bgr = frame_bgr.copy()
-                mask = build_mask(cfg.stabilise, source.shape, exclude_px=collector.all_pts)
-                stabiliser = Stabiliser(cfg.stabilise, grey, mask)
+                mask = build_mask(stab_cfg, source.shape, exclude_px=collector.all_pts)
+                stabiliser = Stabiliser(stab_cfg, grey, mask)
                 if stabiliser.enabled:
                     log.info("stabilisation: tracking %d static features", stabiliser.report.n_features)
                 collector.add_frame(grey, None)

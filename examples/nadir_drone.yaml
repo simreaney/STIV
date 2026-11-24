@@ -26,7 +26,10 @@ rectify:
   # m_per_px: 0.0141
   # ...or let it be derived from the flight geometry:
   altitude_m: 30.0          # height above the WATER SURFACE, not above take-off
-  hfov_deg: 84.0            # DJI wide lenses are typically 82-84 degrees
+  # HORIZONTAL field of view. DJI spec sheets quote the DIAGONAL one (e.g.
+  # 84 deg for a 24 mm-equivalent lens), which is ~71.5 deg horizontally on
+  # a 4:3 sensor. Presets for common DJI drones: stiv.cameras.DJI_CAMERAS.
+  hfov_deg: 71.5
   # sensor_width_mm: 6.3    # alternative to hfov_deg
   # focal_length_mm: 4.5
 

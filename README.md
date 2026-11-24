@@ -80,32 +80,61 @@ same `cv2` module and overwrite each other.
 
 ## Interactive notebook UI
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/simreaney/STIV/blob/main/notebooks/STIV_Interactive.ipynb)
+
 For a guided, click-through alternative to the command line -- aimed at
 students setting up their first survey -- there is a step-by-step Jupyter
 wizard in [`notebooks/STIV_Interactive.ipynb`](notebooks/STIV_Interactive.ipynb).
-It wraps the exact same pipeline as the CLI, one decision per screen:
+It wraps the exact same pipeline as the CLI, one decision per screen, with a
+side panel that keeps every choice in view.
+
+The notebook installs what it needs itself: its first cell runs
+
+```bash
+pip install "stiv[widgets] @ git+https://github.com/simreaney/STIV.git"
+```
+
+if STIV is not installed yet, so it can be opened straight from GitHub --
+in Google Colab with the badge above (the cell also connects Google Drive,
+the easiest place for large videos and for the results), or downloaded and
+opened in JupyterLab or VS Code. From a clone of the repository:
 
 ```bash
 pip install -e '.[notebook]'
 jupyter lab notebooks/STIV_Interactive.ipynb
 ```
 
-1. **Video** -- browse to a file, or generate a synthetic demo river with a
-   *known* velocity profile to try the workflow risk-free first.
+1. **Video** -- browse to a file or upload one, generate a synthetic demo
+   river with a *known* velocity profile to try the workflow risk-free, or
+   reopen a saved survey (any run's `config_used.yaml`) to change a setting
+   and run again without re-clicking anything.
 2. **Scale** -- enter a ground resolution directly, or let it derive from
-   flight altitude and camera field of view; suggests a `frame_step`. Nothing
-   here is pre-filled: every velocity is proportional to the scale, so it has
-   to be typed in. Also sets which part of the clip to analyse.
-3. **Cross-section** -- click the section, a downstream point, and (optionally)
-   outline the water, directly on the frame at the analysis start time (the
-   frame the drone-motion correction measures drift from). Loading a different
-   video starts the survey afresh.
+   flight altitude and camera field of view: pick a DJI drone from the list
+   (Mini 3/4/5 Pro, Air 2S/3/3S, Mavic Pro, Mavic 2 Pro, Mavic 3, ...) and its
+   horizontal FOV is filled in. If the drone saved a flight log (`.SRT`, same
+   name as the video) its altitude is offered too, once you say how far the
+   take-off point was above the water. Nothing here is assumed: every velocity
+   is proportional to the scale. Also sets which part of the clip to analyse.
+3. **Cross-section** -- click the section and a downstream point on the frame
+   at the analysis start time (the frame the drone-motion correction measures
+   drift from). The water is then outlined automatically, from where the image
+   moves once the drone's drift is removed; check it and confirm, or draw your
+   own. It also warns if the water seems to flow away from your downstream
+   point. Loading a different video starts the survey afresh.
 4. **Settings** -- station count, expected velocity range, drone-motion
    compensation, and optional discharge, with sensible defaults and the fussier
    options tucked under "Advanced".
 5. **Run** -- reviews the choices, then analyses the video with a progress bar.
-6. **Results** -- the summary, plots and velocity table inline, plus the folder
-   everything was saved to.
+6. **Results** -- headline numbers, then tabs with the flow map (an arrow per
+   station, its length proportional to the velocity), the velocity profile,
+   the STIs and the table, and a zip of the results folder.
+
+**About the field of view.** DJI spec sheets quote the *diagonal* field of
+view -- 84° for a 24 mm-equivalent lens -- but `hfov_deg` is the *horizontal*
+one, about 71.5° for that lens on a 4:3 sensor. Using the quoted figure as the
+horizontal one makes every velocity about 25% too high. The drone list (in
+`stiv.cameras`) does the conversion; for another camera, convert with
+`stiv.cameras.hfov_from_diagonal`.
 
 It covers the common nadir-drone case; oblique views with ground control
 points, and scripting a batch of surveys, still want the CLI below.
@@ -142,11 +171,32 @@ how many stations that was.
 ### 1. Look at the video
 
 ```bash
-stiv info flight.mp4 --altitude-m 60 --hfov-deg 84
+stiv info flight.mp4 --camera mini-4-pro --altitude-m 60
 ```
 
 Reports resolution and frame rate, converts the flight geometry into a ground
 sample distance, and suggests a `frame_step` for the velocity you expect.
+
+`--camera` takes a DJI drone and fills in its *horizontal* field of view;
+`stiv cameras` lists the ones it knows (Mini 2 to Mini 5 Pro, Air 2S/3/3S,
+Mavic Pro, Mavic 2 Pro, Mavic 3, Phantom 4 Pro). For any other camera give
+`--hfov-deg` -- the horizontal field of view, not the diagonal one most spec
+sheets quote (see [About the field of view](#interactive-notebook-ui)).
+
+If the drone saved its flight log beside the video (`.SRT`, same name --
+"video captions" in the DJI app), `stiv info` reports the height it recorded.
+That is the height above the **take-off point**, not above the water, so it is
+used only when you say how far the take-off point was above the water surface:
+
+```bash
+stiv info flight.mp4 --camera mini-4-pro --takeoff-height 1.5
+```
+
+(`0` if you took off at water level.) When the log shows the camera was
+zoomed, you are told the narrower field of view to use instead of the preset.
+`--altitude-m` and `--takeoff-height` are alternatives, as are `--camera` and
+`--hfov-deg`; `stiv init` and `stiv pick` take the same options, and write the
+scale into the survey, with a comment saying where each number came from.
 
 ### 2. Define the survey
 
@@ -154,15 +204,21 @@ sample distance, and suggests a `frame_step` for the velocity you expect.
 stiv pick flight.mp4 -o survey.yaml
 ```
 
-Opens a frame and asks you to click: the two ends of the cross-section, a point
-downstream (which fixes the flow direction), and optionally an outline of the
-water. `-t SECONDS` shows a later frame, and that time also becomes
-`video.start_s`, since drift is measured from the first analysed frame.
+Opens a frame and asks you to click: the two ends of the cross-section, and a
+point downstream (which fixes the flow direction). The water is then outlined
+automatically, from what still moves once the drone's drift is taken out, and
+shown on the frame: enter accepts it, `n` turns it down and lets you click the
+outline yourself (or press enter at once to go without one). If the outline
+cannot be found -- still water, say -- the terminal says why and you are asked
+to click it; it also warns when the water seems to flow away from your
+downstream point. `--no-auto-water` goes straight to clicking. `-t SECONDS`
+shows a later frame, and that time also becomes `video.start_s`, since drift is
+measured from the first analysed frame.
 
-The config it writes leaves the scale as `m_per_px: null` (with `--gcps`, the
-world coordinates of the control points as `null`s), and `stiv run` refuses the
-file until you fill it in -- there is no safe default for a number every
-velocity is proportional to. `stiv init flight.mp4` writes the same skeleton
+Unless the scale options above are given, the config it writes leaves the
+scale as `m_per_px: null` (with `--gcps`, the world coordinates of the control
+points as `null`s), and `stiv run` refuses the file until you fill it in --
+there is no safe default for a number every velocity is proportional to. `stiv init flight.mp4` writes the same skeleton
 with the section ends also `null`, for filling in by hand, or start from
 [`examples/nadir_drone.yaml`](examples/nadir_drone.yaml). Neither command
 overwrites an existing file unless given `--force`. The video path is written
@@ -184,6 +240,7 @@ Outputs, in `output.out_dir`:
 | `report.txt` | the console summary, including warnings |
 | `velocity_profile.png` | velocity across the section with its uncertainty band, and coherency below |
 | `overview.png` | the frame with the section, search lines and flow direction drawn |
+| `velocity_map.png` | the frame with one flow arrow per station, its length proportional to the velocity |
 | `sti_panel.png` | contact sheet of up to 24 STIs, evenly spaced across the section (cf. Fig. 4) |
 | `sti/*.png` | every station's STI, full resolution (`output.save_sti_images`) |
 | `sti_detail/*.png` | orientation vectors, coherency map and angle histogram (Figs. 8, 9, 11) for the first, middle and last stations |
@@ -219,7 +276,13 @@ Camera motion is the dominant error source in UAV gauging: at 2 cm/px and 30 fps
 a drift of one pixel per frame is a spurious **0.6 m/s** on every station.
 Stabilisation is on by default. Supply `stabilise.water_mask_px` — without it the
 tracker may lock onto the moving water surface, and the run report will warn you
-when fewer than half the tracked features agree with the fitted motion. If it
+when fewer than half the tracked features agree with the fitted motion. `stiv
+pick` and the notebook wizard outline the water for you; in a survey written by
+hand, `water_mask_px: auto` does the same when the run starts. Nobody checks
+that outline, so it is used only when the detection is clear-cut; otherwise the
+run carries on without one, as it would have anyway, and the warnings and the
+summary's `water mask` line say what happened. `auto` stays in
+`config_used.yaml`, so a re-run looks again rather than reusing the outline. If it
 finds fewer than 6 trackable features on static ground it cannot fit the motion
 at all and switches itself off: the summary then reads `DISABLED AUTOMATICALLY`,
 the warnings say so in capitals, and every velocity includes whatever the
@@ -408,6 +471,9 @@ stiv/
   plotting.py     diagnostic figures
   picker.py       interactive point selection (matplotlib window)
   notebook_ui.py  interactive point selection + full workflow (Jupyter wizard)
+  cameras.py      field-of-view presets for DJI drones (diagonal -> horizontal)
+  srt.py          reads DJI flight logs (.SRT) for the altitude
+  watermask.py    automatic water outline for the drone-motion correction
   synthetic.py    synthetic river with known ground truth
   cli.py          command line
 

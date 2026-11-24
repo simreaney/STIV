@@ -3,12 +3,17 @@
 Getting pixel coordinates out of a video by hand is the most tedious part of
 setting up an image-velocimetry survey, so this opens a frame in a matplotlib
 window and turns clicks into a ready-to-run config file.
+
+The water outline -- the fiddliest set of clicks -- is found automatically once
+the section and the downstream point are in (:mod:`stiv.watermask`), and
+shown for the user to accept; clicking it by hand is the fallback.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -21,6 +26,8 @@ from .config import (
     survey_dict,
 )
 from .video import probe, read_frame_at
+
+log = logging.getLogger(__name__)
 
 
 class _Picker:
@@ -83,9 +90,7 @@ class _Picker:
         return self.points
 
 
-def pick_points(video: str | Path, n_points: Optional[int], prompt: str,
-                t_s: float = 0.0) -> list[tuple[float, float]]:
-    """Open a frame and return the points the user clicks."""
+def _require_gui() -> None:
     import matplotlib
 
     if matplotlib.get_backend().lower() == "agg":
@@ -94,12 +99,100 @@ def pick_points(video: str | Path, n_points: Optional[int], prompt: str,
             "clicked. Install a GUI backend (e.g. `pip install PyQt5`) or write "
             "section.start_px / end_px into the config by hand."
         )
+
+
+def pick_points(video: str | Path, n_points: Optional[int], prompt: str,
+                t_s: float = 0.0) -> list[tuple[float, float]]:
+    """Open a frame and return the points the user clicks."""
+    _require_gui()
     frame = read_frame_at(video, t_s)
     title = (
         f"{prompt}\n"
         f"left click = add    right click / backspace = undo    enter = done"
     )
     return _Picker(frame, title, n_points).run()
+
+
+def confirm_water_outline(video: str | Path, polygon: Sequence[Sequence[float]],
+                          section: Sequence[Sequence[float]], t_s: float = 0.0,
+                          note: str = "") -> bool:
+    """Show an automatic water outline on the frame; True if the user accepts it.
+
+    Enter or ``y`` accepts; ``n`` or escape -- or closing the window -- turns
+    it down, and the outline is then clicked by hand instead.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon
+
+    _require_gui()
+    frame = read_frame_at(video, t_s)
+    fig, ax = plt.subplots(figsize=(13, 8))
+    ax.imshow(frame[:, :, ::-1])
+    ax.set_axis_off()
+    ax.add_patch(Polygon(np.asarray(polygon, float), closed=True, facecolor="#1baf7a",
+                         edgecolor="#1baf7a", alpha=0.3, lw=2))
+    sec = np.asarray(section, float)
+    ax.plot(sec[:, 0], sec[:, 1], "o-", color="#eb6834", markersize=8,
+            markeredgecolor="white", markeredgewidth=1.5, lw=2)
+    ax.set_title(
+        "The WATER was outlined automatically (green). It should cover the moving water "
+        "around the section but not the banks;\nit need not be exact, and too much water "
+        "is better than too little.   enter / y = use it    n / escape = outline it by hand"
+        + (f"\n{note}" if note else ""),
+        fontsize=11, loc="left")
+    choice = {"accept": False}
+
+    def _on_key(event):
+        if event.key in ("enter", "y"):
+            choice["accept"] = True
+            plt.close(fig)
+        elif event.key in ("n", "escape"):
+            plt.close(fig)
+
+    fig.canvas.mpl_connect("key_press_event", _on_key)
+    plt.show()
+    return choice["accept"]
+
+
+def automatic_water_outline(
+    video: str | Path,
+    t_s: float,
+    section: Sequence[Sequence[float]],
+    downstream: Optional[Sequence[float]],
+    fps: Optional[float] = None,
+) -> Optional[list[tuple[float, float]]]:
+    """Find the water, offer it to the user, and return it if accepted.
+
+    None when the detector finds nothing it trusts -- the reason is logged --
+    or when the user turns the outline down; either way the caller falls back
+    to clicking the outline by hand.
+    """
+    from .watermask import detect_water
+
+    log.info("looking for the water...")
+    try:
+        det = detect_water(video, t_s, section, downstream, fps=fps)
+    except (ConfigError, ValueError) as exc:
+        log.warning("could not outline the water automatically (%s); outline it by hand "
+                    "instead, or press enter to skip", exc)
+        return None
+    if det.flow_agrees is False:
+        log.warning("the water appears to move towards the other side of the cross-section "
+                    "from the downstream point you clicked; if that point is on the wrong "
+                    "side, run `stiv pick` again (stiv run also flips a reversed profile, "
+                    "with flow.auto_flip)")
+    if not det.ok:
+        log.warning("could not outline the water automatically: %s. Outline it by hand "
+                    "instead, or press enter to skip", det.message)
+        return None
+    note = "" if det.confidence == "good" else f"Check it carefully: {det.message}."
+    if det.confidence != "good":
+        log.warning("the automatic water outline needs checking: %s", det.message)
+    if confirm_water_outline(video, det.polygon_px, section, t_s, note):
+        log.info("using the automatic water outline (%s)", det.message)
+        return list(det.polygon_px)
+    log.info("automatic water outline turned down; outline it by hand instead")
+    return None
 
 
 def build_config_interactively(
@@ -109,6 +202,8 @@ def build_config_interactively(
     with_gcps: bool = False,
     n_stations: int = SectionConfig.n_stations,
     config_path: Optional[str | Path] = None,
+    auto_water: bool = True,
+    fps: Optional[float] = None,
 ) -> dict:
     """Walk the user through defining a survey, returning a raw config dict.
 
@@ -123,6 +218,10 @@ def build_config_interactively(
     config file, not the working directory.  The scale is left as a ``null``
     placeholder (or, with ``with_gcps``, the world coordinates of the control
     points), which the config refuses to run with until it is filled in.
+
+    With ``auto_water`` the water is outlined automatically after the
+    downstream click and offered for confirmation; it is clicked by hand only
+    if that finds nothing or the user turns it down.
     """
     info = probe(video)
     if info.duration_s and t_s >= info.duration_s:
@@ -158,13 +257,17 @@ def build_config_interactively(
         if len(gcps) < 4:
             raise ConfigError(f"a homography needs at least 4 GCPs; {len(gcps)} were clicked")
 
-    water = pick_points(
-        video, None,
-        "Optional: outline the WATER by clicking around its edge, then press "
-        "enter. This keeps the stabiliser from tracking the moving surface. "
-        "Press enter immediately to skip.",
-        t_s,
-    )
+    water = None
+    if auto_water:
+        water = automatic_water_outline(video, t_s, pts[:2], down[0] if down else None, fps)
+    if water is None:
+        water = pick_points(
+            video, None,
+            "Optional: outline the WATER by clicking around its edge, then press "
+            "enter. This keeps the stabiliser from tracking the moving surface. "
+            "Press enter immediately to skip.",
+            t_s,
+        )
 
     video_entry = (path_for_config(video, config_path) if config_path is not None
                    else str(Path(video).expanduser().resolve()))

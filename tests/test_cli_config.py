@@ -345,12 +345,17 @@ class TestCli:
             return next(clicks)
 
         monkeypatch.setattr(picker, "pick_points", fake_pick)
+        offered = []
+        # The automatic water outline is offered, turned down, and clicked by hand.
+        monkeypatch.setattr(picker, "confirm_water_outline",
+                            lambda video, poly, section, t_s=0.0, note="": offered.append(t_s))
         monkeypatch.chdir(clip.parent)
         out = tmp_path / "configs" / "survey.yaml"
         out.parent.mkdir()
         assert cli.main(["pick", clip.name, "-o", str(out), "-t", "0.5"]) == 0
         raw = yaml.safe_load(out.read_text())
 
+        assert offered == [0.5]
         assert frames_at == [0.5, 0.5, 0.5]
         assert raw["video"]["start_s"] == 0.5          # clicked on the first analysed frame
         assert raw["section"]["start_px"] == [10.0, 50.0]
@@ -401,6 +406,21 @@ class TestCli:
 
 
 # --------------------------------------------------------------------------- #
+def _find(widget, description):
+    """The one widget labelled ``description`` anywhere inside ``widget``."""
+    found = []
+
+    def walk(w):
+        if getattr(w, "description", None) == description:
+            found.append(w)
+        for child in getattr(w, "children", ()):
+            walk(child)
+
+    walk(widget)
+    assert len(found) == 1, f"{len(found)} widgets labelled {description!r}"
+    return found[0]
+
+
 class TestWizard:
     @pytest.fixture
     def nb(self):
@@ -462,7 +482,7 @@ class TestWizard:
 
         # Typed into the box the scale step shows for exactly this case.
         step1 = wz._build_step1()
-        (fps_box,) = [w for w in step1.children if getattr(w, "description", "") == "Frame rate (fps)"]
+        fps_box = _find(step1, "Frame rate (fps)")
         fps_box.value = "30"
         assert wz.state.fps_override == 30.0
         assert wz._step_ready(1)[0] is True
@@ -506,8 +526,7 @@ class TestWizard:
         assert out_dir(wz, clip) != out_dir(wz, other)
 
         # A folder typed into step 4, or given to Wizard(), still wins.
-        (box,) = [w for w in wz._build_step3().children
-                  if getattr(w, "description", "") == "Save results to"]
+        box = _find(wz._build_step3(), "Save results to")
         box.value = "mine"
         assert out_dir(wz, clip) == "mine"
         assert out_dir(nb.Wizard(out_dir="given"), other) == "given"
@@ -553,3 +572,173 @@ class TestWizard:
         assert a == b
         # duration_s is the whole clip in one and null in the other: same frames.
         assert FrameSource(got.video).n_frames == FrameSource(want.video).n_frames
+
+    # -- drone presets, flight log, reopening, automatic water ------------- #
+    def test_drone_preset_fills_the_horizontal_fov(self, nb, clip):
+        import ipywidgets as W
+
+        from stiv.cameras import camera
+
+        wz = nb.Wizard()
+        wz._load_video(str(clip), is_demo=False, status=W.HTML())
+        wz.state.scale_mode = "flight"
+        step1 = wz._build_step1()
+        _find(step1, "Altitude above water (m)").value = "60"
+        dd = _find(step1, "Drone / camera")
+        assert dd.value == "" and wz.state.hfov_deg is None        # nothing assumed
+        assert "Choose your drone" in wz._step_ready(1)[1]
+
+        dd.value = "mini-4-pro"
+        assert wz.state.hfov_deg == pytest.approx(camera("mini-4-pro").hfov_deg, abs=0.05)
+        assert wz.state.camera_key == "mini-4-pro"
+        assert wz._step_ready(1)[0] is True
+
+        # Typing another value is a different camera, not that preset.
+        _find(step1, "Horizontal FOV (degrees)").value = "75"
+        assert dd.value == "custom" and wz.state.hfov_deg == 75.0
+
+    def test_flight_log_altitude_needs_the_take_off_height(self, nb, clip, tmp_path):
+        import ipywidgets as W
+
+        video = tmp_path / "flight.mp4"
+        shutil.copy(clip, video)
+        video.with_suffix(".SRT").write_text(
+            "1\n00:00:00,000 --> 00:00:00,033\n[focal_len: 24.00] [rel_alt: 41.500 abs_alt: 99.0]\n\n"
+            "2\n00:00:01,000 --> 00:00:01,033\n[focal_len: 24.00] [rel_alt: 41.700 abs_alt: 99.2]\n",
+            encoding="utf-8")
+        wz = nb.Wizard()
+        wz._load_video(str(video), is_demo=False, status=W.HTML())
+        assert len(wz.state.srt_records) == 2
+        wz.state.scale_mode = "flight"
+        step1 = wz._build_step1()
+        use = _find(step1, "Use flight-log altitude")
+        use.click()
+        assert wz.state.altitude_m is None                  # no take-off height yet
+        _find(step1, "Take-off height above water (m)").value = "2"
+        use.click()
+        assert wz.state.altitude_m == pytest.approx(41.6 + 2.0)
+
+    def _survey(self, clip, tmp_path):
+        raw = survey_dict(str(clip), start_s=0.5, duration_s=1.0, m_per_px=0.03, start_px=(160, 50),
+                          end_px=(160, 150), downstream_px=(300, 100), n_stations=9,
+                          water_mask_px=[[(0, 60), (319, 60), (319, 140), (0, 140)]],
+                          out_dir=str(tmp_path / "results"), fps_override=30.0)
+        raw["quality"] = {"min_mean_coherency": 0.42}               # no wizard control for it
+        raw["stabilise"]["model"] = "affine"
+        path = tmp_path / "config_used.yaml"
+        Config.from_dict(raw).dump_yaml(path)
+        return path
+
+    def test_reopening_a_saved_survey_round_trips(self, nb, clip, tmp_path):
+        import ipywidgets as W
+
+        path = self._survey(clip, tmp_path)
+        wz = nb.Wizard()
+        status = W.HTML()
+        wz._reopen_survey(str(path), status)
+        assert "Reopened" in status.value
+        assert wz.step == 4                                 # straight to the review
+        s = wz.state
+        assert (s.m_per_px, s.n_stations, s.start_s, s.water_source) == (0.03, 9, 0.5, "loaded")
+        assert wz._out_dir() == str(tmp_path / "results")
+
+        want, got = Config.from_yaml(path).to_dict(), wz._build_config().to_dict()
+        assert got == want
+        assert got["quality"]["min_mean_coherency"] == 0.42 and got["stabilise"]["model"] == "affine"
+
+        # Changing the scale method replaces the scale rather than mixing in
+        # the file's m_per_px; clearing the frame rate does not bring it back.
+        s.scale_mode, s.altitude_m, s.hfov_deg, s.fps_override = "flight", 40.0, 71.5, None
+        s.water_pts.clear()
+        cfg = wz._build_config()
+        assert cfg.rectify.m_per_px is None and cfg.rectify.altitude_m == 40.0
+        assert cfg.video.fps_override is None and cfg.stabilise.water_mask_px is None
+
+        # A new video afterwards is a new survey, and not written over this one.
+        wz._load_video(str(clip), is_demo=False, status=W.HTML())
+        assert wz.state.base_raw is None and wz._out_dir() != str(tmp_path / "results")
+
+    def test_reopening_an_unfinished_survey(self, nb, clip, tmp_path):
+        """`stiv init` leaves the scale and section as nulls; the wizard reads
+        what is there and stops at the first step that needs input."""
+        import ipywidgets as W
+
+        path = tmp_path / "survey.yaml"
+        path.write_text(yaml.safe_dump(survey_dict(str(clip))), encoding="utf-8")
+        wz = nb.Wizard()
+        status = W.HTML()
+        wz._reopen_survey(str(path), status)
+        assert "Reopened" in status.value and wz.step == 1
+
+    def test_stepper_only_jumps_to_steps_already_reached(self, nb, clip):
+        import ipywidgets as W
+
+        wz = nb.Wizard()
+        wz._load_video(str(clip), is_demo=False, status=W.HTML())
+        wz._go_to(3)
+        assert wz.step == 0
+        wz._on_next(None)
+        assert wz.step == 1 and wz._furthest == 1
+        wz._on_next(None)                                   # no scale yet
+        assert wz.step == 1 and "ground resolution" in wz._error.value
+        wz._go_to(0)
+        assert wz.step == 0
+        wz._go_to(1)
+        assert wz.step == 1
+
+    def test_water_is_outlined_automatically(self, nb, clip):
+        import ipywidgets as W
+
+        wz = nb.Wizard()
+        wz._load_video(str(clip), is_demo=False, status=W.HTML())
+        s = wz.state
+        s.m_per_px = 0.02
+        s.section_pts = [(160.0, 50.0), (160.0, 150.0)]
+        s.downstream_pts = [(310.0, 100.0)]
+        wz._detect_water()
+        assert s.water_source == "auto" and len(s.water_pts) >= 3
+        assert "outlined automatically" in wz._water_note_html()
+        assert len(wz._build_config().stabilise.water_mask_px[0]) == len(s.water_pts)
+        assert wz._water_key == wz._water_inputs()          # not redone for the same picks
+
+    def test_picker_outlines_the_water_when_its_stage_opens(self, nb, clip):
+        pytest.importorskip("ipympl")
+        code = textwrap.dedent("""
+            import sys, matplotlib
+            matplotlib.use("module://ipympl.backend_nbagg")
+            import matplotlib.pyplot as plt, ipywidgets as W
+            from stiv.notebook_ui import Wizard
+
+            def find(w, d):
+                if getattr(w, "description", None) == d:
+                    return w
+                for c in getattr(w, "children", ()):
+                    f = find(c, d)
+                    if f is not None:
+                        return f
+
+            wz = Wizard()
+            wz._ensure_interactive_backend = plt.ion
+            wz._load_video(sys.argv[1], is_demo=False, status=W.HTML())
+            s = wz.state
+            s.m_per_px = 0.02
+            s.section_pts = [(160.0, 50.0), (160.0, 150.0)]
+            s.downstream_pts = [(0.0, 100.0)]          # wrong side: the river runs to the right
+            wz._pick_stage = 1
+            box = wz._build_step2()
+            find(box, "Confirm").click()               # downstream confirmed -> water stage
+            assert s.water_source == "auto" and len(s.water_pts) >= 3, s.water_source
+            flip = find(box, "Move downstream point across")
+            assert flip.layout.display is None         # offered
+            flip.click()
+            assert s.downstream_pts[0][0] > 160 and flip.layout.display == "none"
+            find(box, "Clear stage").click()
+            assert s.water_pts == [] and s.water_source is None
+            find(box, "Detect water").click()
+            assert s.water_source == "auto"
+            find(box, "Confirm").click()
+            assert wz._step_ready(2)[0]
+            assert "detected automatically" in wz._summary_html()
+        """)
+        subprocess.run([sys.executable, "-c", code, str(clip)],
+                       cwd=Path(__file__).resolve().parents[1], check=True)

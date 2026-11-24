@@ -33,6 +33,7 @@ OUTPUT_FILES = (
     "summary.json",
     "orientation_fields.npz",
     "overview.png",
+    "velocity_map.png",
     "velocity_profile.png",
     "sti_panel.png",
     "discharge.png",

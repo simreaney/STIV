@@ -218,6 +218,51 @@ class TestFigures:
         written = plotting.save_all(res, tmp_path / "figs", dpi=50)
         assert all(p.stat().st_size > 1000 for p in written)
 
+    @staticmethod
+    def _arrows(fig):
+        """(base points, arrow vectors) of every quiver on the figure's map axes."""
+        from matplotlib.quiver import Quiver
+
+        qs = [c for c in fig.axes[0].collections if isinstance(c, Quiver)]
+        return [(np.asarray(q.XY), np.column_stack([q.U, q.V])) for q in qs]
+
+    def test_velocity_map_arrow_length_is_proportional_to_speed(self, base, tmp_path, figures):
+        res = _clean(base[1])
+        plotting.plot_velocity_map(res, tmp_path / "m.png", dpi=50)
+        ((xy, uv),) = self._arrows(figures[0])
+        v = res.velocities
+        assert len(uv) == len(v)
+        lengths = np.linalg.norm(uv, axis=1)
+        # A uniform-scale view: pixels per (m/s) is the same for every arrow.
+        np.testing.assert_allclose(lengths / np.abs(v), (lengths / np.abs(v))[0], rtol=1e-6)
+        # ... and every arrow points downstream: the synthetic river runs left
+        # to right across the frame.
+        assert (uv[:, 0] > 0).all() and np.allclose(uv[:, 1], 0.0, atol=1e-6 * lengths.max())
+
+    def test_velocity_map_marks_failed_stations(self, base, tmp_path, figures):
+        res = _clean(base[1])
+        _fail(res, 1, interpolated=True)
+        _fail(res, 3, interpolated=False, raw_value=math.nan)
+        res.stations[5].velocity_ms = -0.2          # flowing upstream at one station
+        plotting.plot_velocity_map(res, tmp_path / "m.png", dpi=50)
+        quivers = self._arrows(figures[0])
+        assert sorted(len(uv) for _, uv in quivers) == [1, 5]   # interpolated drawn apart
+        labels = [t.get_text() for t in figures[0].axes[0].get_legend().get_texts()]
+        assert "failed QC (interpolated)" in labels and "no velocity (excluded)" in labels
+        assert (tmp_path / "m.png").stat().st_size > 1000
+
+    def test_velocity_map_with_no_velocity_at_all(self, base, tmp_path):
+        res = _clean(base[1])
+        for st in res.stations:
+            st.velocity_ms = math.nan
+            st.flags = ["low_coherency"]
+        plotting.plot_velocity_map(res, tmp_path / "m.png", dpi=50)
+        assert (tmp_path / "m.png").stat().st_size > 1000
+
+    def test_velocity_map_is_part_of_the_figure_set(self, base, tmp_path):
+        written = plotting.save_all(_clean(base[1]), tmp_path / "figs", dpi=50)
+        assert tmp_path / "figs" / "velocity_map.png" in written
+
     @pytest.mark.parametrize("w,h", [(336, 256), (480, 300), (1920, 1080), (1080, 1920)])
     def test_overview_layout_holds_for_small_frames(self, base, tmp_path, w, h):
         """At 110 px to the inch a thermal-camera or proxy frame made a figure

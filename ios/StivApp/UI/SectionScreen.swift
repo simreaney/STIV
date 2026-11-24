@@ -72,6 +72,10 @@ struct SectionScreen: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
+                if model.pickTarget == .waterOutline {
+                    waterOutlineStatus
+                }
+
                 if let width = model.sectionWidthM {
                     HStack(spacing: 18) {
                         Metric(label: "Section", value: "\(decimals(width, 2)) m")
@@ -121,6 +125,57 @@ struct SectionScreen: View {
                 }
             }
         }
+    }
+
+    /// Where the automatic water outline has got, and what to do about it.
+    ///
+    /// The outline is found from a second or so of frames after the downstream
+    /// tap -- the water is what moves once the phone's own motion is taken out
+    /// -- and it is the user's to accept: it is drawn on the feed, and a tap
+    /// replaces it with one of their own.
+    @ViewBuilder private var waterOutlineStatus: some View {
+        switch model.waterDetection {
+        case .idle:
+            EmptyView()
+        case .looking:
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("Looking for the water: hold the phone still on the section…")
+                    .font(.caption)
+            }
+        case .found(let weak, let message):
+            Label(weak
+                  ? "Water outlined, but check it: \(message)."
+                  : "Water outlined automatically (blue). It should cover the moving water "
+                    + "near you, not the bank; tap around the water to draw your own instead.",
+                  systemImage: weak ? "exclamationmark.triangle" : "wand.and.stars")
+                .font(.caption).foregroundStyle(weak ? .orange : .green)
+                .fixedSize(horizontal: false, vertical: true)
+        case .notFound(let message):
+            Label("Could not find the water automatically: \(message). Tap around it "
+                + "yourself, or carry on without an outline.", systemImage: "info.circle")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        if model.flowLooksReversed {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("The water seems to flow toward the other side of the section from your "
+                    + "downstream point.", systemImage: "arrow.left.arrow.right")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Move the downstream point across") { model.moveDownstreamAcross() }
+                    .font(.caption.weight(.semibold))
+            }
+        }
+
+        Button {
+            model.detectWater()
+        } label: {
+            Label("Find the water again", systemImage: "wand.and.stars")
+        }
+        .font(.footnote)
+        .disabled(model.waterDetection == .looking)
     }
 
     /// The far-field scale warning, shown while it can still be acted on.

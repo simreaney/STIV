@@ -408,10 +408,14 @@ final class SurveyRecordingTests: XCTestCase {
         let folder = try XCTUnwrap(model.exportDirectory)
         XCTAssertEqual(folder.deletingLastPathComponent().standardizedFileURL,
                        URL.documentsDirectory.standardizedFileURL)
-        let names = ["report.txt", "summary.json", "survey.yaml", "velocity.csv"]
+        let names = ["report.txt", "summary.json", "survey.yaml", "velocity.csv", "velocity_map.png"]
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(),
                        names, "saved without Share being tapped")
         let saved = documents()
+        // The flow map, drawn in plan as the results screen shows it.
+        let png = try Data(contentsOf: folder.appendingPathComponent("velocity_map.png"))
+        let picture = try XCTUnwrap(UIImage(data: png))
+        XCTAssertEqual(picture.size.width * picture.scale, 1800, accuracy: 1)
 
         XCTAssertEqual(model.survey.capture.frameStep, 2)
         model.setFrameStep(1)

@@ -29,12 +29,16 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
 gui = ["PyQt5>=5.15"]          # only needed for the interactive `stiv pick`
-notebook = [                   # the interactive survey wizard in notebooks/
+widgets = [                    # the interactive survey wizard (stiv.notebook_ui), for
+    "ipywidgets>=7.6",         # a kernel that already has Jupyter: Colab, JupyterHub,
+    "ipympl>=0.9",             # VS Code. 7.6 rather than 8, so installing it never
+    "ipyfilechooser>=0.6",     # replaces the widgets a hosted frontend was built for.
+]
+notebook = [                   # the wizard plus JupyterLab 4 to run it in
+    "stiv[widgets]",
+    "ipywidgets>=8",
     "jupyterlab>=4",
     "ipykernel>=6",
-    "ipywidgets>=8",
-    "ipympl>=0.9",
-    "ipyfilechooser>=0.6",
 ]
 
 [project.scripts]
