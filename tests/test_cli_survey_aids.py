@@ -31,11 +31,18 @@ SECTION = [(160.0, 50.0), (160.0, 150.0)]
 RIGHT = (310.0, 100.0)                  # downstream: the river runs left to right
 
 
-def _srt(alts=(41.5, 41.7, 41.6), focal=24.0, with_alt=True) -> str:
+def _srt(alts=(41.5, 41.7, 41.6), focal=24.0, with_alt=True, plain=False) -> str:
+    """A flight log: ``rel_alt`` as the Mini and Air 3 write it, a plain
+    ``altitude`` as the Air 2S and Mavic 2 do (``plain``), or no height."""
     blocks = []
     for i, alt in enumerate(alts):
-        fields = f"[focal_len: {focal:.2f}]" + (f" [rel_alt: {alt:.3f} abs_alt: 99.0]" if with_alt
-                                                 else " [altitude: 99.0]")
+        if not with_alt:
+            height = ""
+        elif plain:
+            height = f" [altitude: {alt:.6f}]"
+        else:
+            height = f" [rel_alt: {alt:.3f} abs_alt: 99.0]"
+        fields = f"[focal_len: {focal:.2f}]" + height
         blocks.append(f"{i + 1}\n00:00:0{i},000 --> 00:00:0{i},033\n{fields}\n")
     return "\n".join(blocks)
 
@@ -151,6 +158,20 @@ class TestFlightLog:
 
     def test_takeoff_height_with_a_log_that_has_no_altitude(self, flight, tmp_path, capsys):
         flight.with_suffix(".SRT").write_text(_srt(with_alt=False), encoding="utf-8")
+        assert _init(flight, tmp_path / "s.yaml", "--takeoff-height", "1") == 2
+        assert "records no height above take-off" in capsys.readouterr().err
+
+    def test_an_air_2s_log_is_used_and_flagged_for_checking(self, flight, tmp_path, capsys):
+        flight.with_suffix(".SRT").write_text(_srt(focal=224, plain=True), encoding="utf-8")
+        out = tmp_path / "s.yaml"
+        assert _init(flight, out, "--camera", "air-2s", "--takeoff-height", "1.5") == 0
+        assert yaml.safe_load(out.read_text())["rectify"]["altitude_m"] == pytest.approx(43.1)
+        printed = capsys.readouterr()
+        assert "sea level" in printed.out + printed.err
+
+    def test_a_log_reading_above_sea_level_is_not_used(self, flight, tmp_path, capsys):
+        flight.with_suffix(".SRT").write_text(_srt(alts=(812.0, 812.4, 812.2), plain=True),
+                                              encoding="utf-8")
         assert _init(flight, tmp_path / "s.yaml", "--takeoff-height", "1") == 2
         assert "records no height above take-off" in capsys.readouterr().err
 

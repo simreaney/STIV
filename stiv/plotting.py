@@ -15,6 +15,9 @@ the validated reference palette; magnitude uses a single-hue blue ramp and the
 space-time images stay greyscale, since they are photographs rather than
 encodings of an abstract quantity.
 
+Each ``plot_*`` function writes to a file path, or -- for the PDF report --
+to an open multi-page PDF, one page per figure.
+
 Figures are built on :class:`matplotlib.figure.Figure` with an Agg canvas of
 their own rather than through ``pyplot``, so importing this module never
 changes the process-wide backend -- in a notebook, a later inline or ipympl
@@ -89,6 +92,22 @@ _MIN_OVERVIEW_WIDTH_IN = 6.5
 
 def _style():
     return matplotlib.rc_context(_RC)
+
+
+def _save(fig: Figure, target, dpi: int, **kwargs):
+    """Write ``fig`` to ``target``: a file path, or an open multi-page PDF.
+
+    The PDF report (:mod:`stiv.pdf_report`) passes a
+    :class:`~matplotlib.backends.backend_pdf.PdfPages`, and each figure becomes
+    a page of it, as vector graphics.  Returns ``target``.
+    """
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    if isinstance(target, PdfPages):
+        target.savefig(fig, dpi=dpi, **kwargs)
+    else:
+        fig.savefig(target, dpi=dpi, **kwargs)
+    return target
 
 
 def _figure(**kwargs) -> Figure:
@@ -176,7 +195,7 @@ def plot_overview(result: StivResult, path: Path, dpi: int = 150) -> Path:
             f"{result.config.stiv.search_line_length_m:.1f} m search lines",
             loc="left",
         )
-        fig.savefig(path, dpi=dpi, bbox_inches="tight")
+        _save(fig, path, dpi, bbox_inches="tight")
     return path
 
 
@@ -341,7 +360,7 @@ def plot_velocity_map(result: StivResult, path: Path, dpi: int = 150) -> Path:
         stats = (f"mean {finite.mean():.2f} m/s, max {finite.max():.2f} m/s"
                  if finite.size else "no velocities passed quality control")
         ax.set_title(f"Surface velocity  -  {result.config.section.name}   ({stats})", loc="left")
-        fig.savefig(path, dpi=dpi, bbox_inches="tight")
+        _save(fig, path, dpi, bbox_inches="tight")
     return path
 
 
@@ -445,7 +464,7 @@ def plot_velocity_profile(result: StivResult, path: Path, dpi: int = 150) -> Pat
                        f"0 m at image point ({result.geometry.start_px[0]:.0f}, "
                        f"{result.geometry.start_px[1]:.0f})")
 
-        fig.savefig(path, dpi=dpi)
+        _save(fig, path, dpi)
     return path
 
 
@@ -497,7 +516,7 @@ def plot_sti_panel(result: StivResult, path: Path, max_panels: int = 24,
             "(horizontal: metres downstream, vertical: seconds)",
             fontsize=10, color=INK, x=0.01, ha="left",
         )
-        fig.savefig(path, dpi=dpi)
+        _save(fig, path, dpi)
     return path
 
 
@@ -582,7 +601,7 @@ def plot_sti_detail(result: StivResult, index: int, path: Path, dpi: int = 150) 
             f"Sx/St = {s.velocity_per_unit_slope():.2f} m/s per unit slope   |   flags: {flags}",
             fontsize=9.5, color=INK_2, x=0.01, ha="left",
         )
-        fig.savefig(path, dpi=dpi)
+        _save(fig, path, dpi)
     return path
 
 
@@ -627,7 +646,7 @@ def plot_discharge(result: StivResult, path: Path, dpi: int = 150) -> Path:
         ax2.set_ylabel("panel Q  (m³/s)")
         ax2.set_xlabel("distance along cross-section  (m)")
 
-        fig.savefig(path, dpi=dpi)
+        _save(fig, path, dpi)
     return path
 
 

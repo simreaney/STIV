@@ -123,11 +123,13 @@ jupyter lab notebooks/STIV_Interactive.ipynb
    point. Loading a different video starts the survey afresh.
 4. **Settings** -- station count, expected velocity range, drone-motion
    compensation, and optional discharge, with sensible defaults and the fussier
-   options tucked under "Advanced".
+   options tucked under "Advanced". A PDF report is written with the results
+   unless you untick it.
 5. **Run** -- reviews the choices, then analyses the video with a progress bar.
 6. **Results** -- headline numbers, then tabs with the flow map (an arrow per
    station, its length proportional to the velocity), the velocity profile,
-   the STIs and the table, and a zip of the results folder.
+   the STIs and the table, then the PDF report (or a button to make one) and
+   a zip of the results folder.
 
 **About the field of view.** DJI spec sheets quote the *diagonal* field of
 view -- 84° for a 24 mm-equivalent lens -- but `hfov_deg` is the *horizontal*
@@ -229,6 +231,7 @@ because that is what relative paths in a config are resolved against.
 
 ```bash
 stiv run survey.yaml
+stiv run survey.yaml --pdf     # ...and report.pdf as well
 ```
 
 Outputs, in `output.out_dir`:
@@ -247,6 +250,7 @@ Outputs, in `output.out_dir`:
 | `discharge.png`, `discharge_panels.csv` | if depths were supplied |
 | `orientation_fields.npz` | per-window orientation and coherency fields, if `output.save_fields` |
 | `config_used.yaml` | the fully resolved config, for reproducibility |
+| `report.pdf` | one document to keep or hand in: the headline velocities, the survey details and every warning, then each figure, the station table and the config used -- with `--pdf` or `output.pdf_report: true` (the notebook wizard writes it by default) |
 
 Each run lists the files it wrote in `.stiv_outputs.json`, and a re-run into
 the same folder first removes exactly those, so a run with fewer stations, or

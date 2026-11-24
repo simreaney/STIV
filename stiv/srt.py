@@ -9,12 +9,19 @@ it matter here:
     Height above the **take-off point**, from the barometer.  It is *not* the
     height above the water: a drone launched from a bank two metres above the
     river reads two metres low.  The caller has to add that offset.
+``altitude``
+    What the Air 2S and the Mavic 2 log instead, with no reference stated.  On
+    those models it is the same height above take-off -- the number the
+    controller shows as H -- so it is used, but marked as an assumption
+    (:attr:`AltitudeStats.assumed`) for the user to check.  DJI firmware will
+    not fly more than 500 m above the take-off point, so a log reading higher
+    than that is height above sea level and is not used.
 ``focal_len``
     The 35 mm-equivalent focal length actually in use; larger than the lens's
     native value when digital zoom was on, which narrows the field of view.
 
-Formats differ by model and firmware, so only fields whose meaning is
-unambiguous are read; an absolute (GPS / sea-level) altitude is ignored.
+A field that says what it is measured from (``rel_alt``) is preferred to one
+that does not (``altitude``); an altitude above sea level is never used.
 """
 
 from __future__ import annotations
@@ -29,20 +36,28 @@ import numpy as np
 
 _TIME = re.compile(r"(\d+):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->")
 #: Height above take-off, in the order tried.  ``rel_alt: 30.1`` (Mini 3/4/5
-#: Pro, Air 2S/3/3S, Mavic 3), ``H 29.70m`` / ``H:29.7m`` (Mavic Pro), and
+#: Pro, Air 3/3S, Mavic 3), ``H 29.70m`` / ``H:29.7m`` (Mavic Pro), and
 #: ``BAROMETER:10.2`` (Phantom 4).
 _REL_ALT = (
     re.compile(r"rel_alt\s*:\s*(-?\d+(?:\.\d+)?)", re.I),
     re.compile(r"(?<![A-Za-z.])H\s*[: ]\s*(-?\d+(?:\.\d+)?)\s*m\b"),
     re.compile(r"BAROMETER\s*:\s*(-?\d+(?:\.\d+)?)", re.I),
 )
+#: ``[altitude: 35.9]`` (Air 2S, Mavic 2): no reference stated; see above.
+_ALTITUDE = re.compile(r"(?<![A-Za-z_])altitude\s*:\s*(-?\d+(?:\.\d+)?)", re.I)
 _FOCAL = re.compile(r"focal_len\s*:\s*(\d+(?:\.\d+)?)", re.I)
+#: DJI's ceiling above the take-off point, m.  A logged altitude above it can
+#: only be height above sea level.
+MAX_ABOVE_TAKEOFF_M = 500.0
 
 
 @dataclass
 class SrtRecord:
     t_s: float
+    #: Height above take-off, from a field that says so.
     rel_alt_m: Optional[float] = None
+    #: A bare ``altitude``, whose reference the log does not state.
+    altitude_m: Optional[float] = None
     #: 35 mm-equivalent focal length in use, mm.
     focal_len_mm: Optional[float] = None
 
@@ -55,6 +70,10 @@ class AltitudeStats:
     n: int
     #: Median 35 mm-equivalent focal length over the same records, if logged.
     focal_len_mm: Optional[float] = None
+    #: True when the heights are a bare ``altitude``, read as height above
+    #: take-off because that is what it is on the models that log it -- but
+    #: the log does not say so, and the user should check.
+    assumed: bool = False
 
 
 def find_srt(video_path: str | Path) -> Optional[Path]:
@@ -88,6 +107,9 @@ def parse_srt_text(text: str) -> list[SrtRecord]:
             if a:
                 rec.rel_alt_m = float(a.group(1))
                 break
+        bare = _ALTITUDE.search(body)
+        if bare:
+            rec.altitude_m = float(bare.group(1))
         f = _FOCAL.search(body)
         if f:
             focal = float(f.group(1))
@@ -101,16 +123,25 @@ def altitude_stats(records: Sequence[SrtRecord], start_s: float = 0.0,
                    duration_s: Optional[float] = None) -> Optional[AltitudeStats]:
     """Height above take-off over the analysis window; None if not logged.
 
-    Falls back to the whole log when no caption falls inside the window.
+    From ``rel_alt`` (or ``H`` / ``BAROMETER``) when the log has it; otherwise
+    from a bare ``altitude``, marked ``assumed``, unless that reads higher than
+    a drone can fly above its take-off point.  Falls back to the whole log when
+    no caption falls inside the window.
     """
-    with_alt = [r for r in records if r.rel_alt_m is not None and math.isfinite(r.rel_alt_m)]
-    if not with_alt:
-        return None
     end = math.inf if duration_s is None else start_s + duration_s
-    window = [r for r in with_alt if start_s <= r.t_s <= end] or with_alt
-    alt = np.array([r.rel_alt_m for r in window], float)
-    focal = [r.focal_len_mm for r in window if r.focal_len_mm]
-    return AltitudeStats(
-        median_m=float(np.median(alt)), min_m=float(alt.min()), max_m=float(alt.max()),
-        n=len(window), focal_len_mm=float(np.median(focal)) if focal else None,
-    )
+    for field, assumed in (("rel_alt_m", False), ("altitude_m", True)):
+        with_alt = [r for r in records
+                    if getattr(r, field) is not None and math.isfinite(getattr(r, field))]
+        if not with_alt:
+            continue
+        window = [r for r in with_alt if start_s <= r.t_s <= end] or with_alt
+        alt = np.array([getattr(r, field) for r in window], float)
+        if assumed and alt.max() > MAX_ABOVE_TAKEOFF_M:
+            return None                     # above sea level: no use here
+        focal = [r.focal_len_mm for r in window if r.focal_len_mm]
+        return AltitudeStats(
+            median_m=float(np.median(alt)), min_m=float(alt.min()), max_m=float(alt.max()),
+            n=len(window), focal_len_mm=float(np.median(focal)) if focal else None,
+            assumed=assumed,
+        )
+    return None

@@ -379,6 +379,9 @@ class _State:
     section_name: Optional[str] = None
 
     discharge_enabled: bool = False
+    #: Write report.pdf with the results: on by default here, where it is a
+    #: visible choice -- a single document is what a student hands in.
+    pdf_report: bool = True
     bathymetry_csv: Optional[str] = None
     alpha: float = DischargeConfig.alpha
     bank_coefficient: float = DischargeConfig.bank_coefficient
@@ -1032,6 +1035,7 @@ class Wizard:
         s.bathymetry_csv = cfg.discharge.bathymetry_csv
         s.alpha, s.bank_coefficient = cfg.discharge.alpha, cfg.discharge.bank_coefficient
         s.loaded_out_dir = cfg.output.out_dir
+        s.pdf_report = cfg.output.pdf_report
         s.base_raw = cfg.to_dict()
         s.loaded_from = str(path)
 
@@ -1124,11 +1128,14 @@ class Wizard:
                 _show(use_btn, False)
                 return
             spread = f" ({st.min_m:.1f}&ndash;{st.max_m:.1f} m)" if st.max_m - st.min_m >= 0.05 else ""
+            assumed = (" The log calls this just &ldquo;altitude&rdquo;: on the Air 2S and Mavic 2 that "
+                       "is the height above take-off, but check it is not the height above sea level."
+                       if st.assumed else "")
             srt_note.value = _callout(
                 "info", f"<b>Flight log found.</b> During the analysis window the drone was "
-                        f"<b>{st.median_m:.1f} m above its take-off point</b>{spread}. That is not its height "
-                        f"above the water: enter how far the take-off point was above the water surface "
-                        f"(0 if you took off at water level, negative if below it).")
+                        f"<b>{st.median_m:.1f} m above its take-off point</b>{spread}.{assumed} That is not "
+                        f"its height above the water: enter how far the take-off point was above the water "
+                        f"surface (0 if you took off at water level, negative if below it).")
             preset = camera(s.camera_key or "")
             narrowed = preset.zoomed_hfov_deg(st.focal_len_mm) if preset else None
             if narrowed is not None:
@@ -1714,6 +1721,16 @@ class Wizard:
 
         out_dir_box.observe(_on_out_dir, names="value")
 
+        pdf_chk = W.Checkbox(value=s.pdf_report, indent=False,
+                             description="Also write a PDF report (report.pdf): the summary, every "
+                                         "figure, the station table and these settings in one document",
+                             layout=W.Layout(width="auto"))
+
+        def _on_pdf(change):
+            s.pdf_report = change["new"]
+
+        pdf_chk.observe(_on_pdf, names="value")
+
         def _sync(*_):
             s.n_stations = n_stations.value
             s.velocity_range = tuple(vrange.value)
@@ -1736,7 +1753,7 @@ class Wizard:
                   n_stations, vrange, advanced),
             _card("Camera motion", stabilise),
             _card("Discharge", discharge_chk, discharge_box),
-            _card("Output", out_dir_box,
+            _card("Output", out_dir_box, pdf_chk,
                   _help("Running again into the same folder replaces the results already there.")),
         ])
 
@@ -1774,6 +1791,7 @@ class Wizard:
             bank_coefficient=s.bank_coefficient,
             out_dir=self._out_dir(),
         )
+        raw["output"]["pdf_report"] = bool(s.pdf_report)
         if s.base_raw:
             raw = _merge_survey(s.base_raw, raw)
         return Config.from_dict(raw)
@@ -1804,6 +1822,7 @@ class Wizard:
              else "found when the analysis runs (auto, from the survey file)"
              if self._water_at_run() else "none"),
             ("Discharge", "on" if s.discharge_enabled else "off"),
+            ("PDF report", "yes" if s.pdf_report else "no"),
             ("Results folder", f"<code>{_esc(self._out_dir())}</code>"),
         ]
         body = "".join(f"<tr><td class='k'>{k}</td><td><b>{v}</b></td></tr>" for k, v in rows)
@@ -1945,7 +1964,39 @@ class Wizard:
                            icon="download", layout=W.Layout(width="auto"))
         rerun_btn = W.Button(description="Change settings and re-run", icon="sliders",
                              layout=W.Layout(width="auto"))
+        pdf_path = Path(out) / "report.pdf"
+        pdf_btn = W.Button(icon="file-pdf-o", layout=W.Layout(width="auto"))
         files_note = W.HTML()
+
+        def _pdf_label():
+            if pdf_path.is_file():
+                pdf_btn.description = "Download PDF report" if _in_colab() else "PDF report"
+            else:
+                pdf_btn.description = "Make a PDF report"
+
+        def _on_pdf(_btn):
+            pdf_btn.disabled = True
+            try:
+                if not pdf_path.is_file():
+                    files_note.value = _callout("info", "Writing the PDF report&hellip;")
+                    from .report import add_pdf_report
+
+                    add_pdf_report(result, result.config)
+                if _in_colab():
+                    from google.colab import files
+
+                    files.download(str(pdf_path))
+                    files_note.value = _callout("ok", "Downloading <code>report.pdf</code>.")
+                else:
+                    files_note.value = _callout(
+                        "ok", f"The PDF report is <code>{_esc(pdf_path.resolve())}</code>.")
+            except Exception as exc:
+                files_note.value = _callout("error", f"Could not write the PDF report: {_esc(exc)}")
+            _pdf_label()
+            pdf_btn.disabled = False
+
+        _pdf_label()
+        pdf_btn.on_click(_on_pdf)
 
         def _on_zip(_btn):
             zip_btn.disabled = True
@@ -1980,10 +2031,11 @@ class Wizard:
             W.HTML(_tiles(tiles) + warn_html),
             tabs,
             _card("Files",
-                  _help(f"Tables, figures, the run report and <code>config_used.yaml</code> were written to "
+                  _help(f"Tables, figures, the run report{', report.pdf' if pdf_path.is_file() else ''} "
+                        f"and <code>config_used.yaml</code> were written to "
                         f"<code>{_esc(Path(out).resolve())}</code>. Reopen that YAML in step 1 to come back "
                         f"to this survey later.{colab_note}"),
-                  W.HBox([zip_btn, rerun_btn], layout=W.Layout(flex_flow="row wrap")),
+                  W.HBox([pdf_btn, zip_btn, rerun_btn], layout=W.Layout(flex_flow="row wrap")),
                   files_note),
         ])
 

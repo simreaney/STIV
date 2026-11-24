@@ -188,6 +188,12 @@ def _resolve_scale(args, video: str | Path, start_s: float = 0.0,
             f"{'analysis window' if duration_s is not None else 'clip'}{spread}) + {takeoff:g} m "
             f"take-off height above the water"
         )
+        if st.assumed:
+            sc.warnings.append(
+                f"{sc.srt.name} logs only a plain \"altitude\", which on the Air 2S and Mavic 2 "
+                f"is the height above the take-off point and is used as such here. Check that "
+                f"{st.median_m:.1f} m is that, not the height above sea level"
+            )
 
     narrowed = preset.zoomed_hfov_deg(st.focal_len_mm) if preset and st else None
     if narrowed is not None:
@@ -262,6 +268,9 @@ def cmd_info(args) -> int:
         else:
             spread = f" ({st.min_m:.1f}-{st.max_m:.1f} m)" if st.max_m - st.min_m >= 0.05 else ""
             print(f"  height above take-off   {st.median_m:.1f} m, median over the clip{spread}")
+            if st.assumed:
+                print('  (logged as plain "altitude": on the Air 2S and Mavic 2 that is the height '
+                      "above take-off;\n  check it is not the height above sea level)")
             if st.focal_len_mm:
                 print(f"  focal length            {st.focal_len_mm:g} mm (35 mm equivalent)")
             print("  That is NOT the height above the water. Give the take-off point's "
@@ -443,6 +452,8 @@ def cmd_run(args) -> int:
     if args.no_figures:
         cfg.output.save_diagnostics = False
         cfg.output.save_sti_images = False
+    if args.pdf:
+        cfg.output.pdf_report = True
     cfg.validate()
 
     result = run_analysis(cfg, progress=not args.quiet)
@@ -533,6 +544,7 @@ def cmd_demo(args) -> int:
 
     cfg = Config.from_dict(make_config(river, video, out_dir / "analysis",
                                        n_stations=args.n_stations))
+    cfg.output.pdf_report = bool(args.pdf)
     result = run_analysis(cfg, progress=not args.quiet)
     _write_outputs(result, cfg)
 
@@ -636,6 +648,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-stabilise", action="store_true",
                    help="skip camera-motion compensation (fixed cameras only)")
     s.add_argument("--no-figures", action="store_true", help="tables only, no images")
+    s.add_argument("--pdf", action="store_true",
+                   help="also write report.pdf: the summary, figures, station table and config "
+                        "(output.pdf_report)")
     s.set_defaults(func=cmd_run)
 
     s = sub.add_parser("cameras", parents=[common],
@@ -650,6 +665,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--drift-px", type=float, default=DEMO_DRIFT_PX,
                    help="simulated drone drift in pixels (0 for a fixed camera)")
     s.add_argument("-n", "--n-stations", type=int, default=DEMO_N_STATIONS)
+    s.add_argument("--pdf", action="store_true", help="also write report.pdf")
     s.set_defaults(func=cmd_demo)
 
     return p

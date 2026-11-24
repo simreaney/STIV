@@ -37,6 +37,7 @@ OUTPUT_FILES = (
     "velocity_profile.png",
     "sti_panel.png",
     "discharge.png",
+    "report.pdf",
 )
 
 #: Sub-folders this module writes, and the only files it ever puts in them.
@@ -95,6 +96,28 @@ def clear_outputs(out: Path) -> list[Path]:
             pass
     manifest.unlink(missing_ok=True)
     return removed
+
+
+def add_pdf_report(result: StivResult, cfg: Config) -> Path:
+    """Write ``report.pdf`` into the output folder of a run already written.
+
+    For a report asked for after the fact -- the notebook's results step
+    offers one.  It is added to the folder's manifest, so the next run there
+    clears it along with everything else this run wrote.
+    """
+    from .pdf_report import write_pdf_report
+
+    out = Path(cfg.output.out_dir)
+    path = write_pdf_report(result, cfg, out / "report.pdf")
+    manifest = out / MANIFEST
+    try:
+        listed = json.loads(manifest.read_text(encoding="utf-8")).get("files", [])
+    except (OSError, ValueError, AttributeError):
+        listed = []
+    if not isinstance(listed, list):
+        listed = []
+    _write_manifest(out, [out / f for f in listed if isinstance(f, str)] + [path])
+    return path
 
 
 def _write_manifest(out: Path, written: list[Path]) -> None:
@@ -192,6 +215,11 @@ def _write_all(result: StivResult, cfg: Config, out: Path, written: list[Path]) 
 
     if cfg.output.save_diagnostics:
         written.extend(plotting.save_all(result, out, dpi=cfg.output.dpi))
+
+    if cfg.output.pdf_report:
+        from .pdf_report import write_pdf_report
+
+        written.append(write_pdf_report(result, cfg, out / "report.pdf"))
 
     if cfg.output.save_sti_images:
         import cv2

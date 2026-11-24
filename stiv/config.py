@@ -330,6 +330,9 @@ class OutputConfig:
     dpi: int = 150
     #: Write the per-window orientation/coherency fields to a .npz archive.
     save_fields: bool = False
+    #: Also write ``report.pdf``: the summary, every figure, the station
+    #: table and this configuration, in one document.
+    pdf_report: bool = False
 
 
 @dataclass

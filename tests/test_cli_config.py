@@ -568,7 +568,9 @@ class TestWizard:
         a, b = got.to_dict(), want.to_dict()
         for d in (a, b):
             d["video"].pop("start_s"), d["video"].pop("duration_s")
-            d["output"].pop("out_dir")
+            # Where results go, and whether a PDF of them is written, are not
+            # the analysis.
+            d["output"].pop("out_dir"), d["output"].pop("pdf_report")
         assert a == b
         # duration_s is the whole clip in one and null in the other: same frames.
         assert FrameSource(got.video).n_frames == FrameSource(want.video).n_frames

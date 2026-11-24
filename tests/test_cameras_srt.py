@@ -90,10 +90,28 @@ HOME(-1.5750,54.7750) 2018.04.19 11:43:54
 GPS(-1.5750,54.7750,13) ISO:100 Shutter:60 EV:0 Fnum:2.2 BAROMETER:10.2
 """
 
-ABSOLUTE_ONLY = """\
+#: The Air 2S's own format: a plain ``altitude``, height above take-off on
+#: this model.  (Shaped on a real log; the position is made up.)
+AIR_2S_PLAIN = """\
 1
 00:00:00,000 --> 00:00:00,033
-[iso : 100] [latitude : 54.1] [longtitude : -1.2] [altitude: 120.5] </font>
+<font size="36">SrtCnt : 1, DiffTime : 33ms
+2023-08-12 10:52:30,115,185
+[iso : 100] [shutter : 1/320.0] [fnum : 280] [ev : 0] [ct : 5881] [color_md : default] [focal_len : 224] [latitude: 54.775000] [longitude: -1.575000] [altitude: 35.900000]
+</font>
+
+2
+00:00:00,033 --> 00:00:00,066
+<font size="36">SrtCnt : 2, DiffTime : 33ms
+[iso : 100] [focal_len : 224] [latitude: 54.775000] [longitude: -1.575000] [altitude: 35.800000]
+</font>
+"""
+
+#: The same field, reading higher than any drone may fly above its take-off.
+ABOVE_SEA_LEVEL = """\
+1
+00:00:00,000 --> 00:00:00,033
+[iso : 100] [latitude : 46.5] [longtitude : 7.9] [altitude: 812.5] </font>
 """
 
 
@@ -121,9 +139,25 @@ class TestSrt:
         (rec,) = parse_srt_text(text)
         assert rec.rel_alt_m == alt
 
-    def test_absolute_altitude_is_not_mistaken_for_height_above_take_off(self):
-        (rec,) = parse_srt_text(ABSOLUTE_ONLY)
-        assert rec.rel_alt_m is None
+    def test_plain_altitude_is_used_but_marked_as_assumed(self):
+        """The Air 2S logs no rel_alt, only a plain altitude -- which on that
+        model is height above take-off, so it is used, flagged for checking."""
+        recs = parse_srt_text(AIR_2S_PLAIN)
+        assert [r.rel_alt_m for r in recs] == [None, None]
+        assert [r.altitude_m for r in recs] == [35.9, 35.8]
+        st = altitude_stats(recs)
+        assert (st.median_m, st.min_m, st.max_m, st.assumed) == (pytest.approx(35.85), 35.8, 35.9, True)
+        assert st.focal_len_mm == 22.4
+
+    def test_a_stated_height_above_take_off_wins_and_is_not_assumed(self):
+        (rec,) = parse_srt_text(MODERN.split("\n\n")[0].replace("] </font>", "] [altitude: 99.0] </font>"))
+        assert rec.rel_alt_m == 30.1 and rec.altitude_m == 99.0
+        st = altitude_stats([rec])
+        assert st.median_m == 30.1 and not st.assumed
+
+    def test_altitude_above_sea_level_is_not_mistaken_for_height_above_take_off(self):
+        (rec,) = parse_srt_text(ABOVE_SEA_LEVEL)
+        assert rec.altitude_m == 812.5
         assert altitude_stats([rec]) is None
 
     def test_found_beside_the_video(self, tmp_path):
