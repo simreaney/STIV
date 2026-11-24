@@ -46,6 +46,9 @@ targets:
         PRODUCT_NAME: STIV
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: StivApp/Info.plist
+        # Info.plist reads its version and build from these.
+        MARKETING_VERSION: "1.1"
+        CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         # StivApp/Assets.xcassets: the icon, the tint, and the launch colour

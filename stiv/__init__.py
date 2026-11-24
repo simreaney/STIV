@@ -23,7 +23,7 @@ or from the command line::
 # The single source of the package version: pyproject.toml reads it from here
 # (``[tool.setuptools.dynamic]``).  Defined before the imports below so that a
 # submodule can import it while the package is still initialising.
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .analysis import StationResult, StivResult, run
 from .config import Config, ConfigError
