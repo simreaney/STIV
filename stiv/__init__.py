@@ -26,7 +26,7 @@ pass over the video by :func:`run_survey`, which returns a result for each.
 # The single source of the package version: pyproject.toml reads it from here
 # (``[tool.setuptools.dynamic]``).  Defined before the imports below so that a
 # submodule can import it while the package is still initialising.
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 from .analysis import StationResult, StivResult, SurveyResult, run, run_survey
 from .config import Config, ConfigError
